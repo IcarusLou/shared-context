@@ -136,7 +136,10 @@ impl Event {
             outcome,
             authorization: Authorization::NotApplicable,
             invocation_id: invocation_id.into(),
-            program_version: env!("CARGO_PKG_VERSION").to_owned(),
+            // The same string `sctx --version` prints, so a telemetry row and a support
+            // conversation identify one build the same way. [`normalized`](Self::normalized)
+            // bounds it to a token; see [`crate::VERSION`] for why it survives that intact.
+            program_version: crate::VERSION.to_owned(),
             operation: Some(operation.into()),
             error_code: None,
             error_family: None,
@@ -239,4 +242,38 @@ fn bounded_with(value: &str, max: usize, allow: impl Fn(u8) -> bool) -> String {
         .map(char::from)
         .collect();
     filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EntryPoint, Event, EventKind};
+
+    /// The build fingerprint has to survive normalization, or telemetry keeps reporting the one
+    /// datum -- the version number -- that never distinguished two builds in the first place.
+    #[test]
+    fn the_build_fingerprint_survives_the_program_version_bound() {
+        let normalized = Event::started(
+            EntryPoint::Cli,
+            EventKind::OperationFinished,
+            "invocation",
+            "version",
+        )
+        .normalized();
+
+        assert!(
+            normalized.program_version.len() <= 32,
+            "{}",
+            normalized.program_version
+        );
+        let mut parts = normalized.program_version.split(' ');
+        assert_eq!(parts.next(), Some(env!("CARGO_PKG_VERSION")));
+        // `(`, `,` and `)` are not token characters, so the human form collapses to
+        // `<version> <commit> <state>` rather than losing its tail to the 32-byte bound.
+        let commit = parts.next().expect("a commit token");
+        assert!(
+            commit == "unknown" || commit.len() == 7,
+            "{}",
+            normalized.program_version
+        );
+    }
 }

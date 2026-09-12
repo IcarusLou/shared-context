@@ -583,8 +583,29 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout),
-        format!("sctx {}\n", env!("CARGO_PKG_VERSION"))
+        format!("sctx {}\n", sctx_telemetry::VERSION)
     );
+    // The version line carries the build it came from, not only the number every build between
+    // two version bumps shares. Tests run from this checkout, so the fingerprint is a real commit.
+    let stamped = String::from_utf8_lossy(&version.stdout);
+    let fingerprint = stamped
+        .trim_end()
+        .strip_prefix(&format!("sctx {}", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| {
+            panic!("version line does not start with the package version: {stamped}")
+        })
+        .trim();
+    let commit = fingerprint
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(", "))
+        .unwrap_or_else(|| panic!("version line carries no `(<commit>, <state>)`: {stamped}"));
+    assert_eq!(commit.0.len(), 7, "{stamped}");
+    assert!(
+        commit.0.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{stamped}"
+    );
+    assert!(matches!(commit.1, "clean" | "dirty"), "{stamped}");
 }
 
 #[test]

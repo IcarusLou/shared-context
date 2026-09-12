@@ -324,8 +324,11 @@ fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
             print!("{HELP}");
             Ok(())
         }
+        // The build fingerprint rides along because a version number alone has three times been
+        // read as identifying a generation it did not: every build between two version bumps
+        // reports the same number, so an installed binary could not say which source it came from.
         [arg] if arg == "-V" || arg == "--version" => {
-            println!("sctx {}", env!("CARGO_PKG_VERSION"));
+            println!("sctx {}", sctx_telemetry::VERSION);
             Ok(())
         }
         [command, rest @ ..] if command == "setup" => {
