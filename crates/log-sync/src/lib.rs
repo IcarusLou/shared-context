@@ -10,5 +10,5 @@ mod sync;
 
 pub use sync::{
     PruneReport, SealStatus, SyncError, SyncErrorCode, SyncErrorStage, SyncOptions, SyncOutcome,
-    SyncReport, prune_cache, sync, sync_scheduled,
+    SyncReport, bounded_tool_diagnostic, prune_cache, sync, sync_scheduled,
 };

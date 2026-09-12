@@ -38,11 +38,17 @@ pub struct StatusReport {
     pub last_upload_attempt_unix_ms: Option<i64>,
     pub last_upload_attempt_stage: Option<String>,
     pub last_upload_attempt_detail: Option<String>,
+    /// What the failing tool itself said. Local only, never uploaded --- the closed-vocabulary
+    /// `last_upload_attempt_detail` is the field that travels.
+    pub last_upload_attempt_diagnostic: Option<String>,
     pub last_upload_attempt_retryable: Option<bool>,
     pub last_upload_attempt_uploaded_batches: Option<u64>,
     pub last_upload_attempt_uploaded_bytes: Option<u64>,
     pub next_upload_retry_unix_ms: Option<i64>,
     pub consecutive_upload_failures: Option<u64>,
+    /// When the current unbroken run of upload failures began, so its age is readable without
+    /// inferring it from the last success.
+    pub first_upload_failure_unix_ms: Option<i64>,
     pub automatic_upload_retry_blocked: Option<bool>,
     pub blocked_upload_stream_id: Option<String>,
     pub collector_error: Option<ErrorCode>,
@@ -188,6 +194,11 @@ pub fn status(root: &Path) -> Result<StatusReport> {
             .and_then(|value| value.get("last_error_detail"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned),
+        last_upload_attempt_diagnostic: upload
+            .as_ref()
+            .and_then(|value| value.get("last_error_diagnostic"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         last_upload_attempt_retryable: upload
             .as_ref()
             .and_then(|value| value.get("last_error_retryable"))
@@ -208,6 +219,10 @@ pub fn status(root: &Path) -> Result<StatusReport> {
             .as_ref()
             .and_then(|value| value.get("consecutive_retryable_failures"))
             .and_then(serde_json::Value::as_u64),
+        first_upload_failure_unix_ms: upload
+            .as_ref()
+            .and_then(|value| value.get("first_failure_unix_ms"))
+            .and_then(serde_json::Value::as_i64),
         automatic_upload_retry_blocked: upload
             .as_ref()
             .and_then(|value| value.get("automatic_retry_blocked"))

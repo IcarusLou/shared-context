@@ -2192,9 +2192,9 @@ fn fetch_required_branch(
     if output.status.success() {
         Ok(())
     } else {
-        Err(Error::new(
-            ErrorKind::External,
+        Err(git_failure(
             "fetch Knowledge Store default branch failed; verify read access and retry",
+            &output,
         ))
     }
 }
@@ -2222,9 +2222,9 @@ fn fetch_optional_work_branch(
                 network_timeout,
             )?;
             if !fetch.status.success() {
-                return Err(Error::new(
-                    ErrorKind::External,
+                return Err(git_failure(
                     "fetch Knowledge Store work branch failed; verify read access and retry",
+                    &fetch,
                 ));
             }
             git_output(
@@ -2248,9 +2248,9 @@ fn fetch_optional_work_branch(
             }
             Ok(None)
         }
-        _ => Err(Error::new(
-            ErrorKind::External,
+        _ => Err(git_failure(
             "inspect remote Knowledge Store work branch failed; verify read access and retry",
+            &probe,
         )),
     }
 }
@@ -2327,6 +2327,21 @@ fn divergence(repository: &Path, base_ref: &str) -> Result<(u64, u64)> {
         return Err(invariant("Git returned extra branch divergence fields"));
     }
     Ok((behind, ahead))
+}
+
+/// A typed Git failure that keeps what Git actually said.
+///
+/// The hand-written half of the message is the advice; Git's stderr is the evidence. Recording
+/// only the advice is how `fetch Knowledge Store default branch failed; verify read access and
+/// retry` came to be the entire durable record of a real outage --- true, and useless for telling
+/// an expired credential from an unreachable host. `sctx_log_sync::bounded_tool_diagnostic` bounds
+/// the excerpt, strips control characters, and keeps the last lines, which is where Git puts its
+/// conclusion.
+fn git_failure(message: &str, output: &Output) -> Error {
+    sctx_log_sync::bounded_tool_diagnostic(&output.stderr).map_or_else(
+        || Error::new(ErrorKind::External, message),
+        |detail| Error::new(ErrorKind::External, format!("{message} (git: {detail})")),
+    )
 }
 
 fn git_command(repository: &Path, args: &[&str], context: &str) -> Result<Output> {

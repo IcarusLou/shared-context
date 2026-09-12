@@ -157,6 +157,7 @@ pub struct SyncError {
     code: SyncErrorCode,
     stage: SyncErrorStage,
     safe_detail: String,
+    local_diagnostic: Option<String>,
     uploaded_batches: u64,
     uploaded_bytes: u64,
 }
@@ -175,6 +176,25 @@ impl SyncError {
     #[must_use]
     pub fn safe_detail(&self) -> &str {
         &self.safe_detail
+    }
+
+    /// What the failing tool actually said, bounded and stripped of control characters.
+    ///
+    /// [`safe_detail`](Self::safe_detail) is a closed vocabulary on purpose, and it stays one:
+    /// it is the string that travels, and a classifier that cannot recognise a failure reports
+    /// `unknown` rather than leaking an unbounded message. `unknown` is also where diagnosis
+    /// stops. A real installation spent nearly twenty hours on
+    /// `git ls-remote exited with code 128 (unknown)`, twenty-two times, with Git's own
+    /// explanation discarded at the moment it was produced and nothing on disk to recover it
+    /// from.
+    ///
+    /// This is that explanation, and it is **local only**: it is written to
+    /// `<logs_root>/state/upload-status.json`, which is a private file on the machine that
+    /// produced the failure, and it must never be copied into a telemetry Event, a report that
+    /// is uploaded, or anything else that leaves the host.
+    #[must_use]
+    pub fn local_diagnostic(&self) -> Option<&str> {
+        self.local_diagnostic.as_deref()
     }
 
     #[must_use]
@@ -210,6 +230,7 @@ impl SyncError {
             code,
             stage: default_error_stage(code),
             safe_detail: bounded_safe_detail(message.into()),
+            local_diagnostic: None,
             uploaded_batches: 0,
             uploaded_bytes: 0,
         }
@@ -220,9 +241,15 @@ impl SyncError {
             code,
             stage,
             safe_detail: bounded_safe_detail(detail.into()),
+            local_diagnostic: None,
             uploaded_batches: 0,
             uploaded_bytes: 0,
         }
+    }
+
+    fn with_local_diagnostic(mut self, diagnostic: Option<String>) -> Self {
+        self.local_diagnostic = diagnostic;
+        self
     }
 
     fn with_stage(mut self, stage: SyncErrorStage) -> Self {
@@ -336,6 +363,19 @@ struct UploadStatus {
     last_error_detail: Option<String>,
     #[serde(default)]
     last_error_retryable: Option<bool>,
+    /// What the failing tool said, for the operator reading this file. Local only --- see
+    /// [`SyncError::local_diagnostic`].
+    #[serde(default)]
+    last_error_diagnostic: Option<String>,
+    /// When the current unbroken run of failures began.
+    ///
+    /// Without it a streak has no start: `consecutive_retryable_failures` counts attempts and
+    /// `last_attempt_unix_ms` names the newest one, so "22 failures" could have begun an hour ago
+    /// or two days ago, and only a lucky `last_success_unix_ms` narrowed it down. A real
+    /// installation had to infer a 19h50m outage from the last success, because nothing recorded
+    /// when the outage started.
+    #[serde(default)]
+    first_failure_unix_ms: Option<i64>,
     #[serde(default)]
     last_attempt_uploaded_batches: u64,
     #[serde(default)]
@@ -635,6 +675,8 @@ fn record_upload_status_locked(
             status.last_error_code = None;
             status.last_error_detail = None;
             status.last_error_retryable = None;
+            status.last_error_diagnostic = None;
+            status.first_failure_unix_ms = None;
             status.last_attempt_uploaded_batches = report.uploaded_batches;
             status.last_attempt_uploaded_bytes = report.uploaded_bytes;
             status.consecutive_retryable_failures = 0;
@@ -651,6 +693,11 @@ fn record_upload_status_locked(
             status.last_error_code = Some(error.code());
             status.last_error_detail = Some(error.safe_detail().to_owned());
             status.last_error_retryable = Some(error.retryable());
+            status.last_error_diagnostic = error.local_diagnostic().map(str::to_owned);
+            // The streak's start is kept, not overwritten: this is the one field that says how
+            // long an outage has been running, and re-stamping it every attempt would make every
+            // outage look like it began moments ago.
+            status.first_failure_unix_ms = status.first_failure_unix_ms.or(Some(now));
             status.last_attempt_uploaded_batches = error.uploaded_batches();
             status.last_attempt_uploaded_bytes = error.uploaded_bytes();
             if error.retryable() {
@@ -2052,6 +2099,59 @@ fn git_failure(
         |code| format!("git {operation} exited with code {code} ({kind})"),
     );
     SyncError::at(stage, SyncErrorCode::Git, detail)
+        .with_local_diagnostic(local_git_diagnostic(stderr))
+}
+
+/// Git's own last words, reduced to something safe to keep in a local status file.
+///
+/// The classifier above answers "which closed class is this"; when the answer is `unknown`, the
+/// status file records a failure nobody can act on. This keeps the sentences Git wrote, which is
+/// what an operator reads to decide whether a remote is gone, a credential expired, or a network
+/// was down.
+///
+/// Three bounds, because this is durable state written by a background daemon: only the last few
+/// lines (Git puts its conclusion last, and progress output first), no control characters (the
+/// file is read by humans and by JSON parsers), and a hard character ceiling.
+fn local_git_diagnostic(stderr: &[u8]) -> Option<String> {
+    bounded_tool_diagnostic(stderr)
+}
+
+/// The last words of a failed tool, reduced to something safe to keep in a local status file.
+///
+/// Every place that runs a child process and then records only its own summary of the failure
+/// throws this away at the moment it exists, and no later run can recover it. `sctx maintain` did
+/// exactly that with `sctx logs sync`'s stderr, and its digest reported
+/// `logging synchronization exited unsuccessfully` for a week.
+///
+/// Three bounds, because this is durable state written by a background daemon: only the last few
+/// lines (a tool puts its conclusion last and its progress first), no control characters (the
+/// result is read by humans and embedded in JSON and log lines), and a hard character ceiling.
+///
+/// The result is **local only**. It is not a closed vocabulary, so it must never be copied into a
+/// telemetry Event or anything else that leaves the host.
+#[must_use]
+pub fn bounded_tool_diagnostic(stderr: &[u8]) -> Option<String> {
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 240;
+    let text = String::from_utf8_lossy(stderr);
+    let mut lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.len() > MAX_LINES {
+        lines.drain(..lines.len() - MAX_LINES);
+    }
+    let joined: String = lines
+        .join("; ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_CHARS)
+        .collect();
+    (!joined.is_empty()).then_some(joined)
 }
 
 fn classify_git_failure(stderr: &[u8]) -> &'static str {

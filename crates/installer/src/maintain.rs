@@ -462,7 +462,18 @@ impl Installer {
                     .output_limit(4096);
                 let mut step = match sctx_log_sync::runner::run(&spec) {
                     Ok(output) if output.status.success() => parse_logs_sync_report(&output.stdout),
-                    Ok(_) => failed_logs("logging synchronization exited unsuccessfully"),
+                    // The child already prints a fully diagnosed failure --- stage, code,
+                    // retryability, and the detail --- on its stderr, and this arm used to
+                    // discard all of it and record the constant below. A real installation ran
+                    // for a week with `logs_sync=failed` and no recoverable reason for it.
+                    Ok(output) => failed_logs(
+                        &sctx_log_sync::bounded_tool_diagnostic(&output.stderr).map_or_else(
+                            || "logging synchronization exited unsuccessfully".to_owned(),
+                            |detail| {
+                                format!("logging synchronization exited unsuccessfully: {detail}")
+                            },
+                        ),
+                    ),
                     Err(sctx_log_sync::runner::RunnerError::TimedOut { .. }) => {
                         failed_logs("logging synchronization exceeded its total deadline")
                     }
@@ -724,13 +735,33 @@ fn append_log_line(root: &Path, digest: &MaintainDigest) -> Result<()> {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    // The daily log line is the only per-run record that survives; `maintain-digest.json` holds
+    // one run and is overwritten by the next. Without the reasons, a line that says
+    // `knowledge_sync=failed logs_sync=failed` is a fact with no cause attached, and by the time
+    // anyone reads it the digest that explained it is gone.
+    let reasons = digest
+        .steps
+        .iter()
+        .filter(|step| step.outcome != MaintainOutcome::Ok)
+        .filter_map(|step| {
+            step.reason
+                .as_deref()
+                .map(|reason| format!("{}: {}", step.name, log_field(reason)))
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let reasons = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" reasons=\"{reasons}\"")
+    };
     let mode = match digest.mode {
         MaintainMode::Scheduled => "scheduled",
         MaintainMode::Opportunistic => "opportunistic",
     };
     let line = format!(
         "{} mode={mode} duration_s={} {summary} pending_reviews={} expiring_reviews={} \
-         provisional_spaces={} unresolved_references={}\n",
+         provisional_spaces={} unresolved_references={}{reasons}\n",
         digest.finished_at_unix_seconds,
         digest
             .finished_at_unix_seconds
@@ -748,6 +779,28 @@ fn append_log_line(root: &Path, digest: &MaintainDigest) -> Result<()> {
         .map_err(io_error("open maintenance log"))?;
     file.write_all(line.as_bytes())
         .map_err(io_error("append maintenance log"))
+}
+
+/// One reason, made safe for a single-line, double-quote-delimited log field.
+///
+/// A reason now carries a tool's own words, which can hold newlines and quotes; the log line is
+/// one record per line and parsed by eye and by `grep`, so neither may survive into it.
+fn log_field(reason: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    reason
+        .chars()
+        .map(|character| {
+            if character.is_control() || character == '"' {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(MAX_CHARS)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn unix_seconds() -> Result<u64> {
