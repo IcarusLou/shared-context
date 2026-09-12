@@ -1741,16 +1741,16 @@ fn run_hook(args: &[String]) -> Result<()> {
     if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
         remove_hook_session_scope(agent, &event.context().session_id, &recorder);
     }
-    let output = if agent == "cursor" {
-        sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
-    } else {
-        sctx_adapter_codex::encode_hook_output(event.kind(), &resolved)?
-    };
-    println!(
-        "{}",
-        String::from_utf8(output).map_err(|error| {
-            Error::new(ErrorKind::Io, format!("hook output is not UTF-8: {error}"))
-        })?
+    print_hook_output(agent, event.kind(), &resolved)?;
+    // After the response is on stdout, because that is the moment the delivery became real.
+    record_self_healed_marker_delivery(
+        agent,
+        &event,
+        &capabilities,
+        &policy,
+        &authorization,
+        &resolved,
+        &recorder,
     );
     if activated && !capabilities.hooks_verified() {
         eprintln!("{}", capabilities.diagnostic);
@@ -1961,6 +1961,79 @@ fn add_self_healed_activation_marker(
     action
 }
 
+/// Encodes one resolved action for its host and writes it to stdout.
+fn print_hook_output(
+    agent: &str,
+    event: CanonicalAgentEventKind,
+    resolved: &ResolvedAgentAction,
+) -> Result<()> {
+    let output = if agent == "cursor" {
+        sctx_adapter_cursor::encode_hook_output(event, resolved)?
+    } else {
+        sctx_adapter_codex::encode_hook_output(event, resolved)?
+    };
+    println!(
+        "{}",
+        String::from_utf8(output).map_err(|error| {
+            Error::new(ErrorKind::Io, format!("hook output is not UTF-8: {error}"))
+        })?
+    );
+    Ok(())
+}
+
+/// Spends the lease's one-shot activation-marker delivery, once the response has carried it.
+///
+/// The delivery is one-shot, so recording it before the response exists means every way of losing
+/// the text between the decision and stdout burns it permanently: the Session is marked as told
+/// and never told. The marker is the one datum an Agent cannot guess — the host Session id it must
+/// send back as `external_session_id` — so a burned delivery costs that Session every MCP call it
+/// would ever have made.
+///
+/// Confirmation is by value, not by flag: the marker is rendered again from the same three inputs
+/// and compared against what the response actually carries. A planner that put something else in
+/// `additional_context`, or a fail-open that cleared it, therefore leaves the lease unspent and
+/// the next event offers the marker again.
+///
+/// Two concurrent Hooks can now both confirm and both record, where the old ordering let the lease
+/// write serialize them. A Session told its own id twice is a duplicated sentence; a Session never
+/// told it is inert for its whole life, which is the trade this ordering takes deliberately. The
+/// same is true of a failure to record here: the marker was delivered, so the worst case is one
+/// more delivery on the next event.
+fn record_self_healed_marker_delivery(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    capabilities: &AgentCapabilities,
+    policy: &Policy,
+    authorization: &HookAuthorization,
+    resolved: &ResolvedAgentAction,
+    recorder: &HookEventRecorder,
+) {
+    if !authorization.deliver_activation_marker {
+        return;
+    }
+    let session_id = &event.context().session_id;
+    let delivered = shared_context_activation_marker_with_policy(
+        capabilities.agent,
+        session_id,
+        policy.session(),
+    );
+    if resolved.additional_context.as_deref() != Some(delivered.as_str()) {
+        return;
+    }
+    let outcome = installation_root().and_then(|root| {
+        let locator = ExternalSessionLocator::new(agent, session_id)?;
+        AuthorizedSessionScopeStore::initialize(&root)?
+            .try_mark_activation_marker_delivered(&locator)
+    });
+    if let Err(error) = outcome {
+        recorder.flush(
+            HookEventDecision::Neutral,
+            "marker_mark_failed",
+            Some(truncate_hook_detail(error.message())),
+        );
+    }
+}
+
 /// Whether this event is worth spending an Agent's one-shot activation-marker delivery on.
 ///
 /// Two questions, asked in order. The wire question belongs to the adapter that encodes the
@@ -2049,8 +2122,15 @@ fn resolve_hook_authorization_inner(
             // `SessionStart` renders the marker unconditionally, so only a later event that had
             // to build the lease itself owes one. Recording the delivery in the lease is what
             // keeps the next event from repeating it — the same one-shot bookkeeping the Intent
-            // bootstrap reminder uses — and a busy lock simply skips this event's delivery
-            // rather than risking a duplicate.
+            // bootstrap reminder uses.
+            //
+            // This decides only that the marker is *owed*; the recording happens in
+            // [`record_self_healed_marker_delivery`], after the response carrying it is on
+            // stdout. Deciding and recording used to be this one call, and every later way of
+            // losing the marker therefore burned it: a failed Task Runtime operation makes
+            // `resolve_hook_action` fail open with `additional_context: None`, which dropped a
+            // marker the lease had already been told was delivered, leaving that Session with no
+            // way to ever learn the `external_session_id` it must send back.
             //
             // The delivery is offered here and nowhere else, because a lease this event did not
             // create cannot be told apart from one a `SessionStart` created — both carry
@@ -2059,15 +2139,10 @@ fn resolve_hook_authorization_inner(
             // context therefore keeps its delivery unspent but never gets a second chance at it
             // (deferred-issues #37). Unspent is still the right state: recording a delivery the
             // host discarded is a lie about what the Session was told.
-            if event_kind != CanonicalAgentEventKind::SessionStart
+            deliver_activation_marker = event_kind != CanonicalAgentEventKind::SessionStart
                 && carries_model_visible_context(agent, event_kind)
                 && scope.decision.is_enabled()
-                && !scope.activation_marker_delivered
-            {
-                deliver_activation_marker = store
-                    .try_mark_activation_marker_delivered(&locator)
-                    .unwrap_or(false);
-            }
+                && !scope.activation_marker_delivered;
             Some(scope)
         }
     };
@@ -2447,6 +2522,11 @@ fn resolve_hook_action(
                 "task_operation_failed",
                 Some(truncate_hook_detail(error.message())),
             );
+            // Model context planned for this event is dropped along with the failed operation:
+            // this response says only that retrieval is unavailable. A one-shot delivery in there
+            // is not lost by it, because nothing is recorded as delivered until
+            // `record_self_healed_marker_delivery` sees the marker survive to the response, and
+            // it does not survive this one.
             return ResolvedAgentAction {
                 additional_context: None,
                 system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),

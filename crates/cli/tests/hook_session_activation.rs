@@ -1248,3 +1248,92 @@ fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str)
         Policy::compiled_default().session(),
     )
 }
+
+/// The self-healed activation marker is one-shot, and a failed Task Runtime operation used to
+/// burn it.
+///
+/// The lease repair recorded the delivery the moment it decided one was owed; the fail-open that
+/// follows a failed operation then returned `additional_context: None`. The Session was marked as
+/// told and never told, and the marker is the one datum an Agent cannot guess -- the
+/// `external_session_id` every MCP call must carry -- so that Session stayed inert for its whole
+/// life. The delivery is now recorded only after the response carries the marker.
+#[test]
+fn a_failed_task_operation_does_not_burn_the_self_healed_activation_marker() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.direct_repository.join("bootstrap.rs"),
+        "fn bootstrap_fixture() {}\n",
+    )
+    .unwrap();
+    let session = "marker-fail-open";
+    assert_activated(
+        &fixture.hook(
+            "codex",
+            &codex_start(session, &fixture.direct_repository, "startup"),
+        ),
+        AgentKind::Codex,
+        session,
+    );
+    // Only an event that has to rebuild the lease itself owes the marker again.
+    fs::remove_file(lease_record_path(&fixture.root(), "codex", session)).unwrap();
+
+    // The prior events opened `runtime.sqlite` themselves, so the fault has to replace it.
+    let database = fixture.root().join("state/runtime.sqlite");
+    let _ = fs::remove_file(&database);
+    fs::create_dir(&database).unwrap();
+    let failed = fixture.hook(
+        "codex",
+        &codex_post_tool(session, &fixture.direct_repository),
+    );
+    assert!(
+        failed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let response: Value = serde_json::from_slice(&failed.stdout).unwrap();
+    // Codex mirrors the fail-open notice onto `additionalContext`, so the assertion is about the
+    // marker itself and not about the field being empty.
+    assert_ne!(
+        response["hookSpecificOutput"]["additionalContext"].as_str(),
+        Some(codex_marker(session).as_str()),
+        "the fail-open response carries no marker: {response:#}"
+    );
+    let AuthorizedSessionScopeRead::Current(scope) = fixture.read_scope("codex", session) else {
+        panic!("the lease was rebuilt by the failing event");
+    };
+    assert!(
+        !scope.activation_marker_delivered,
+        "a marker the response never carried must stay unspent"
+    );
+
+    // With the Runtime back, a later event that again has to rebuild the lease spends the
+    // delivery -- and records it only because the response carried it. (One lease still gets one
+    // offer: the repaired lease above is indistinguishable from a `SessionStart`'s, which is
+    // deferred-issues #37 and unchanged here.)
+    fs::remove_dir(&database).unwrap();
+    fs::remove_file(lease_record_path(&fixture.root(), "codex", session)).unwrap();
+    let healed = fixture.hook(
+        "codex",
+        &codex_post_tool(session, &fixture.direct_repository),
+    );
+    assert_activated(&healed, AgentKind::Codex, session);
+    let AuthorizedSessionScopeRead::Current(scope) = fixture.read_scope("codex", session) else {
+        panic!("the lease survives a delivered marker");
+    };
+    assert!(
+        scope.activation_marker_delivered,
+        "a delivered marker must be recorded so the next event does not repeat it"
+    );
+
+    // And exactly once: the following event states it no more.
+    let quiet = fixture.hook(
+        "codex",
+        &codex_post_tool(session, &fixture.direct_repository),
+    );
+    let response: Value = serde_json::from_slice(&quiet.stdout).unwrap();
+    assert_ne!(
+        response["hookSpecificOutput"]["additionalContext"].as_str(),
+        Some(codex_marker(session).as_str()),
+        "{response:#}"
+    );
+}
