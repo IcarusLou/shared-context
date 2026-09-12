@@ -191,6 +191,28 @@ class HookHashTests(unittest.TestCase):
         )
 
 
+class FixtureParityTests(unittest.TestCase):
+    """The shared contract with the Rust port in `crates/installer/src/codex_trust.rs`.
+
+    `fixtures/codex-trust/expected.json` was generated from the `hooks.json` beside it by this
+    module. The installer re-stamps `~/.codex/config.toml` with the Rust port, so the two have to
+    agree bit for bit or an install would trust hashes Codex does not compute. The mirror is
+    `crates/installer/tests/codex_trust_parity.rs`.
+    """
+
+    FIXTURE = Path(__file__).resolve().parents[4] / "fixtures" / "codex-trust"
+
+    def test_this_module_still_produces_the_recorded_hashes(self) -> None:
+        expected = json.loads((self.FIXTURE / "expected.json").read_text(encoding="utf-8"))
+        document = codex_trust.load_hooks_file(self.FIXTURE / "hooks.json")
+        computed = codex_trust.hook_state_entries(document, expected["key_source"])
+        self.assertEqual(computed, expected["trusted_hashes"])
+
+    def test_the_fixture_names_the_commit_this_module_was_read_at(self) -> None:
+        expected = json.loads((self.FIXTURE / "expected.json").read_text(encoding="utf-8"))
+        self.assertEqual(expected["codex_source_commit"], codex_trust.CODEX_SOURCE_COMMIT)
+
+
 class HookStateEntryTests(unittest.TestCase):
     def test_keys_are_positional_and_survive_skipped_handlers(self) -> None:
         document = hooks_file(

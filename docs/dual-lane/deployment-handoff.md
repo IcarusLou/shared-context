@@ -2,6 +2,41 @@
 
 本轮迭代自 0e54982(双径合并门)后共 17 个 commit,HEAD `815eae9`。全部通过:workspace 1109/0(15 ignored=真模型套件,见手动清单)、clippy `-D warnings` 零告警、真模型套件重基线三次一致、红线(candidate 语义/search_contract/显式 search)零回退。部署由操作者执行;本文件是交接面。
 
+## 0. 最高优先(2026-09-12 配对回放追加)· Codex hook 信任哈希必须重戳
+
+**症状是"什么都没发生"**:dev.10 安装后一整场 Codex 回放里零 `<shared-context-active>`、零 external_session 行,只有 project/plugin 来源的 hook 跑了。根因不在 `hooks.json`——它被正确改写成了 `--agent-version 0.154.0`;根因在 `~/.codex/config.toml` 的 `[hooks.state]`:六个 sctx 事件的 `trusted_hash` 仍描述 `0.153.4` 的命令行。**Codex 拒绝执行哈希不符的 hook,并且一声不响**,所以唯一症状就是缺席。
+
+诊断(只读,任何时候都能跑):
+
+```
+python3 tests/scripts/session_replay/codex_trust.py --config ~/.codex/config.toml
+```
+
+实测复现(修复前):`matched 18 / mismatched 6`(恰好六个 sctx 事件)+ 3 个 `hooks.json` 已不再声明的陈旧键(`pre_tool_use` / `subagent_start` / `subagent_stop`)。
+
+**修复命令(操作者自己跑,装上新二进制之后)**:
+
+```
+~/.shared-context/bin/current/sctx setup
+```
+
+或升级路径 `~/.shared-context/bin/current/sctx upgrade`。二者都会在写 `hooks.json` 的同一事务里重戳六个键的 `trusted_hash` 并清掉自己的陈旧键,然后:
+
+```
+~/.shared-context/bin/current/sctx doctor --json | python3 -c "import json,sys; print([c for c in json.load(sys.stdin)['checks'] if c['name']=='codex_trusted_hash'])"
+python3 tests/scripts/session_replay/codex_trust.py --config ~/.codex/config.toml   # 应为 mismatched 0
+```
+
+`codex_trusted_hash` 应为 `ok` 且文案为 "all 6 … are trusted"。若为 `action_required`,文案本身给修复路径;若为 `warning`,说明 `config.toml` 有一处 setup 拒绝解释的形状(见下"边界"),重戳被降级成了 notice 而不是让安装失败。
+
+**运维纪律(这条要长期记住)**:
+
+- **每次升级 codex-cli 之后必须重跑 `sctx setup`。** 信任哈希覆盖 hook 的命令行,而命令行里带 `--agent-version`;codex-cli 版本一变,六个哈希同时失效,所有 sctx hook 静默停摆。`sctx doctor` 的 `codex_trusted_hash` 是唯一能提前看见这件事的地方——**不要**用"hooks.json 里有我们的命令"判断 hook 会跑。
+- 重戳只动 sctx 自己的键:key 的来源前缀是我们写的那个 `hooks.json`,且该位置确实由 setup 亲手写入。别人的 hook(哪怕在同一个 `hooks.json` 里)、project 来源、`<plugin>@<pack>` 来源的键一律不读不写不删。给别人的 hook 盖信任章等于替操作者授权,这条没有例外。
+- 陈旧键只清"指向我们这个 `hooks.json` 里已不存在的位置"的那些——它们已经指挥不了任何 hook,清掉不减少任何人的能力。
+
+**边界(已知并接受)**:`config.toml` 是手写面,写入走 `toml_edit`,注释、未知字段、inline table 形状、以及每个条目除 `trusted_hash` 以外的字段(`enabled` 等)都原样保留;写入前先验证渲染结果可解析,再做原子替换,失败由事务日志整文件回滚。唯一拒绝处理的形状是 `hooks` 或 `hooks.state` 不是 table——此时保留原样并在 `SetupReport.notices` 里说明,**不让 setup/upgrade 整体失败**。
+
 ## 1. 本轮包含什么(按 commit 组)
 
 - **a988142** build 指纹:`sctx --version` → `0.2.0-dev.9 (<commit>, clean|dirty)`;遥测 program_version 同源。

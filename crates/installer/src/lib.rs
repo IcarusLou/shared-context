@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
+pub mod codex_trust;
 pub mod embedding;
 pub mod launchd;
 pub mod logs_launchd;
@@ -146,6 +147,7 @@ pub enum SetupStage {
     CursorHooksWritten,
     CodexMcpWritten,
     CodexHooksWritten,
+    CodexHookTrustStamped,
     GlobalSkillGateWritten,
     GlobalSkillWorkflowWritten,
     GlobalSkillMetadataWritten,
@@ -947,28 +949,45 @@ impl Installer {
                     .and_then(Option::as_deref),
                 &mut ownership,
                 &mut notices,
-            )?;
+            )?
+            .changed;
             self.fail(SetupStage::CursorHooksWritten)?;
         }
         if options.agents.contains(&Agent::Codex) {
+            let codex_config = self.context.home.join(".codex/config.toml");
             config_changed |= merge_codex_mcp(
                 transaction,
-                &self.context.home.join(".codex/config.toml"),
+                &codex_config,
                 &stable_binary,
                 &mut ownership,
                 &mut notices,
             )?;
             self.fail(SetupStage::CodexMcpWritten)?;
-            config_changed |= merge_json_hooks(
+            let codex_hooks = self.context.home.join(".codex/hooks.json");
+            let merge = merge_json_hooks(
                 transaction,
-                &self.context.home.join(".codex/hooks.json"),
+                &codex_hooks,
                 Agent::Codex,
                 &stable_binary,
                 agent_versions.get(&Agent::Codex).and_then(Option::as_deref),
                 &mut ownership,
                 &mut notices,
             )?;
+            config_changed |= merge.changed;
             self.fail(SetupStage::CodexHooksWritten)?;
+            // The hooks file alone does nothing: Codex will not run a hook whose stored trust hash
+            // no longer describes it. Re-stamped unconditionally, because the hash covers a command
+            // that carries `--agent-version` and so goes stale on every upgrade.
+            match restamp_codex_hook_trust(transaction, &codex_config, &codex_hooks, &merge) {
+                Ok(update) => config_changed |= update.changed(),
+                Err(error) => notices.push(format!(
+                    "could not re-stamp the Codex hook trust hashes in {}: {error}. Codex will \
+                     skip the Shared Context hooks until they are trusted again -- `sctx doctor` \
+                     reports this as codex_trusted_hash",
+                    codex_config.display()
+                )),
+            }
+            self.fail(SetupStage::CodexHookTrustStamped)?;
         }
 
         finalize_ownership(transaction, &mut ownership)?;
@@ -1107,6 +1126,7 @@ impl Installer {
         check_engineering_graph(root, &mut checks);
         check_repository_catalog(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
+        check_codex_trusted_hash(root, &self.context.home, &mut checks);
         check_policy(root, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
         check_session_scope_leases(root, &mut checks);
@@ -3278,6 +3298,43 @@ fn merge_json_named_entry(
     Ok(changed)
 }
 
+/// What [`merge_json_hooks`] did, for the caller that has to follow up on it.
+///
+/// Codex needs the follow-up: a hook it does not *trust* never runs, and the trust hash is keyed on
+/// the hook command, which this merge rewrites on every upgrade. See [`codex_trust`].
+struct HookMerge {
+    changed: bool,
+    /// The `hooks.<Event>[index]` group addresses this installer authored, byte for byte.
+    ///
+    /// Only these may be re-trusted. An address the merge *preserved* because the operator had
+    /// edited the entry stays out, so `sctx setup` can never grant Codex's execution trust to a
+    /// command it did not write.
+    owned_groups: Vec<(&'static str, usize)>,
+    /// The hooks document as it now stands on disk.
+    document: Map<String, Value>,
+}
+
+/// The one hook entry this installer writes into each of an Agent's hook events.
+///
+/// Cursor takes a bare handler; Codex takes a matcher group wrapping one handler. Note that the
+/// command embeds the *detected* Agent version, which is why installing a hook can never be a
+/// once-only act: the command changes with the host, and for Codex the trust hash changes with the
+/// command (see [`codex_trust`]).
+fn desired_hook_entry(agent: Agent, binary: &Path, agent_version: Option<&str>) -> Result<Value> {
+    let command = format!(
+        "{} hook --agent {} --agent-version {}",
+        shell_quote(binary)?,
+        agent_name(agent),
+        shell_quote(Path::new(agent_version.unwrap_or("unavailable")))?
+    );
+    Ok(match agent {
+        Agent::Cursor => json!({"command": command}),
+        Agent::Codex => json!({
+            "hooks": [{"type": "command", "command": command, "statusMessage": "Shared Context"}]
+        }),
+    })
+}
+
 fn merge_json_hooks(
     transaction: &mut Transaction,
     path: &Path,
@@ -3286,7 +3343,7 @@ fn merge_json_hooks(
     agent_version: Option<&str>,
     ownership: &mut Vec<OwnedConfig>,
     notices: &mut Vec<String>,
-) -> Result<bool> {
+) -> Result<HookMerge> {
     let kind = match agent {
         Agent::Cursor => ConfigKind::CursorHooks,
         Agent::Codex => ConfigKind::CodexHooks,
@@ -3304,25 +3361,14 @@ fn merge_json_hooks(
     }
     let mut changed = document != original;
     let hooks = object_field_mut(&mut document, "hooks")?;
-    let agent_version = agent_version.unwrap_or("unavailable");
-    let command = format!(
-        "{} hook --agent {} --agent-version {}",
-        shell_quote(binary)?,
-        agent_name(agent),
-        shell_quote(Path::new(agent_version))?
-    );
-    let desired = match agent {
-        Agent::Cursor => json!({"command": command}),
-        Agent::Codex => json!({
-            "hooks": [{"type": "command", "command": command, "statusMessage": "Shared Context"}]
-        }),
-    };
+    let desired = desired_hook_entry(agent, binary, agent_version)?;
     let desired_hash = hash_value(&desired)?;
     let prior_entries = ownership
         .iter()
         .find(|config| config.kind == kind)
         .map_or_else(Vec::new, |config| config.entries.clone());
     let mut entries = Vec::new();
+    let mut owned_groups = Vec::new();
     for event in events {
         let item = hooks
             .entry((*event).to_owned())
@@ -3339,6 +3385,7 @@ fn merge_json_hooks(
                 hash: desired_hash.clone(),
                 original_index: Some(index),
             });
+            owned_groups.push((*event, index));
             continue;
         }
         let prior = prior_entries.iter().find(|entry| entry.selector == *event);
@@ -3353,12 +3400,15 @@ fn merge_json_hooks(
                         hash: desired_hash.clone(),
                         original_index: Some(index),
                     });
+                    owned_groups.push((*event, index));
                     continue;
                 }
                 notices.push(format!(
                     "preserved user-modified {event} hook at index {index} in {}",
                     path.display()
                 ));
+                // Deliberately not an owned group: the entry at this address is the operator's
+                // now, so its Codex trust hash is theirs to grant and not ours to re-stamp.
                 entries.push(prior.clone());
                 continue;
             }
@@ -3371,6 +3421,7 @@ fn merge_json_hooks(
             hash: desired_hash.clone(),
             original_index: Some(index),
         });
+        owned_groups.push((*event, index));
     }
     if changed {
         transaction.record(path)?;
@@ -3379,7 +3430,93 @@ fn merge_json_hooks(
     }
     let originally_absent = prior_originally_absent(ownership, kind, absent);
     upsert_owned_config(ownership, path, kind, originally_absent, entries);
-    Ok(changed)
+    Ok(HookMerge {
+        changed,
+        owned_groups,
+        document,
+    })
+}
+
+/// Re-stamps the Codex `[hooks.state]` trust hashes for the hook groups `merge` just authored.
+///
+/// Codex refuses to run a hook whose recomputed identity hash does not match the `trusted_hash`
+/// stored in `config.toml`, and the hash covers the hook *command*, which embeds
+/// `--agent-version`. So every upgrade that rewrites `hooks.json` invalidates the operator's trust
+/// and every Codex hook stops firing -- silently, with no error anywhere, the failure mode this
+/// exists to close. Measured on the dev.10 install: `hooks.json` said `0.154.0`, all six stored
+/// hashes still described `0.153.4`, and a full replay produced zero `<shared-context-active>`
+/// markers.
+///
+/// Scope discipline is in [`codex_trust::apply_trust`]: only the groups this installer authored are
+/// stamped, only dead keys addressing our own `hooks.json` are pruned, and no other key source is
+/// read or written.
+///
+/// # Errors
+///
+/// Returns an error when `config.toml` cannot be read, parsed, or replaced. The caller degrades
+/// that to a notice: `config.toml` is the operator's hand-written file, and a hook that will not
+/// run is worth reporting but never worth failing an otherwise complete install over.
+fn restamp_codex_hook_trust(
+    transaction: &mut Transaction,
+    config_path: &Path,
+    hooks_path: &Path,
+    merge: &HookMerge,
+) -> Result<codex_trust::TrustUpdate> {
+    let key_source = path_text(hooks_path)?;
+    let mut desired = BTreeMap::new();
+    for (event, group_index) in &merge.owned_groups {
+        let group = merge
+            .document
+            .get("hooks")
+            .and_then(|hooks| hooks.get(*event))
+            .and_then(Value::as_array)
+            .and_then(|groups| groups.get(*group_index))
+            .ok_or_else(|| invalid(format!("{event} hook group {group_index} vanished")))?;
+        let matcher = group.get("matcher").and_then(Value::as_str);
+        let handlers = group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid(format!("{event} hook group {group_index} has no handlers")))?;
+        for (handler_index, handler) in handlers.iter().enumerate() {
+            if let Some(digest) = codex_trust::hook_hash(event, matcher, handler)? {
+                desired.insert(
+                    codex_trust::hook_key(&key_source, event, *group_index, handler_index)?,
+                    digest,
+                );
+            }
+        }
+    }
+    let addressed = codex_trust::addressed_keys(&merge.document, &key_source)?;
+
+    let _lock = ConfigLock::acquire(config_path)?;
+    let mut document = read_utf8_or_empty(config_path)?
+        .parse::<DocumentMut>()
+        .map_err(|error| {
+            invalid(format!(
+                "invalid Codex TOML in {}: {error}",
+                config_path.display()
+            ))
+        })?;
+    let update = codex_trust::apply_trust(&mut document, &key_source, &desired, &addressed)?;
+    if update.changed() {
+        let rendered = document.to_string();
+        // Validated before the replacement rather than after it: the operator's `config.toml` is
+        // the one file here whose corruption would cost them their own settings.
+        rendered.parse::<DocumentMut>().map_err(|error| {
+            invalid(format!(
+                "re-stamping Codex hook trust would have produced invalid TOML: {error}"
+            ))
+        })?;
+        transaction.record(config_path)?;
+        atomic_write(
+            config_path,
+            rendered.as_bytes(),
+            existing_mode(config_path, 0o600)?,
+        )?;
+        parse_toml_file(config_path)?;
+        transaction.phase("restamped_codex_hook_trust")?;
+    }
+    Ok(update)
 }
 
 fn merge_codex_mcp(
@@ -5306,6 +5443,124 @@ fn check_configs(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
             format!("{} has no current runtime registration", codex.display()),
         )),
         Err(error) => checks.push(failed("codex_mcp", error.to_string())),
+    }
+}
+
+/// Reports whether Codex will actually *run* the hooks that are registered.
+///
+/// [`check_configs`] above answers "is the hook written", which is the question that used to be
+/// mistaken for the whole story. Codex adds a second condition: it recomputes each hook's identity
+/// hash at discovery time and skips any hook whose hash does not match the `trusted_hash` stored in
+/// `config.toml`. It reports nothing when it skips one. So a stale hash is a total, silent loss of
+/// every hook -- exactly what the dev.10 install was in when a full session replay produced zero
+/// `<shared-context-active>` markers -- and an absence is the only symptom an operator can see.
+/// This check turns that absence into a sentence.
+///
+/// `ActionRequired`, not `Error`: nothing about the installation is broken, and re-running
+/// `sctx setup` re-stamps the hashes. Only hooks whose command targets the current runtime are
+/// judged, so somebody else's hooks in the same file are neither checked nor blamed.
+fn check_codex_trusted_hash(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
+    const NAME: &str = "codex_trusted_hash";
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    let stable = root.join("bin/current/sctx");
+    let report = read_json_object(&hooks_path).and_then(|hooks| {
+        let key_source = path_text(&hooks_path)?;
+        let stored = read_utf8_or_empty(&config_path)?
+            .parse::<DocumentMut>()
+            .map(|document| codex_trust::stored_trust_hashes(&document))
+            .map_err(|error| {
+                invalid(format!(
+                    "invalid Codex TOML in {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+        let mut ours = 0_usize;
+        let mut untrusted = Vec::new();
+        for handler in codex_trust::iter_hook_handlers(&hooks)? {
+            let targets_runtime = handler
+                .handler
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| command.contains(&stable.to_string_lossy().to_string()));
+            if !targets_runtime {
+                continue;
+            }
+            ours += 1;
+            let Some(digest) =
+                codex_trust::hook_hash(handler.event, handler.matcher, handler.handler)?
+            else {
+                continue;
+            };
+            let key = codex_trust::hook_key(
+                &key_source,
+                handler.event,
+                handler.group_index,
+                handler.handler_index,
+            )?;
+            if stored.get(&key) != Some(&digest) {
+                untrusted.push(handler.event);
+            }
+        }
+        let addressed = codex_trust::addressed_keys(&hooks, &key_source)?;
+        let dead = stored
+            .keys()
+            .filter(|key| {
+                codex_trust::key_source(key) == Some(key_source.as_str())
+                    && !addressed.contains(*key)
+            })
+            .count();
+        Ok((ours, untrusted, dead))
+    });
+    match report {
+        Ok((0, _, _)) => checks.push(ok(
+            NAME,
+            format!(
+                "{} registers no Shared Context hook, so none needs trusting",
+                hooks_path.display()
+            ),
+        )),
+        Ok((ours, untrusted, dead)) if !untrusted.is_empty() => checks.push(action_required(
+            NAME,
+            format!(
+                "{} of {ours} Shared Context hooks in {} are not trusted by {} ({}), so Codex \
+                 silently skips them{}. Run `sctx setup` (or `sctx upgrade`) to re-stamp the \
+                 trust hashes; a Codex upgrade invalidates them every time, because the hash \
+                 covers the hook command and the command carries --agent-version",
+                untrusted.len(),
+                hooks_path.display(),
+                config_path.display(),
+                untrusted.join(", "),
+                if dead == 0 {
+                    String::new()
+                } else {
+                    format!(", and {dead} stale trust keys address hooks that no longer exist")
+                },
+            ),
+        )),
+        Ok((ours, _, dead)) if dead > 0 => checks.push(warning(
+            NAME,
+            format!(
+                "all {ours} Shared Context hooks in {} are trusted, but {dead} stale trust keys \
+                 in {} still address hooks that no longer exist; `sctx setup` clears them",
+                hooks_path.display(),
+                config_path.display()
+            ),
+        )),
+        Ok((ours, _, _)) => checks.push(ok(
+            NAME,
+            format!(
+                "all {ours} Shared Context hooks in {} are trusted by {}",
+                hooks_path.display(),
+                config_path.display()
+            ),
+        )),
+        // Whatever made these unreadable is already reported by `check_configs`, which owns the
+        // parse verdict for both files; saying it twice at Error severity would double-count it.
+        Err(error) => checks.push(warning(
+            NAME,
+            format!("Codex hook trust cannot be verified: {error}"),
+        )),
     }
 }
 

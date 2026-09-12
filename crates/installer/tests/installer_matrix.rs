@@ -2401,6 +2401,342 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
     }
 }
 
+/// Reads the `key -> trusted_hash` pairs the installer left in a Codex `config.toml`.
+fn stored_codex_trust(path: &Path) -> std::collections::BTreeMap<String, String> {
+    let document = fs::read_to_string(path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    sctx_installer::codex_trust::stored_trust_hashes(&document)
+}
+
+/// The hashes Codex itself would demand for every hook in a `hooks.json`.
+fn required_codex_trust(hooks: &Path) -> std::collections::BTreeMap<String, String> {
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(hooks).unwrap()).expect("hooks.json is JSON");
+    sctx_installer::codex_trust::hook_state_entries(
+        document.as_object().unwrap(),
+        hooks.to_str().unwrap(),
+    )
+    .expect("hashable hooks.json")
+}
+
+fn codex_paths(home: &Path) -> (PathBuf, PathBuf) {
+    (
+        home.join(".codex/hooks.json"),
+        home.join(".codex/config.toml"),
+    )
+}
+
+/// Writing `hooks.json` is only half of installing a Codex hook: Codex recomputes each hook's
+/// identity hash at discovery time and silently skips any hook whose hash is not the one
+/// `config.toml` records as trusted. Measured on the dev.10 install -- `hooks.json` had been
+/// rewritten to `--agent-version 0.154.0`, all six stored hashes still described `0.153.4`, and a
+/// full replay produced zero `<shared-context-active>` markers and zero external-session rows.
+#[test]
+fn setup_trusts_every_codex_hook_it_writes_and_nobody_elses() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+
+    let required = required_codex_trust(&hooks);
+    let stored = stored_codex_trust(&config);
+    let source = hooks.to_str().unwrap();
+    let runtime = harness.root.join("bin/current/sctx");
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&hooks).unwrap()).unwrap();
+    for (event, label) in [
+        ("SessionStart", "session_start"),
+        ("UserPromptSubmit", "user_prompt_submit"),
+        ("PostToolUse", "post_tool_use"),
+        ("PreCompact", "pre_compact"),
+        ("Stop", "stop"),
+        ("SessionEnd", "session_end"),
+    ] {
+        // The seeded fixture already owns `Stop` group 0, so our own `Stop` hook lands at group 1:
+        // the address has to be found, not assumed.
+        let index = document["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("{event} is not in hooks.json"))
+            .iter()
+            .position(|group| {
+                group["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains(runtime.to_str().unwrap()))
+            })
+            .unwrap_or_else(|| panic!("no {event} hook targets the current runtime"));
+        let key = format!("{source}:{label}:{index}:0");
+        assert_eq!(
+            stored.get(&key),
+            required.get(&key),
+            "{event} is registered but not trusted, so Codex would skip it"
+        );
+    }
+    // The operator's own `Stop` hook at group 0 is in the same file. Its trust is theirs to grant:
+    // setup must not have stamped it.
+    assert!(
+        !stored.contains_key(&format!("{source}:stop:0:0")),
+        "setup granted Codex execution trust to a hook it did not write"
+    );
+    assert_eq!(stored.len(), 6, "exactly our six hooks were trusted");
+}
+
+/// The hash covers the hook *command*, and the command carries `--agent-version`. So every Codex
+/// upgrade invalidates all six stored hashes at once; re-stamping cannot be a first-install-only
+/// step.
+#[test]
+fn an_upgrade_that_rewrites_the_hook_command_re_stamps_its_trust() {
+    let harness = Harness::new();
+    let before = Installer::new(
+        harness.context("1.0.0"),
+        Arc::new(FakeHost {
+            codex_version: Some("0.153.4"),
+            ..FakeHost::default()
+        }),
+    );
+    before.setup(&SetupOptions::default()).unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let first = stored_codex_trust(&config);
+    assert_eq!(first, required_codex_trust(&hooks));
+
+    let after = Installer::new(
+        harness.context("1.1.0"),
+        Arc::new(FakeHost {
+            codex_version: Some("0.154.0"),
+            ..FakeHost::default()
+        }),
+    );
+    let report = after.upgrade(&SetupOptions::default()).unwrap();
+    assert!(
+        report
+            .notices
+            .iter()
+            .all(|notice| !notice.contains("could not re-stamp"))
+    );
+    let second = stored_codex_trust(&config);
+    assert_eq!(
+        second,
+        required_codex_trust(&hooks),
+        "the upgrade left Codex refusing every hook it had just rewritten"
+    );
+    assert_ne!(
+        first, second,
+        "the fixture must actually change the command, or this proves nothing"
+    );
+    assert!(
+        fs::read_to_string(&hooks).unwrap().contains("0.154.0"),
+        "the hook command should name the newly detected Codex version"
+    );
+}
+
+/// Two disciplines in one test, because they are the same discipline: the installer owns its own
+/// state keys and nothing else. A key addressing a position our `hooks.json` no longer has is dead
+/// -- it can run nothing -- so reclaiming it takes no capability from anyone. A key addressing
+/// another source is not ours to read, rewrite, or remove, however dead it looks.
+#[test]
+fn setup_prunes_its_own_dead_trust_keys_and_leaves_foreign_sources_alone() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let source = hooks.to_str().unwrap().to_owned();
+
+    // What the real install looked like: keys from a Shared Context version that registered more
+    // events than this one does, next to a project hooks file and a plugin-provided source.
+    let foreign = [
+        "/some/project/.codex/hooks.json:stop:0:0",
+        "auto-tracking@ai-metrics:hooks/hooks.json:session_start:0:0",
+    ];
+    let mut body = fs::read_to_string(&config).unwrap();
+    for stale in [
+        "pre_tool_use:0:0",
+        "subagent_start:0:0",
+        "subagent_stop:0:0",
+    ] {
+        write!(
+            body,
+            "\n[hooks.state.\"{source}:{stale}\"]\ntrusted_hash = \"sha256:stale\"\n"
+        )
+        .unwrap();
+    }
+    for key in foreign {
+        write!(
+            body,
+            "\n[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:theirs\"\nenabled = true\n"
+        )
+        .unwrap();
+    }
+    fs::write(&config, &body).unwrap();
+
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let stored = stored_codex_trust(&config);
+    for stale in [
+        "pre_tool_use:0:0",
+        "subagent_start:0:0",
+        "subagent_stop:0:0",
+    ] {
+        assert!(
+            !stored.contains_key(&format!("{source}:{stale}")),
+            "{stale} addresses a hook that no longer exists and should have been pruned"
+        );
+    }
+    for key in foreign {
+        assert_eq!(
+            stored.get(key).map(String::as_str),
+            Some("sha256:theirs"),
+            "{key} belongs to another source and must be untouched"
+        );
+    }
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("enabled = true"),
+        "a foreign entry's other fields must survive too"
+    );
+    assert_eq!(stored_codex_trust(&config).len(), 6 + foreign.len());
+}
+
+/// `config.toml` is the operator's hand-written file. When re-stamping cannot proceed, an install
+/// that is otherwise complete must still complete: the cost of the failure is hooks that do not
+/// fire, which is worth a sentence and a doctor check, never worth discarding a finished setup.
+#[test]
+fn an_unusable_codex_config_degrades_the_trust_stamp_to_a_notice() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    let (_, config) = codex_paths(&harness.home);
+    // Valid TOML, so the MCP merge still succeeds, but `hooks` is not a table -- the one shape
+    // the re-stamp refuses rather than overwriting.
+    fs::write(&config, "model = \"fixture\"\nhooks = 1\n").unwrap();
+
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        report.notices.iter().any(|notice| notice
+            .contains("could not re-stamp the Codex hook trust hashes")
+            && notice.contains("codex_trusted_hash")),
+        "a degraded trust stamp must be reported: {:?}",
+        report.notices
+    );
+    assert_eq!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .matches("hooks = 1")
+            .count(),
+        1,
+        "the shape we refused to interpret must be left exactly as it was"
+    );
+    // And the consequence is visible rather than inferred: with no `[hooks.state]` to read, every
+    // installed hook is untrusted, which is exactly what Codex will do with them.
+    let report = harness.installer("1.0.0").doctor();
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "codex_trusted_hash")
+        .expect("the check is registered");
+    assert_eq!(check.status, CheckStatus::ActionRequired);
+    assert!(check.message.contains("6 of 6"), "{}", check.message);
+}
+
+#[test]
+fn doctor_reports_whether_codex_actually_trusts_the_installed_hooks() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let trusted = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "codex_trusted_hash")
+            .cloned()
+            .expect("the check is registered")
+    };
+
+    let healthy = trusted(&harness.installer("1.0.0").doctor());
+    assert_eq!(healthy.status, CheckStatus::Ok);
+    assert!(healthy.message.contains("all 6"), "{}", healthy.message);
+
+    // Exactly the dev.10 state: the hooks file is current, the stored hashes describe an older
+    // command. Nothing else on the installation is wrong, so this is the operator's action, not an
+    // error.
+    let stale = fs::read_to_string(&config)
+        .unwrap()
+        .replace("trusted_hash = \"sha256:", "trusted_hash = \"sha256:00");
+    fs::write(&config, stale).unwrap();
+    let broken = trusted(&harness.installer("1.0.0").doctor());
+    assert_eq!(broken.status, CheckStatus::ActionRequired);
+    assert!(
+        broken.message.contains("6 of 6")
+            && broken.message.contains("silently skips them")
+            && broken.message.contains("sctx setup"),
+        "the check has to name the repair: {}",
+        broken.message
+    );
+    let report = harness.installer("1.0.0").doctor();
+    assert!(
+        report.healthy,
+        "an untrusted hook is an action, not a broken installation"
+    );
+
+    // A dead key of our own is worth saying, but it costs no hook: a warning, not an action.
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let mut body = fs::read_to_string(&config).unwrap();
+    write!(
+        body,
+        "\n[hooks.state.\"{}:subagent_stop:0:0\"]\ntrusted_hash = \"sha256:dead\"\n",
+        hooks.to_str().unwrap()
+    )
+    .unwrap();
+    fs::write(&config, body).unwrap();
+    let stale_only = trusted(&harness.installer("1.0.0").doctor());
+    assert_eq!(stale_only.status, CheckStatus::Warning);
+    assert!(
+        stale_only.message.contains("1 stale trust keys"),
+        "{}",
+        stale_only.message
+    );
+}
+
+/// A rolled-back setup must leave `config.toml` byte-for-byte as it found it, trust keys included.
+#[test]
+fn a_failed_setup_restores_the_codex_trust_state_it_had_rewritten() {
+    let harness = Harness::new();
+    let seeded = harness.seed_configs();
+    let (_, config) = codex_paths(&harness.home);
+    let original = seeded
+        .iter()
+        .find(|(path, _, _)| path == &config)
+        .map(|(_, bytes, _)| bytes.clone())
+        .unwrap();
+
+    let failing = harness
+        .installer("1.0.0")
+        .with_failure_after(SetupStage::CodexHookTrustStamped);
+    assert!(failing.setup(&SetupOptions::default()).is_err());
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        original,
+        "rollback left the operator's Codex config rewritten"
+    );
+}
+
 #[test]
 fn doctor_reports_codex_trust_as_action_required() {
     let harness = Harness::new();

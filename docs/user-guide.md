@@ -973,6 +973,19 @@ sctx doctor
 
 如果报告为 `ACTION REQUIRED`，按报告中的 Agent 能力提示完成信任设置，再运行 `sctx doctor --fix`。Hook 不可用时系统会降级；正常编程不会被阻断，但 Agent 应在结束前用 flat `task_checkpoint` 直接提交完整 Claims/Unknowns。`doctor` 报告里的 `adapter_capability.*` 只反映 Hook 可用性与信任状态，附带上报检测到的版本；版本本身无论是什么形态都不会把检查降级为 Warning。
 
+### 7.2.1 Codex 侧 Hook 明明装了却一个都不跑
+
+这是另一种"信任"，和 7.2 的 `--trust` 不是同一件事。Codex 在发现 hook 时会重算它的身份哈希，只执行哈希与 `~/.codex/config.toml` 里 `[hooks.state]` 记录的 `trusted_hash` 一致的 hook；不一致就跳过，**且不打印任何错误**。所以唯一症状是"缺席"：注入标记不出现、`external_session` 没有行、`hooks.json` 里却明明写着我们的命令。
+
+哈希覆盖 hook 的命令行，而命令行带 `--agent-version`——**codex-cli 一升级，六个哈希同时失效**。`sctx setup` / `sctx upgrade` 会在写 `hooks.json` 的同一事务里重戳它们，所以修复就是重跑一次安装：
+
+```bash
+sctx setup
+sctx doctor        # 看 codex_trusted_hash 这一项
+```
+
+`codex_trusted_hash` 的三种状态：`ok` 表示六个 hook 都被信任；`action_required` 表示有 hook 会被静默跳过，文案会写清数量和修复命令；`warning` 表示 `config.toml` 里有一处形状让重戳被降级成 notice（安装本身是完整的）。重戳只动 setup 亲手写入的键——同一个文件里别人的 hook、project 来源和插件来源的键一律不碰。
+
 ### 7.3 报 `intent_stale` 或 Review 版本过期
 
 这是并发保护在生效，不是数据损坏。重新读取当前 Task/Candidate，使用最新的 `intent_revision_id` 或 `review_version`，核对内容后重试。`task_checkpoint` 不接受调用者提供的 Task/Intent/Episode CAS；同 scoped content 应原样重试，不要猜 ID 或添加重试键。
