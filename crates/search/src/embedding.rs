@@ -9,19 +9,21 @@
 //!   before this module existed -- not approximately, and not "with an empty channel": the
 //!   [`crate::SearchEngine`] holds `None` and never reports an omission it had no channel to fail.
 //! * **It never blocks.** Corpus vectors are a discardable local cache filled by a background
-//!   thread. The query path reads that cache and encodes one query under a hard wall-clock budget;
-//!   every failure mode -- absent model, unfinished load, slow encode -- degrades to
-//!   [`SemanticOutcome::Unavailable`], which the Pack reports as `embedding_unavailable` while the
+//!   thread. Retrieval reads that cache and nothing else: every comparison ADR-0007 makes is
+//!   between two vectors the backfill already wrote, so no retrieval can acquire a model call,
+//!   and a channel that has not finished loading reports `embedding_unavailable` while the
 //!   lexical channels answer unchanged.
 //!
-//!   That budget is the one number in this file that has already been wrong once, and the way it
-//!   was wrong is worth keeping in view. It was set for a *short* query, because the probe suite
-//!   that validated it asked short questions. A real query is a Working Intent flattened to a few
-//!   hundred characters, the encode cost scales with that length, and the result was a channel
-//!   that loaded a two-gigabyte model, embedded the whole corpus, reported no error, and
-//!   contributed to nothing in any real session. Degrading silently is right; degrading silently
-//!   *and leaving no trace* is what turned one mis-calibrated constant into an invisible total
-//!   failure. Hence [`EncodeSample`]: every encode says what it cost and whether it fit.
+//!   There was a query path here, and the way it failed is worth keeping in view. It encoded the
+//!   caller's text under a wall-clock budget, and that budget was set for a *short* query because
+//!   the probe suite that validated it asked short questions. A real query was a Working Intent
+//!   flattened to a few hundred characters, the encode cost scales with length, and the result
+//!   was a channel that loaded a two-gigabyte model, embedded the whole corpus, reported no
+//!   error, and contributed to nothing in any real session. What retired it in the end was not
+//!   the budget: measured on a real installation, the intent-text path took its top hit from an
+//!   unrelated topic every time, which is a ranking signal being asked to make an admission
+//!   decision. ADR-0007 replaced it with the second hop, and this module now has no query side at
+//!   all.
 //! * **It is one channel, never the answer.** The prototype that motivated ADR-0004 lost
 //!   identifier queries outright and could not tell a near-duplicate from its neighbour. Its
 //!   output is fused, never substituted.
@@ -29,11 +31,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Condvar, Mutex, OnceLock, RwLock,
-        mpsc::{RecvTimeoutError, sync_channel},
-    },
-    time::{Duration, Instant, UNIX_EPOCH},
+    sync::{Arc, Condvar, Mutex, RwLock},
+    time::{Duration, UNIX_EPOCH},
 };
 
 use rusqlite::Connection;
@@ -42,120 +41,6 @@ use sha2::{Digest, Sha256};
 
 #[cfg(feature = "embedding-onnx")]
 pub mod onnx;
-
-/// Cosine similarity, in basis points, a corpus revision must reach to enter the channel.
-///
-/// ADR-0004 set a provisional 0.50 from a two-fixture prototype and explicitly deferred the final
-/// value to the T5a extended set. This is that recalibration, and the extended set moved it:
-/// measured against `fixtures/association/probe-ext-v1.json` with a real bge-m3 export, the
-/// highest-scoring noise query reaches 5095 and the lowest-scoring cross-lingual positive reaches
-/// 5640. A floor of 0.50 therefore admits one noise query outright -- and because a semantic hit
-/// is its own injection eligibility path, admitting it is enough to put a Context in front of an
-/// Agent who asked about something else entirely.
-///
-/// 5200 sits 105 basis points above the noise ceiling and 440 below the lowest positive the
-/// channel exists to rescue. One `multi_hop` probe scores 5160 and is given up deliberately: the
-/// alternative is defending a five-basis-point gap, which is not a threshold but an overfit to one
-/// fixture. Noise rejection is the constraint that does not bend, because a wrong Context nobody
-/// asked for is worse than no Context at all.
-pub const SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 5_200;
-
-/// The same floor for the F2LLM encoder over a Qwen3-0.6B decoder.
-///
-/// The value this constant held first came from a torch/Python benchmark run before any of this
-/// existed in the workspace, and it said so, because ADR-0004 has twice recorded what happens when
-/// a retrieval constant is calibrated somewhere other than where it runs. This is the T5a procedure
-/// repeated on the stack that ships: measured 2026-09-07 on Apple Silicon / macOS 24.6.0, ONNX
-/// Runtime 1.28.1, the `codefuse-ai/F2LLM-v2-0.6B` Hub export, release profile, over all three
-/// association fixtures at once -- 27 Contexts encoded as corpus, 85 probe queries encoded through
-/// the query path with the model's instruction prefix, by
-/// `crates/search/tests/embedding_qwen3_floor_calibration.rs`.
-///
-/// That run separates into three regions, and the middle one is why this number is not 2400:
-///
-/// | region | range |
-/// |---|---|
-/// | 8 noise queries | 303 -- **2070** |
-/// | 2 outlying positives (`probe-v1` zh-07, en-04) | 2403, 2447 |
-/// | the other 75 positives | **3217** -- 8588 |
-///
-/// 2800 sits in the widest empty band the distribution has: 730 basis points above every noise
-/// query and 417 below the lowest positive of the main mass. Noise rejection is the constraint that
-/// does not bend -- a semantic hit is its own injection eligibility path, so one noise query above
-/// the floor is enough to put a Context in front of an Agent who asked about something else -- and
-/// the remaining room is spent on the positives that are still to come rather than on the two this
-/// fixture happens to hold.
-///
-/// Those two are given up deliberately. Reaching them costs a floor of 2400, three basis points
-/// under zh-07, which is an overfit to one fixture row rather than a threshold; and zh-07 would not
-/// even be answered by admitting it, because a distractor outscores its expected Context (2445
-/// against 2403). Their category survives regardless: `chinese_natural_language` keeps 24 of 25 and
-/// `english_natural_language` 6 of 7. Both are also two-word keyword queries -- `功能等价` and
-/// `functional equivalence` -- which is the shape with the least for an encoder to work with and the
-/// most for a lexical index, and `association_probe_workflow` measures both as lexical hits through
-/// both entry points today. Giving them up costs this suite nothing.
-/// Fusion over the extended fixture measures the same 32/39 at 2800 as at any floor down to 2200,
-/// so the band is a choice about safety margin and nothing else
-/// (`crates/cli/tests/association_probe_ext_semantic_f2llm.rs`).
-///
-/// A second constant rather than a second opinion about the first: cosine floors are not portable
-/// between embedding spaces. bge-m3's CLS vectors and a decoder's last-token vectors spread their
-/// similarities over different ranges -- this family's noise ceiling, 2070, is below bge-m3's floor
-/// by more than three thousand basis points -- and carrying 5200 across would reject nearly
-/// everything this family retrieves, exactly as carrying 2800 back would admit noise bge-m3 was
-/// calibrated to refuse. Which one applies is a property of the loaded model, so the loaded provider
-/// is what reports it -- see [`EmbeddingProvider::similarity_floor_basis_points`].
-///
-/// ## What this number did and did not govern before 2026-09-10
-///
-/// The calibration above has always encoded revision fields as written. Production did not: until
-/// the corpus join was fixed (`SEMANTIC_CORPUS_VERSION` `"1"` -> `"2"`, see
-/// `SearchEngine::embeddable_revisions`) every installed vector was built from `context_fts`, i.e.
-/// from `normalize_search_text` output, which for CJK is overlapping bigram shrapnel. So this floor
-/// was cutting one distribution in the calibration suite and a different one in the field, and no
-/// test could see the gap: the fixtures and the probes both went through the intended path, and the
-/// only code that took the wrong one was the backfill.
-///
-/// The value is therefore left alone here. 2800 is what the calibration measured, the calibration
-/// measured the space production now actually uses, and this is the first time those two statements
-/// are both true -- which makes this a restoration of the floor's meaning, not evidence for a new
-/// value. Re-deriving one belongs to the rebuild work, against a re-encoded corpus, not to the fix
-/// that made re-deriving meaningful.
-///
-/// ## Re-read in the clean space, 2026-09-11, and deliberately left at 2800
-///
-/// That re-derivation was done, and it changed the floor's *job* rather than its value.
-/// `embedding_hop2_admission_calibration.rs` scores the six Working Intents of
-/// `fixtures/association/hard-negative-v1.json` -- goal, current direction and in-scope list joined
-/// exactly as `semantic_query_text` joins them -- against the Contexts of the two topics each
-/// Intent is *not* about. This floor admits **31 of those 96 off-topic Contexts, 32.3%**. Per
-/// Intent the pass rate runs from 0/16 to 13/16, and the single highest off-topic score is 5125.
-///
-/// The value is nonetheless unchanged, because that number is not evidence against it.
-///
-/// * **The failure it describes is structural, not numerical.** Ranking is intact on the same run:
-///   every Intent's best on-topic Context beats its best off-topic one by 2902 to 5584 basis
-///   points, without exception. So the encoder knows which Contexts belong to the task, and the
-///   floor is simply not the thing that acts on that knowledge -- it admits a third of the corpus
-///   and leaves the ordering to decide the rest. Raising a number cannot convert a ranking signal
-///   into an admission decision; that is what the second hop's
-///   [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] is for, and on the same six Intents it admits
-///   0 of 96.
-/// * **Raising it would break the job this floor still has.** Under the two-lane design the
-///   intent-text path is retired from automatic injection and what remains behind this floor is
-///   explicit `context_search`, where a caller asked for a broad list and a short human phrase is
-///   the query. The calibration above measured that population directly: positives run 2403--8588
-///   with the main mass starting at 3217, so a floor anywhere near the document-side 5200 would
-///   refuse most of what an explicit search exists to return. The two floors are not two opinions
-///   about one boundary; they cut two different distributions for two different callers.
-/// * **This corpus cannot settle the question it would have to settle.** `hard-negative-v1` holds
-///   no noise queries, which is the constraint that set 2800 in the first place, and its Intents
-///   were written alongside its Contexts -- so they share vocabulary a real Working Intent, written
-///   before the work is understood, does not. The device run behind ADR-0007 is the honest evidence
-///   on that path and it is worse than this one: five real Intents scored against a real corpus
-///   took their top hit from an unrelated topic every time, with the highest at 5501. That is the
-///   defect the architecture change addresses, and no value of this constant addresses it.
-pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 2_800;
 
 /// Cosine a candidate Context must reach against a *seed Context* to be admitted by the second hop.
 ///
@@ -234,125 +119,20 @@ pub const QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS: u16 = 2_800;
 /// Contexts at all, so the cross-repository claim rests on two repositories rather than three.
 pub const SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS: u16 = 5_200;
 
-/// Most revisions one query may contribute through the semantic channel.
-///
-/// Fusion ranks within a channel, so an unbounded channel would hand a rank to every vector above
-/// the floor and let the long tail of weak semantic neighbours outvote a strong lexical match by
-/// sheer count.
-pub const SEMANTIC_CHANNEL_LIMIT: usize = 16;
-
-/// Default wall clock a single query encode may spend before the channel reports itself
-/// unavailable.
-///
-/// The first value here was 200 ms, taken from ADR-0004's "30--85 ms p95". That number came from a
-/// torch prototype, not the `ort` stack this workspace ships, and it was validated against probe
-/// queries 15--40 characters long. A real query is a Working Intent flattened -- goal, current
-/// direction and in-scope list concatenated -- and the encode cost is roughly linear in its
-/// length. Codex session 01a06646 built a 283-character query and every one of its automatic
-/// retrievals reported `embedding_unavailable`: the channel was not slow on that machine, it was
-/// calibrated against a query length no real session produces.
-///
-/// **bge-m3.** Measured 2026-09-03, Apple Silicon / macOS 24.6.0, ONNX Runtime 1.28.1, bge-m3 ONNX
-/// export, release profile, warm (`crates/search/tests/embedding_encode_latency.rs`, 24 samples
-/// each):
-///
-/// | chars | p50 | p95 | max |
-/// |------:|----:|----:|----:|
-/// |    20 |  28 |  33 |  37 |
-/// |    40 |  33 |  37 |  43 |
-/// |   100 |  74 |  78 |  81 |
-/// |   200 | 139 | 153 | 164 |
-/// |   283 | 197 | 235 | 243 |
-/// |   400 | 274 | 298 | 301 |
-/// |   700 | 458 | 539 | 633 |
-/// |  1400 | 757 | 816 | 828 |
-///
-/// The debug profile runs about 20% slower and tops out at 995 ms p95 for the longest query.
-/// [`SEMANTIC_MAX_TOKENS`] caps the sequence, so 1400 characters is already at the truncation
-/// ceiling and 816 ms is the worst warm encode this machine can be asked for.
-///
-/// **F2LLM-v2-0.6B**, the export `sctx embedding install` now defaults to. Measured 2026-09-07 on
-/// the same machine, runtime and profile, same 24 samples per length, by the same file. The middle
-/// column is what the ladder's characters cost in *tokens* for this tokenizer, because that is what
-/// the cap counts:
-///
-/// | chars | tokens | p50 | p95 | max |
-/// |------:|-------:|----:|----:|----:|
-/// |    20 |     30 |  58 |  63 |  63 |
-/// |    40 |     40 |  71 |  76 |  77 |
-/// |   100 |     65 | 111 | 113 | 113 |
-/// |   200 |    104 | 169 | 169 | 171 |
-/// |   283 |    132 | 215 | 236 | 246 |
-/// |   400 |    178 | 295 | 344 | 350 |
-/// |   700 |    290 | 493 | 536 | 546 |
-/// |  1400 |    512 | 941 | 986 |1000 |
-///
-/// 1400 characters of this text is exactly [`SEMANTIC_MAX_TOKENS`], so that row is the ceiling for
-/// this family too; a separately measured 6000-character query, truncated to the same 512 tokens,
-/// returns in 959 ms p95, which is the same number reached from the other side.
-///
-/// The two families cost the same at the length that matters and diverge at the tail: 236 ms
-/// against 235 ms for a real 283-character Intent, 986 ms against 816 ms at the cap. Model load is
-/// 2.1--2.5 s (runtime initialisation and session, warm page cache) and the process holds about
-/// 1.83 GB resident with the weights in.
-///
-/// One thing the 2026-09-04 derivation of this constant does not survive on the new table, and it
-/// is recorded here rather than quietly fixed: 2000 ms is 2.0x the F2LLM ceiling, where the load
-/// factor that session 01a06b3e measured was 3--5x. It was already only 2.45x the bge-m3 ceiling,
-/// so the shortfall is not a property of the new default -- what the new default does is make it
-/// slightly worse at the longest query the constant can be asked for, while leaving the real-Intent
-/// case (283 characters, 8x headroom) exactly where it was. Raising the budget is an ADR-0004
-/// decision, not a doc-comment one.
-///
-/// Every row above is a quiet machine, and that is the table's limit. Codex session 01a06b3e --
-/// 6.7 hours of real work, the machine also running builds and the Agent itself -- encoded at
-/// three to five times these numbers: a 76-character query took 379 ms against a 78 ms quiet p95,
-/// and a 394-character query took **1505 ms and timed out**, which is a length the quiet table
-/// answers in under 300 ms. The 1200 ms budget did not fail because the machine is slow; it failed
-/// because a busy machine is the normal case and the calibration only ever saw an idle one.
-///
-/// 2000 ms is the quiet 512-token ceiling (816 ms) carried through that measured 3--5x load
-/// factor: even the longest query this constant can be asked for stays inside the budget while
-/// the machine is under the load a real session puts it under. It remains a *ceiling*, not a
-/// typical cost -- the 283-character query that exposed the original defect returns in about
-/// 200 ms quiet, and a repeat of any query is served from the query vector cache for nothing at
-/// all. What the number buys is that the channel keeps answering during exactly the long sessions
-/// that accumulate the most Context, instead of degrading silently once the machine gets busy.
-///
-/// Operators on slower hardware raise it with `[retrieval] embedding_encode_budget_ms`; `sctx
-/// doctor` says so when it sees encodes timing out.
-pub const SEMANTIC_ENCODE_BUDGET: Duration = Duration::from_secs(2);
-
-/// Query vectors kept in the process-lifetime LRU that fronts the encoder.
-///
-/// A Working Intent changes far more slowly than it is read: `task_context` re-reads the same
-/// Intent, `task_artifact_focus` fires repeatedly against one Task, and every one of those builds
-/// the identical query string. Sixty-four entries is a few hundred kilobytes and covers every
-/// Intent a session realistically holds open at once.
-pub const SEMANTIC_QUERY_CACHE_CAPACITY: usize = 64;
-
-/// Encode observations kept in the discardable cache for `sctx embedding status` and `sctx doctor`.
-///
-/// Enough to show a distribution and a timeout rate; small enough that the trim is one statement
-/// and the rows never become a storage decision.
-pub const SEMANTIC_ENCODE_SAMPLE_HISTORY: usize = 64;
-
 /// Second-hop admission decisions kept in the discardable cache.
 ///
-/// Two orders of magnitude above [`SEMANTIC_ENCODE_SAMPLE_HISTORY`], and the difference is what the
-/// two histories are read for. An encode history answers "is this budget fit for this machine",
-/// which the last few dozen calls settle. This one is the data source ADR-0007 pre-registered for
-/// re-deriving [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] from real traffic, and a threshold is
-/// re-derived from a *distribution* -- one pass of the second hop over a 26-Context installation
-/// with four seeds already writes about a hundred rows, so 64 would hold a single retrieval's worth
-/// of them and answer nothing. At roughly 100 bytes a row this is a few hundred kilobytes in a file
-/// that already holds megabytes of floats, which keeps it what the rest of `semantic.sqlite` is:
-/// derived data an operator may delete at any moment.
+/// This is the data source ADR-0007 pre-registered for re-deriving
+/// [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`] from real traffic, and a threshold is re-derived
+/// from a *distribution* -- one pass of the second hop over a 26-Context installation with four
+/// seeds already writes about a hundred rows, so a window of a few dozen would hold a single
+/// retrieval's worth of them and answer nothing. At roughly 100 bytes a row this is a few hundred
+/// kilobytes in a file that already holds megabytes of floats, which keeps it what the rest of
+/// `semantic.sqlite` is: derived data an operator may delete at any moment.
 pub const SEMANTIC_HOP2_SAMPLE_HISTORY: usize = 4_096;
 
-/// Longest query, in model tokens, handed to the encoder. bge-m3 accepts far more; retrieval
-/// queries built from a Working Intent do not need them, and truncation keeps the encode inside
-/// [`SEMANTIC_ENCODE_BUDGET`].
+/// Longest text, in model tokens, handed to the encoder. bge-m3 accepts far more; a Context's
+/// statement, rationale and problem view do not need them, and truncation bounds what one corpus
+/// encode can cost the backfill.
 pub const SEMANTIC_MAX_TOKENS: usize = 512;
 
 /// Turns text into a unit-length vector in a fixed embedding space.
@@ -371,20 +151,6 @@ pub trait EmbeddingProvider: Send + Sync {
     /// Returns a typed error when the text cannot be tokenized or the model cannot be run.
     fn encode(&self, text: &str) -> Result<Vec<f32>>;
 
-    /// Cosine similarity, in basis points, below which this provider's vectors say nothing useful.
-    ///
-    /// The floor belongs to the provider because it is a property of the embedding space, not of
-    /// retrieval: it is read off a calibration run against one model, and the number that keeps
-    /// noise out of one space is the number that empties another. A caller that reached for a
-    /// constant instead would be asserting that every encoder scores alike, which is the assumption
-    /// that breaks the moment a second family is installed.
-    ///
-    /// The default is [`SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`], which is bge-m3's -- the space
-    /// every provider that predates a second family produces vectors in.
-    fn similarity_floor_basis_points(&self) -> u16 {
-        SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS
-    }
-
     /// Encodes corpus text nobody is waiting for, yielding the encoder to queries.
     ///
     /// The vector must be identical to [`EmbeddingProvider::encode`]'s -- corpus and query vectors
@@ -401,49 +167,21 @@ pub trait EmbeddingProvider: Send + Sync {
     fn encode_bulk(&self, text: &str) -> Result<Vec<f32>> {
         self.encode(text)
     }
-
-    /// Whether corpus encodes are competing for this provider right now.
-    ///
-    /// It is what separates "this encode overran because the machine cannot meet the budget" from
-    /// "this encode overran because it queued behind the corpus backfill". The first is a reason
-    /// to raise `[retrieval] embedding_encode_budget_ms`; the second is a window that closes by
-    /// itself, and telling an operator to raise a budget over it would be wrong.
-    fn is_backfilling(&self) -> bool {
-        false
-    }
-}
-
-/// One corpus revision the semantic channel matched, with the similarity that admitted it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SemanticHit {
-    /// The accepted revision whose cached vector matched.
-    pub revision_id: RevisionId,
-    /// Cosine similarity scaled to basis points and clamped to `[0, 10000]`.
-    pub similarity_basis_points: u16,
-}
-
-/// What the semantic channel had to say about one query.
-///
-/// The two variants are deliberately not collapsed into `Vec`: an empty hit list means the channel
-/// ran and found nothing above the floor, while [`Self::Unavailable`] means it could not run at
-/// all. Only the second one is worth an omission line in the Pack.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SemanticOutcome {
-    /// The model was missing, still loading, or too slow for [`SEMANTIC_ENCODE_BUDGET`].
-    Unavailable,
-    /// The channel ran. The vector is sorted by descending similarity and already truncated to
-    /// [`SEMANTIC_CHANNEL_LIMIT`].
-    Hits(Vec<SemanticHit>),
 }
 
 /// One published generation of corpus vectors, shared by every reader of the same channel.
 pub type DocumentVectorSnapshot = Arc<Vec<(RevisionId, Vec<f32>)>>;
 
-/// The query-time face of the channel, so retrieval never depends on how vectors are produced.
+/// The retrieval-time face of the channel, so retrieval never depends on how vectors are produced.
+///
+/// It has no query method. It had one -- `similar_revisions`, which encoded the caller's text and
+/// ranked the corpus against it -- and ADR-0007 retired the only path that called it: automatic
+/// injection reaches knowledge through the files a Session touched, and the second hop compares
+/// one stored Context vector against another. Explicit `context_search` builds its own engine and
+/// has never held a channel. So nothing in production ever asked this trait a question again, and
+/// the method, its floors, its budget, its query cache and its encode telemetry are gone rather
+/// than left as a surface that reads as live.
 pub trait SemanticChannel: Send + Sync {
-    /// Ranks cached corpus revisions against one query text.
-    fn similar_revisions(&self, query_text: &str) -> SemanticOutcome;
-
     /// The cached document vectors this channel was published over.
     ///
     /// ADR-0007's second hop compares a seed Context against a candidate Context, so both sides are
@@ -519,149 +257,6 @@ impl SemanticCacheKey {
     }
 }
 
-/// Process-lifetime LRU of query vectors, shared by every channel built over the same generation.
-///
-/// The corpus cache on disk answers "what does this Context embed to". This one answers "what does
-/// *this query* embed to", and it exists because the query side turned out to be the expensive
-/// half: one encode of a real Working Intent costs about as much as the entire lexical retrieval
-/// it is supposed to augment, and a session asks the same question repeatedly.
-///
-/// Two properties make it worth more than the memory it costs. A hit is not merely fast, it is
-/// *free*: it skips the worker thread and the budget entirely. And an encode that overran the
-/// budget still lands here when it finishes, so the caller that gave up is the only one that pays
-/// -- the next read of the same Intent is a hit. That turns a systematic timeout from permanent
-/// silence into one slow first call.
-#[derive(Debug, Default)]
-pub struct QueryVectorCache {
-    entries: Mutex<QueryVectorEntries>,
-    capacity: usize,
-}
-
-#[derive(Debug, Default)]
-struct QueryVectorEntries {
-    /// Digest of the generation and the query text, to the vector and the tick it was last read.
-    vectors: BTreeMap<[u8; 32], (Arc<Vec<f32>>, u64)>,
-    /// Monotonic read counter. Recency, not wall clock: a clock that can move backwards would let
-    /// eviction pick the entry it just stored.
-    tick: u64,
-}
-
-impl QueryVectorCache {
-    /// Builds an empty cache holding at most `capacity` vectors.
-    #[must_use]
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: Mutex::new(QueryVectorEntries::default()),
-            capacity: capacity.max(1),
-        }
-    }
-
-    /// The shared cache for one cache generation, created on first use.
-    ///
-    /// Sharing it across channel instances is the point. [`crate::EmbeddingSemanticChannel`] is
-    /// rebuilt and republished when the corpus backfill finishes, and a per-instance cache would
-    /// be thrown away at exactly the moment a session has warmed it up.
-    #[must_use]
-    pub fn shared(key: &SemanticCacheKey) -> Arc<Self> {
-        static SHARED: OnceLock<Mutex<BTreeMap<String, Arc<QueryVectorCache>>>> = OnceLock::new();
-        let namespace = format!("{}\u{0}{}", key.model_fingerprint, key.ranking_version);
-        let caches = SHARED.get_or_init(|| Mutex::new(BTreeMap::new()));
-        let Ok(mut caches) = caches.lock() else {
-            // A poisoned registry costs cache sharing, never an answer.
-            return Arc::new(Self::with_capacity(SEMANTIC_QUERY_CACHE_CAPACITY));
-        };
-        Arc::clone(
-            caches
-                .entry(namespace)
-                .or_insert_with(|| Arc::new(Self::with_capacity(SEMANTIC_QUERY_CACHE_CAPACITY))),
-        )
-    }
-
-    /// Returns the cached vector for `query_text` under `key`, if one is held.
-    #[must_use]
-    pub fn get(&self, key: &SemanticCacheKey, query_text: &str) -> Option<Arc<Vec<f32>>> {
-        let digest = Self::digest(key, query_text);
-        let mut entries = self.entries.lock().ok()?;
-        entries.tick = entries.tick.wrapping_add(1);
-        let tick = entries.tick;
-        let (vector, last_read) = entries.vectors.get_mut(&digest)?;
-        *last_read = tick;
-        Some(Arc::clone(vector))
-    }
-
-    /// Stores one query vector, evicting the least recently read entry when full.
-    pub fn store(&self, key: &SemanticCacheKey, query_text: &str, vector: Arc<Vec<f32>>) {
-        let digest = Self::digest(key, query_text);
-        let Ok(mut entries) = self.entries.lock() else {
-            return;
-        };
-        entries.tick = entries.tick.wrapping_add(1);
-        let tick = entries.tick;
-        entries.vectors.insert(digest, (vector, tick));
-        while entries.vectors.len() > self.capacity {
-            let Some(coldest) = entries
-                .vectors
-                .iter()
-                .min_by_key(|(_, (_, last_read))| *last_read)
-                .map(|(digest, _)| *digest)
-            else {
-                break;
-            };
-            entries.vectors.remove(&coldest);
-        }
-    }
-
-    /// How many vectors the cache currently holds.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries
-            .lock()
-            .map_or(0, |entries| entries.vectors.len())
-    }
-
-    /// True when the cache holds nothing.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Hashes the generation and the query together, so a model swap cannot serve a stale vector.
-    fn digest(key: &SemanticCacheKey, query_text: &str) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(key.model_fingerprint.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(key.ranking_version.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(query_text.as_bytes());
-        hasher.finalize().into()
-    }
-}
-
-/// One observed query encode.
-///
-/// The channel's whole failure surface is `Unavailable`, which is honest but says nothing about
-/// *why*. A timeout and an absent model read identically in the Pack, and the defect this type
-/// exists to prevent -- a budget that no real query can meet -- was invisible for exactly that
-/// reason: fail-open with no trace. These rows are what makes the difference legible after the
-/// fact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
-pub struct EncodeSample {
-    /// Characters in the query that was encoded, which is what the cost scales with.
-    pub query_chars: u32,
-    /// Wall clock the encode itself took, whether or not the caller was still waiting.
-    pub elapsed_ms: u32,
-    /// The budget in force when it ran.
-    pub budget_ms: u32,
-    /// Whether the encode overran that budget, which is what the caller saw as `Unavailable`.
-    pub timed_out: bool,
-    /// Whether the corpus backfill was competing for the encoder while this encode ran.
-    ///
-    /// A timeout with this set is a transient contention timeout inside a window that closes when
-    /// the backfill finishes. A timeout without it is the encoder failing to meet the budget on
-    /// its own, which is the only one an operator should act on.
-    pub backfill_active: bool,
-}
-
 /// One second-hop admission decision, as it was taken.
 ///
 /// Every pair the hop judged produces one of these, refused pairs included. The refused ones are
@@ -698,89 +293,19 @@ pub struct RecordedHop2Admission {
     pub sample: Hop2AdmissionSample,
 }
 
-/// Where a channel reports what its encodes cost. Implemented by [`SemanticVectorCache`]; absent
-/// on every channel that has no discardable cache to write to, such as the in-memory test ones.
-pub trait EncodeSampleRecorder: Send + Sync {
-    /// Records one observation. Failure is not reportable: a diagnostic that can fail a retrieval
-    /// is worse than no diagnostic.
-    fn record(&self, sample: EncodeSample);
-
-    /// Records one pass of the second hop's admission decisions, on the same terms.
+/// Where a channel reports what the second hop decided. Implemented by [`SemanticVectorCache`];
+/// absent on every channel that has no discardable cache to write to, such as the in-memory test
+/// ones.
+///
+/// It was `EncodeSampleRecorder` and watched query encodes as well. That half went with the query
+/// path: an encode history answered "is this budget fit for this machine", and with no query
+/// encode there is no budget and no machine question to answer.
+pub trait Hop2AdmissionRecorder: Send + Sync {
+    /// Records one pass of the second hop's admission decisions.
     ///
-    /// Defaulted to a no-op so a recorder that only watches encodes stays a recorder: the sink that
-    /// has somewhere to put these rows is [`SemanticVectorCache`], and every other implementation
-    /// would otherwise have to write the same empty body.
-    fn record_hop2_admissions(&self, _samples: &[Hop2AdmissionSample]) {}
-}
-
-/// What the recorded encodes add up to, for `sctx embedding status` and `sctx doctor`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
-pub struct EncodeLatencySummary {
-    /// Observations the summary is built from.
-    pub samples: usize,
-    /// How many of them overran the budget.
-    pub timed_out: usize,
-    /// How many of those timeouts happened while the corpus backfill held the encoder.
-    ///
-    /// Subtracting this from `timed_out` leaves the timeouts that say something about the budget.
-    pub timed_out_during_backfill: usize,
-    /// Median observed encode, in milliseconds.
-    pub p50_ms: u32,
-    /// 95th percentile observed encode, in milliseconds.
-    pub p95_ms: u32,
-    /// Slowest observed encode, in milliseconds.
-    pub max_ms: u32,
-    /// The budget in force at the most recent observation.
-    pub budget_ms: u32,
-}
-
-impl EncodeLatencySummary {
-    /// Summarises a batch of observations, newest first.
-    #[must_use]
-    pub fn from_samples(samples: &[EncodeSample]) -> Self {
-        if samples.is_empty() {
-            return Self::default();
-        }
-        let mut elapsed = samples
-            .iter()
-            .map(|sample| sample.elapsed_ms)
-            .collect::<Vec<_>>();
-        elapsed.sort_unstable();
-        let percentile = |fraction: usize| {
-            let rank = (elapsed.len() * fraction).div_ceil(100).saturating_sub(1);
-            elapsed[rank.min(elapsed.len() - 1)]
-        };
-        Self {
-            samples: samples.len(),
-            timed_out: samples.iter().filter(|sample| sample.timed_out).count(),
-            timed_out_during_backfill: samples
-                .iter()
-                .filter(|sample| sample.timed_out && sample.backfill_active)
-                .count(),
-            p50_ms: percentile(50),
-            p95_ms: percentile(95),
-            max_ms: elapsed.last().copied().unwrap_or_default(),
-            budget_ms: samples.first().map_or(0, |sample| sample.budget_ms),
-        }
-    }
-
-    /// True when the recorded history is long enough to trust and mostly timeouts.
-    ///
-    /// One timeout is a busy machine. A majority of them over a full history is the shape of the
-    /// defect this whole module was repaired for: a budget the local hardware cannot meet, which
-    /// silently costs every automatic retrieval its semantic channel.
-    ///
-    /// Timeouts taken while the corpus backfill held the encoder do not count. They are real
-    /// degradations and they are recorded as such, but they say nothing about the budget: they end
-    /// when the backfill does, and telling an operator to raise a budget over them would send them
-    /// to change a number that was never the cause.
-    #[must_use]
-    pub const fn budget_is_unfit(&self) -> bool {
-        let attributable = self
-            .timed_out
-            .saturating_sub(self.timed_out_during_backfill);
-        self.samples >= 8 && attributable * 2 > self.samples
-    }
+    /// Failure is not reportable: a diagnostic that can fail a retrieval is worse than no
+    /// diagnostic.
+    fn record_hop2_admissions(&self, samples: &[Hop2AdmissionSample]);
 }
 
 /// Fingerprints a model directory from the size and modification time of the files that define it.
@@ -891,19 +416,15 @@ impl SemanticVectorCache {
         // halves have opposite tolerance for a wait -- so the choice has to be justified by what
         // actually reaches this connection, not split down the middle.
         //
-        // Nothing on the synchronous query path -- `EmbeddingSemanticChannel::similar_revisions`,
-        // reached from `task_context` -- ever touches this connection. The corpus vectors it
-        // scores against are loaded into memory once, at channel construction
+        // Nothing a retrieval does synchronously touches this connection. The corpus vectors the
+        // second hop compares are loaded into memory once, at channel construction
         // (`SemanticVectorCache::load`, called from `from_cache`), and that construction happens
         // only on the background loader thread in `spawn_semantic_loader` or inside `sctx doctor
-        // --fix`'s synchronous warm-up -- never inline in a request. The one write this connection
-        // takes that a query ever provokes is the `EncodeSampleRecorder::record` call in
-        // `encode_within_budget`, and that runs on a spawned per-query thread *after* it has
-        // already sent the vector back over the channel the caller is blocked on: the caller has
-        // its answer, and its p95, before this connection is touched at all. So a wait here is
-        // invisible to `task_context` latency by construction, not by measurement, and the same
-        // budget that is safe for the write paths below (cache fill, `prune_superseded`,
-        // `encode_sample`) is safe for the whole connection.
+        // --fix`'s synchronous warm-up -- never inline in a request. The one write a retrieval
+        // provokes is `record_hop2_admissions`, and it runs after the Pack has been assembled and
+        // handed back. So a wait here is invisible to `task_context` latency by construction, not
+        // by measurement, and the same budget that is safe for the write paths below (cache fill,
+        // `prune_superseded`, `hop2_admission_sample`) is safe for the whole connection.
         //
         // Five seconds, matching `rusqlite::Connection::open`'s own default
         // (`sqlite3_busy_timeout(db, 5000)`, set unconditionally inside
@@ -935,14 +456,10 @@ impl SemanticVectorCache {
                      vector BLOB NOT NULL,
                      PRIMARY KEY (revision_id, model_fingerprint, ranking_version)
                  ) WITHOUT ROWID;
-                 CREATE TABLE IF NOT EXISTS encode_sample (
-                     observed_at INTEGER PRIMARY KEY AUTOINCREMENT,
-                     query_chars INTEGER NOT NULL,
-                     elapsed_ms INTEGER NOT NULL,
-                     budget_ms INTEGER NOT NULL,
-                     timed_out INTEGER NOT NULL,
-                     backfill_active INTEGER NOT NULL DEFAULT 0
-                 );
+                 -- Query encode observations. The query path is retired, so nothing writes
+                 -- them and nothing reads them; the rows a previous build left behind are
+                 -- reclaimed rather than carried, which is what a discardable cache is for.
+                 DROP TABLE IF EXISTS encode_sample;
                  CREATE TABLE IF NOT EXISTS hop2_admission_sample (
                      observed_at INTEGER PRIMARY KEY AUTOINCREMENT,
                      recorded_at_unix_seconds INTEGER NOT NULL,
@@ -958,7 +475,6 @@ impl SemanticVectorCache {
                     format!("initialize semantic cache schema: {error}"),
                 )
             })?;
-        migrate_encode_sample(&connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
         })
@@ -1178,39 +694,10 @@ impl SemanticVectorCache {
         Ok(removed)
     }
 
-    /// Returns the most recent encode observations, newest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::Io`] when the cache cannot be read.
-    pub fn recent_encode_samples(&self, limit: usize) -> Result<Vec<EncodeSample>> {
-        let connection = self.locked()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT query_chars, elapsed_ms, budget_ms, timed_out, backfill_active
-                 FROM encode_sample ORDER BY observed_at DESC LIMIT ?1",
-            )
-            .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))?;
-        let rows = statement
-            .query_map([i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                Ok(EncodeSample {
-                    query_chars: row.get::<_, i64>(0)?.try_into().unwrap_or(u32::MAX),
-                    elapsed_ms: row.get::<_, i64>(1)?.try_into().unwrap_or(u32::MAX),
-                    budget_ms: row.get::<_, i64>(2)?.try_into().unwrap_or(u32::MAX),
-                    timed_out: row.get::<_, i64>(3)? != 0,
-                    backfill_active: row.get::<_, i64>(4)? != 0,
-                })
-            })
-            .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| Error::new(ErrorKind::Io, format!("read encode samples: {error}")))
-    }
-
     /// Records what the second hop decided about each pair it judged.
     ///
-    /// Best-effort and silent, exactly like [`EncodeSampleRecorder::record`] and for the same
-    /// reason: this is the pre-registered recalibration record, and a diagnostic that can fail a
-    /// retrieval is worse than a diagnostic with a hole in it. A cache file an operator deleted
+    /// Best-effort and silent: this is the pre-registered recalibration record, and a diagnostic
+    /// that can fail a retrieval is worse than a diagnostic with a hole in it. A cache file an operator deleted
     /// mid-session, a full disk, or a table an older build never created all end here as a dropped
     /// batch rather than as a Pack that failed to assemble.
     ///
@@ -1318,17 +805,6 @@ impl SemanticVectorCache {
         Ok(recorded)
     }
 
-    /// Summarises the recorded encode history.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ErrorKind::Io`] when the cache cannot be read.
-    pub fn encode_latency_summary(&self) -> Result<EncodeLatencySummary> {
-        Ok(EncodeLatencySummary::from_samples(
-            &self.recent_encode_samples(SEMANTIC_ENCODE_SAMPLE_HISTORY)?,
-        ))
-    }
-
     fn locked(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
         self.connection.lock().map_err(|_| {
             Error::new(
@@ -1339,92 +815,16 @@ impl SemanticVectorCache {
     }
 }
 
-/// Encode observations go to the same discardable file the vectors do.
+/// Second-hop decisions go to the same discardable file the vectors do.
 ///
-/// They belong there and nowhere durable: they describe how this machine performed, they are worth
-/// nothing after the operator changes hardware or model, and deleting `semantic.sqlite` to reclaim
-/// disk must never be a decision about diagnostics. Every write is best-effort for the same
-/// reason -- a full disk degrades observability, never retrieval.
-impl EncodeSampleRecorder for SemanticVectorCache {
-    fn record(&self, sample: EncodeSample) {
-        let Ok(connection) = self.locked() else {
-            return;
-        };
-        if connection
-            .execute(
-                "INSERT INTO encode_sample
-                     (query_chars, elapsed_ms, budget_ms, timed_out, backfill_active)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![
-                    i64::from(sample.query_chars),
-                    i64::from(sample.elapsed_ms),
-                    i64::from(sample.budget_ms),
-                    i64::from(sample.timed_out),
-                    i64::from(sample.backfill_active),
-                ],
-            )
-            .is_err()
-        {
-            return;
-        }
-        let _trimmed = connection.execute(
-            "DELETE FROM encode_sample WHERE observed_at <= (
-                 SELECT observed_at FROM encode_sample
-                 ORDER BY observed_at DESC LIMIT 1 OFFSET ?1
-             )",
-            [i64::try_from(SEMANTIC_ENCODE_SAMPLE_HISTORY).unwrap_or(i64::MAX)],
-        );
-    }
-
+/// They belong there and nowhere durable: they describe what this installation retrieved against
+/// this corpus under this model, and deleting `semantic.sqlite` to reclaim disk must never be a
+/// decision about diagnostics. Every write is best-effort for the same reason -- a full disk
+/// degrades observability, never retrieval.
+impl Hop2AdmissionRecorder for SemanticVectorCache {
     fn record_hop2_admissions(&self, samples: &[Hop2AdmissionSample]) {
         Self::record_hop2_admissions(self, samples);
     }
-}
-
-/// Brings a cache written before `backfill_active` existed up to the current sample schema.
-///
-/// The observations are dropped rather than migrated, and only the observations. They are a rolling
-/// window of at most [`SEMANTIC_ENCODE_SAMPLE_HISTORY`] rows describing how this machine performed
-/// in the last few minutes, worth nothing after a restart, and refilled by the next few queries --
-/// whereas the corpus vectors in the same file cost hours of encoding, so recreating the *file*
-/// to add one diagnostic column would be a real loss for no reason. Backfilling the missing column
-/// with `false` would be worse than dropping: it would assert about old rows exactly the thing the
-/// column exists to establish.
-///
-/// # Errors
-///
-/// Returns [`ErrorKind::Io`] when the table cannot be inspected or replaced.
-fn migrate_encode_sample(connection: &Connection) -> Result<()> {
-    let has_column = connection
-        .prepare("SELECT 1 FROM pragma_table_info('encode_sample') WHERE name = 'backfill_active'")
-        .and_then(|mut statement| statement.exists([]))
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("inspect encode sample schema: {error}"),
-            )
-        })?;
-    if has_column {
-        return Ok(());
-    }
-    connection
-        .execute_batch(
-            "DROP TABLE encode_sample;
-             CREATE TABLE encode_sample (
-                 observed_at INTEGER PRIMARY KEY AUTOINCREMENT,
-                 query_chars INTEGER NOT NULL,
-                 elapsed_ms INTEGER NOT NULL,
-                 budget_ms INTEGER NOT NULL,
-                 timed_out INTEGER NOT NULL,
-                 backfill_active INTEGER NOT NULL DEFAULT 0
-             );",
-        )
-        .map_err(|error| {
-            Error::new(
-                ErrorKind::Io,
-                format!("rebuild encode sample table: {error}"),
-            )
-        })
 }
 
 /// Path of the discardable vector cache inside an installation root.
@@ -1499,206 +899,57 @@ pub(crate) fn similarity_basis_points(similarity: f32) -> u16 {
     }
 }
 
-/// The live channel: one loaded provider over one snapshot of cached corpus vectors.
+/// The live channel: one snapshot of cached corpus vectors, plus somewhere to record what the
+/// second hop decided about them.
 ///
 /// The snapshot is read once, when the background loader publishes the channel, and never
-/// consulted again. A query that arrives while the backfill is still running sees the corpus as it
-/// stood at publication; missing a vector costs one candidate on one query, and re-reading `SQLite`
-/// on the retrieval path to avoid that would cost every query.
+/// consulted again. A retrieval that arrives while the backfill is still running sees the corpus
+/// as it stood at publication; missing a vector costs one candidate on one retrieval, and
+/// re-reading `SQLite` on that path to avoid it would cost every retrieval.
+///
+/// It holds no provider. It used to, because it encoded the caller's query; with that path retired
+/// there is nothing here to encode -- both sides of every comparison are vectors the backfill
+/// already wrote -- and holding a two-gigabyte model behind a type that cannot use it would say
+/// the opposite.
 pub struct EmbeddingSemanticChannel {
-    provider: Arc<dyn EmbeddingProvider>,
     vectors: Arc<Vec<(RevisionId, Vec<f32>)>>,
-    /// Read from the provider at construction, not from a constant: the floor that admits a hit is
-    /// a fact about the encoder that produced both sides of the comparison.
-    floor_basis_points: u16,
-    limit: usize,
-    budget: Duration,
-    /// Generation this channel's query vectors belong to. A channel built over a bare vector
-    /// snapshot has no fingerprint to name, so it gets a private one and shares nothing.
-    key: SemanticCacheKey,
-    query_cache: Arc<QueryVectorCache>,
-    recorder: Option<Arc<dyn EncodeSampleRecorder>>,
+    recorder: Option<Arc<dyn Hop2AdmissionRecorder>>,
 }
 
 impl EmbeddingSemanticChannel {
     /// Builds a channel over an in-memory vector snapshot.
-    ///
-    /// Its query cache is private to this channel: with no model fingerprint there is no way to
-    /// tell whether another channel's vectors came from the same encoder, and a shared cache that
-    /// might be wrong is worse than one that is merely small.
     #[must_use]
-    pub fn new(provider: Arc<dyn EmbeddingProvider>, vectors: Vec<(RevisionId, Vec<f32>)>) -> Self {
-        let key = SemanticCacheKey::new("in-memory", "in-memory");
-        let query_cache = Arc::new(QueryVectorCache::with_capacity(
-            SEMANTIC_QUERY_CACHE_CAPACITY,
-        ));
-        let floor_basis_points = provider.similarity_floor_basis_points();
+    pub fn new(vectors: Vec<(RevisionId, Vec<f32>)>) -> Self {
         Self {
-            provider,
             vectors: Arc::new(vectors),
-            floor_basis_points,
-            limit: SEMANTIC_CHANNEL_LIMIT,
-            budget: SEMANTIC_ENCODE_BUDGET,
-            key,
-            query_cache,
             recorder: None,
         }
     }
 
     /// Builds a channel over everything the cache currently holds under `key`.
     ///
-    /// The query vector cache is the shared one for `key`, so the second publish that follows a
-    /// finished backfill inherits whatever the first one warmed up.
-    ///
     /// # Errors
     ///
     /// Returns a typed error when the cache cannot be read.
-    pub fn from_cache(
-        provider: Arc<dyn EmbeddingProvider>,
-        cache: &SemanticVectorCache,
-        key: &SemanticCacheKey,
-    ) -> Result<Self> {
-        let vectors = cache.load(key)?;
-        Ok(Self {
-            key: key.clone(),
-            query_cache: QueryVectorCache::shared(key),
-            ..Self::new(provider, vectors)
-        })
+    pub fn from_cache(cache: &SemanticVectorCache, key: &SemanticCacheKey) -> Result<Self> {
+        Ok(Self::new(cache.load(key)?))
     }
 
-    /// Overrides the encode budget. `sctx mcp serve` sets it from `[retrieval]
-    /// embedding_encode_budget_ms`, and tests that must observe the timeout degradation set it
-    /// deliberately low.
+    /// Attaches the sink that records what the second hop decided.
     #[must_use]
-    pub const fn with_budget(mut self, budget: Duration) -> Self {
-        self.budget = budget;
-        self
-    }
-
-    /// Attaches the sink that records what encodes cost.
-    #[must_use]
-    pub fn with_encode_recorder(mut self, recorder: Arc<dyn EncodeSampleRecorder>) -> Self {
+    pub fn with_hop2_recorder(mut self, recorder: Arc<dyn Hop2AdmissionRecorder>) -> Self {
         self.recorder = Some(recorder);
         self
     }
 
-    /// Replaces the query vector cache, for tests that need an isolated one.
-    #[must_use]
-    pub fn with_query_cache(mut self, query_cache: Arc<QueryVectorCache>) -> Self {
-        self.query_cache = query_cache;
-        self
-    }
-
-    /// The query vector cache this channel reads and fills.
-    #[must_use]
-    pub fn query_cache(&self) -> &Arc<QueryVectorCache> {
-        &self.query_cache
-    }
-
-    /// How many corpus vectors this channel can rank against.
+    /// How many corpus vectors this channel holds.
     #[must_use]
     pub fn corpus_size(&self) -> usize {
         self.vectors.len()
     }
-
-    /// Returns the query vector, from cache if possible and from the encoder otherwise.
-    ///
-    /// The cache lookup comes first and costs no thread, no budget and no model call. Only a miss
-    /// reaches the encoder.
-    ///
-    /// The encode runs on a detached worker so a slow model costs the caller the budget rather
-    /// than the encode. Returning `None` on timeout leaves that worker running, and it now does
-    /// two useful things before it exits: it stores its vector in the query cache, so the next
-    /// read of the same Intent is an immediate hit rather than a second timeout, and it records
-    /// what it cost. A budget this machine cannot meet used to be indistinguishable from a missing
-    /// model; it is now one slow call followed by hits, and a row in the encode history either
-    /// way.
-    fn encode_within_budget(&self, text: &str) -> Option<Arc<Vec<f32>>> {
-        if let Some(cached) = self.query_cache.get(&self.key, text) {
-            return Some(cached);
-        }
-        let provider = Arc::clone(&self.provider);
-        let query_cache = Arc::clone(&self.query_cache);
-        let recorder = self.recorder.clone();
-        let key = self.key.clone();
-        let budget = self.budget;
-        let owned = text.to_owned();
-        let (sender, receiver) = sync_channel(1);
-        let started = Instant::now();
-        if std::thread::Builder::new()
-            .name("sctx-embedding-query".to_owned())
-            .spawn(move || {
-                // Asked on both sides of the encode. A backfill that started while this query was
-                // queued and one that finished while it ran are both contention this encode paid
-                // for, and either reading alone would miss one of them.
-                let contended_before = provider.is_backfilling();
-                let outcome = provider.encode(&owned);
-                let elapsed = started.elapsed();
-                let contended = contended_before || provider.is_backfilling();
-                let vector = outcome.map(Arc::new);
-                if let Ok(vector) = &vector {
-                    query_cache.store(&key, &owned, Arc::clone(vector));
-                }
-                let _ignored = sender.send(vector);
-                if let Some(recorder) = recorder {
-                    recorder.record(EncodeSample {
-                        query_chars: u32::try_from(owned.chars().count()).unwrap_or(u32::MAX),
-                        elapsed_ms: u32::try_from(elapsed.as_millis()).unwrap_or(u32::MAX),
-                        budget_ms: u32::try_from(budget.as_millis()).unwrap_or(u32::MAX),
-                        timed_out: elapsed > budget,
-                        backfill_active: contended,
-                    });
-                }
-            })
-            .is_err()
-        {
-            return None;
-        }
-        match receiver.recv_timeout(self.budget) {
-            Ok(Ok(vector)) if started.elapsed() <= self.budget => Some(vector),
-            Ok(_) | Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
-        }
-    }
 }
 
 impl SemanticChannel for EmbeddingSemanticChannel {
-    fn similar_revisions(&self, query_text: &str) -> SemanticOutcome {
-        if query_text.trim().is_empty() {
-            return SemanticOutcome::Hits(Vec::new());
-        }
-        // An empty corpus is a channel that ran and matched nothing, not a broken one: the
-        // backfill simply has not reached this revision yet, and a lexical answer is still whole.
-        if self.vectors.is_empty() {
-            return SemanticOutcome::Hits(Vec::new());
-        }
-        let Some(query) = self.encode_within_budget(query_text) else {
-            return SemanticOutcome::Unavailable;
-        };
-        if query.len() != self.provider.dimensions() {
-            return SemanticOutcome::Unavailable;
-        }
-        let mut scored = self
-            .vectors
-            .iter()
-            .filter(|(_, vector)| vector.len() == query.len())
-            .map(|(revision_id, vector)| SemanticHit {
-                revision_id: *revision_id,
-                similarity_basis_points: similarity_basis_points(cosine_similarity(&query, vector)),
-            })
-            .filter(|hit| hit.similarity_basis_points >= self.floor_basis_points)
-            .collect::<Vec<_>>();
-        // Descending similarity, then Revision ID: two revisions at the same similarity must rank
-        // in the same order on every run or the fused score stops being reproducible.
-        scored.sort_by(|left, right| {
-            right
-                .similarity_basis_points
-                .cmp(&left.similarity_basis_points)
-                .then_with(|| left.revision_id.cmp(&right.revision_id))
-        });
-        scored.truncate(self.limit);
-        SemanticOutcome::Hits(scored)
-    }
-
     fn document_vectors(&self) -> Option<DocumentVectorSnapshot> {
         Some(Arc::clone(&self.vectors))
     }
@@ -1748,8 +999,8 @@ pub fn load_onnx_provider(
 /// Process-lifetime slot a background loader fills once the model is ready.
 ///
 /// The MCP server hands this to every retrieval the moment `[retrieval]` is configured, long
-/// before the 9--12 s model load finishes. Until then it answers [`SemanticOutcome::Unavailable`],
-/// which is the honest report: the channel exists and could not run. An installation with no
+/// before the 9--12 s model load finishes. Until then it has no document vectors, which is the
+/// honest report: the channel exists and could not serve the hop. An installation with no
 /// `[retrieval]` table never gets a handle at all, and so never reports an omission.
 #[derive(Clone, Default)]
 pub struct SemanticChannelHandle {
@@ -1867,13 +1118,6 @@ impl std::fmt::Debug for SemanticChannelHandle {
 }
 
 impl SemanticChannel for SemanticChannelHandle {
-    fn similar_revisions(&self, query_text: &str) -> SemanticOutcome {
-        match self.channel() {
-            Some(channel) => channel.similar_revisions(query_text),
-            None => SemanticOutcome::Unavailable,
-        }
-    }
-
     fn document_vectors(&self) -> Option<DocumentVectorSnapshot> {
         self.channel()?.document_vectors()
     }

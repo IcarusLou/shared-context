@@ -518,19 +518,6 @@ pub struct StatusReport {
     pub files: Vec<FileStatus>,
     pub model_fingerprint: Option<String>,
     pub embedded_revisions: usize,
-    /// What the last [`sctx_search::SEMANTIC_ENCODE_SAMPLE_HISTORY`] query encodes cost, and how
-    /// many of them overran the budget.
-    ///
-    /// A timeout degrades one retrieval to `embedding_unavailable`, which reads in the Pack
-    /// exactly like a model that never loaded. That indistinguishability is what let a budget no
-    /// real query could meet look like a working channel for an entire release. This is where the
-    /// difference is visible: all-zero samples mean the channel has not been asked anything yet, a
-    /// low timeout count means it is working, and a high one means the budget does not fit this
-    /// machine.
-    pub encode_latency: sctx_search::EncodeLatencySummary,
-    /// The encode budget in force, in milliseconds, and whether `[retrieval]` set it.
-    pub encode_budget_ms: u64,
-    pub encode_budget_configured: bool,
     /// `Some` only when `--verify` asked for a real load; `None` means the question was not put.
     pub loads: Option<bool>,
     pub load_error: Option<String>,
@@ -948,13 +935,6 @@ pub fn status(root: &Path, verify: bool) -> Result<StatusReport> {
             })
             .map_or(0, |revisions| revisions.len())
     });
-    // The history is not keyed by model generation: it describes what this machine can encode in,
-    // which does not stop being true when the operator swaps exports.
-    let encode_latency = cache
-        .as_ref()
-        .ok()
-        .and_then(|cache| cache.encode_latency_summary().ok())
-        .unwrap_or_default();
     let (loads, load_error) = if verify && ready {
         // Only a `--verify` pays the 9--12 second load, and only when the files it needs are
         // there: reporting "it does not load" about a file that is simply missing would name the
@@ -985,15 +965,6 @@ pub fn status(root: &Path, verify: bool) -> Result<StatusReport> {
         files,
         model_fingerprint: fingerprint,
         embedded_revisions,
-        encode_latency,
-        encode_budget_ms: u64::try_from(
-            settings
-                .encode_budget()
-                .unwrap_or(sctx_search::SEMANTIC_ENCODE_BUDGET)
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX),
-        encode_budget_configured: settings.embedding_encode_budget_ms.is_some(),
         loads,
         load_error,
         ready,

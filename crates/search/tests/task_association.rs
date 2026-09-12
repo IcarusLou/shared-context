@@ -2164,8 +2164,8 @@ fn repeating_a_contexts_own_words_never_injects_it_without_a_lane() {
 /// A channel over vectors a test placed by hand, and a record of what the hop decided.
 ///
 /// It implements the whole boundary the assembler uses -- the published snapshot on the way in,
-/// the admission record on the way out -- and deliberately refuses to encode anything, because the
-/// second hop must not be able to acquire a model call even when a channel is attached.
+/// the admission record on the way out. There is nothing here to refuse to encode: the trait no
+/// longer has a query method, so the second hop cannot acquire a model call even in principle.
 #[derive(Debug, Default)]
 struct LaneChannel {
     vectors: Vec<(RevisionId, Vec<f32>)>,
@@ -2173,10 +2173,6 @@ struct LaneChannel {
 }
 
 impl sctx_search::SemanticChannel for LaneChannel {
-    fn similar_revisions(&self, _query_text: &str) -> sctx_search::SemanticOutcome {
-        panic!("automatic injection must never encode a query");
-    }
-
     fn document_vectors(&self) -> Option<sctx_search::DocumentVectorSnapshot> {
         Some(Arc::new(self.vectors.clone()))
     }

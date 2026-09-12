@@ -1,14 +1,19 @@
-//! Measures what one real encode actually costs, by query length, for each model family.
+//! Measures what one real encode actually costs, by text length, for each model family.
 //!
-//! T5b set [`sctx_search::SEMANTIC_ENCODE_BUDGET`] to 200 ms on the strength of ADR-0004's
-//! "30--85 ms p95", a number produced by a torch prototype and never re-measured against the `ort`
-//! stack this workspace ships. It was then validated with probe queries 15--40 characters long. A
-//! real Working Intent query is `goal + current_direction + in_scope` concatenated: the Codex
-//! session that exposed the defect built a 283-character query, and every one of its automatic
-//! retrievals reported `embedding_unavailable`.
+//! It used to hold the encode budget honest. T5b set that budget to 200 ms on the strength of
+//! ADR-0004's "30--85 ms p95", a number produced by a torch prototype and never re-measured
+//! against the `ort` stack this workspace ships, and validated with probe queries 15--40
+//! characters long; a real Working Intent query was 283 characters and every automatic retrieval
+//! built from one reported `embedding_unavailable`. ADR-0007 then retired the query path
+//! altogether, so there is no budget left to assert against and these two ladders assert nothing:
+//! they are the measurement, printed.
 //!
-//! These tests exist so that constant is never again chosen without a measurement behind it. Both
-//! are `#[ignore]`d because they need the operator's own model export:
+//! What they are still for is the two questions an operator and a backfill actually ask. How long
+//! does one corpus encode take on this machine, which is what decides how long a first backfill
+//! runs; and how much memory and load time does the export cost, which is what
+//! `docs/user-guide.md` quotes to someone deciding whether to install it at all.
+//!
+//! Both are `#[ignore]`d because they need the operator's own model export:
 //!
 //! ```text
 //! SCTX_PROBE_EMBEDDING_MODEL=~/.shared-context/embedding/model \
@@ -20,14 +25,9 @@
 //!   cargo test --release -p sctx-search --test embedding_encode_latency -- --ignored --nocapture
 //! ```
 //!
-//! One ladder per family, over the same lengths, because a budget shared by two encoders has to
-//! hold for the slower one and there is no way to know which that is without measuring both. The
-//! F2LLM ladder additionally reports the model load and the process's resident size, which is what
-//! `docs/user-guide.md` quotes to an operator deciding whether to install it at all.
-//!
-//! They assert nothing about absolute timings -- those are a property of the machine, not the code
-//! -- and print a table instead. The one thing they do assert is the property the budget has to
-//! satisfy: a warm encode of a real-length Intent query must fit inside the configured budget.
+//! One ladder per family, over the same lengths, because the two encoders do not cost the same
+//! and an operator choosing between them is choosing between these two tables. The F2LLM ladder
+//! additionally reports the model load and the process's resident size.
 
 #![cfg(feature = "embedding-onnx")]
 
@@ -39,15 +39,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sctx_search::{EmbeddingProvider, SEMANTIC_ENCODE_BUDGET, load_onnx_provider};
+use sctx_search::{EmbeddingProvider, load_onnx_provider};
 #[cfg(unix)]
 use sctx_search::{embedding::SEMANTIC_MAX_TOKENS, embedding::onnx::TextRole};
 
 /// Samples per length. Enough that a p95 is a measurement rather than the single worst of three.
 const SAMPLES: usize = 24;
 
-/// Query lengths, in characters, spanning the probe suite through a real Intent to the truncation
-/// ceiling. 283 is the length measured on Codex session 01a06646.
+/// Text lengths, in characters, spanning the probe suite through a real Intent to the truncation
+/// ceiling. 283 is the length measured on Codex session 01a06646, kept because every earlier
+/// reading in `docs/user-guide.md` is quoted at it.
 const LENGTHS: &[usize] = &[20, 40, 100, 200, 283, 400, 700, 1400];
 
 fn provider_paths() -> Option<(PathBuf, PathBuf)> {
@@ -120,10 +121,7 @@ fn ladder(provider: &dyn EmbeddingProvider) -> Duration {
     provider.encode(&intent_query(283)).expect("warm-up encode");
     let cold = cold.elapsed();
     println!("\ncold first encode (283 chars): {} ms", cold.as_millis());
-    println!(
-        "budget under test: {} ms\n",
-        SEMANTIC_ENCODE_BUDGET.as_millis()
-    );
+    println!();
     println!(
         "{:>7}  {:>8}  {:>8}  {:>8}",
         "chars", "p50 ms", "p95 ms", "max ms"
@@ -156,25 +154,11 @@ fn warm_encode_latency_by_query_length() {
     let provider = load_onnx_provider(&model, &runtime).expect("load the configured bge-m3 export");
 
     let worst_real_intent = ladder(provider.as_ref());
-
-    assert!(
-        worst_real_intent <= SEMANTIC_ENCODE_BUDGET,
-        "a warm 283-character Intent query took {} ms at p95, over the {} ms budget: the budget is \
-         calibrated on the wrong query length and every automatic retrieval degrades to \
-         embedding_unavailable",
-        worst_real_intent.as_millis(),
-        SEMANTIC_ENCODE_BUDGET.as_millis()
-    );
+    println!("283-character p95: {} ms", worst_real_intent.as_millis());
 }
 
-/// The same ladder for the export `sctx embedding install` now installs by default.
-///
-/// A 0.6B decoder is a different order of model from bge-m3, and the encode budget is shared by
-/// both: whichever family an operator has configured, [`SEMANTIC_ENCODE_BUDGET`] is what decides
-/// whether their query is answered or silently dropped. So the budget's own assertion below is the
-/// same one, unweakened -- if this family cannot answer a real-length Intent inside it on a quiet
-/// machine, the number that has already been re-calibrated twice needs a third look rather than an
-/// exception.
+/// The same ladder for the export `sctx embedding install` now installs by default, plus the load
+/// time and resident size `docs/user-guide.md` quotes.
 #[cfg(unix)]
 #[test]
 #[ignore = "needs a real F2LLM-v2-0.6B snapshot; see the module docs"]
@@ -235,15 +219,7 @@ fn warm_f2llm_encode_latency_by_query_length() {
     if let Some(resident) = resident_kilobytes() {
         println!("process RSS after the ladder: {} MB", resident / 1024);
     }
-
-    assert!(
-        worst_real_intent <= SEMANTIC_ENCODE_BUDGET,
-        "a warm 283-character Intent query took {} ms at p95, over the {} ms budget: the budget is \
-         calibrated on the wrong model family and every automatic retrieval degrades to \
-         embedding_unavailable",
-        worst_real_intent.as_millis(),
-        SEMANTIC_ENCODE_BUDGET.as_millis()
-    );
+    println!("283-character p95: {} ms", worst_real_intent.as_millis());
 }
 
 /// This process's resident set, in kibibytes, or `None` when `ps` cannot say.

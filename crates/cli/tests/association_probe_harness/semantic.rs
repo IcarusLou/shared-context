@@ -22,8 +22,8 @@ use sctx_domain::{TaskId, WorkingIntentSnapshot};
 use sctx_engineering_graph::EngineeringProjectionStore;
 use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_search::{
-    ContextPackMode, EmbeddingProvider, EmbeddingSemanticChannel, SearchEngine, SemanticCacheKey,
-    SemanticChannel as _, SemanticOutcome, SemanticVectorCache, TaskContextRequest,
+    ContextPackMode, EmbeddingProvider, SearchEngine, SemanticCacheKey, SemanticVectorCache,
+    TaskContextRequest, embedding::cosine_similarity,
 };
 use serde_json::Value;
 
@@ -187,15 +187,22 @@ pub fn embed_corpus(
     (cache, key, embeddable.len())
 }
 
-/// Prints the raw separation the similarity floor has to cut, and returns the two numbers that
-/// decide it: the lowest-scoring positive and the highest-scoring noise query.
+/// Prints the raw separation this encoder achieves on the fixture, and returns the two numbers
+/// that bound it: the lowest-scoring positive and the highest-scoring noise query.
 ///
 /// ADR-0004 set a provisional 0.50 from a prototype on the two older fixtures and deferred the
-/// final value to this set. Printing the distribution means the next person to question a floor
-/// re-reads a table instead of re-deriving one.
+/// final value to this set. Printing the distribution means the next person to question a
+/// threshold re-reads a table instead of re-deriving one.
+///
+/// It scores the provider against the cached corpus directly. It used to go through the channel's
+/// `similar_revisions`, which applied the model family's floor and returned a truncated ranking;
+/// ADR-0007 retired that path, and going through it was the wrong shape for this measurement
+/// anyway -- a separation is a property of the raw score distribution, and reading it through the
+/// threshold it is supposed to justify hides exactly the values that would move one.
 pub fn print_similarity_separation(
     fixture: &Value,
-    channel: &EmbeddingSemanticChannel,
+    provider: &Arc<dyn EmbeddingProvider>,
+    corpus: &[(sctx_domain::RevisionId, Vec<f32>)],
 ) -> (u16, u16) {
     println!("\n--- top similarity per probe (basis points) ---");
     let mut worst_positive = u16::MAX;
@@ -203,12 +210,12 @@ pub fn print_similarity_separation(
     for probe in fixture["probes"].as_array().unwrap() {
         let query = probe["query"].as_str().unwrap();
         let is_noise = probe["expected"].as_array().unwrap().is_empty();
-        let top = match channel.similar_revisions(query) {
-            SemanticOutcome::Hits(hits) => {
-                hits.first().map_or(0, |hit| hit.similarity_basis_points)
-            }
-            SemanticOutcome::Unavailable => 0,
-        };
+        let vector = provider.encode(query).expect("every probe query encodes");
+        let top = corpus
+            .iter()
+            .map(|(_, candidate)| basis_points(cosine_similarity(&vector, candidate)))
+            .max()
+            .unwrap_or(0);
         if is_noise {
             best_noise = best_noise.max(top);
         } else if top > 0 {
@@ -222,4 +229,11 @@ pub fn print_similarity_separation(
     }
     println!("worst scoring positive {worst_positive}, best scoring noise {best_noise}");
     (worst_positive, best_noise)
+}
+
+/// Cosine to basis points, clamped, by the same rounding every recorded score uses.
+fn basis_points(similarity: f32) -> u16 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let scaled = (similarity.clamp(0.0, 1.0) * 10_000.0).round() as u16;
+    scaled
 }

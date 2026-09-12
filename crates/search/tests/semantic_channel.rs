@@ -1,13 +1,18 @@
 //! The optional embedding recall channel (ADR-0004), end to end without an ONNX model.
 //!
 //! The suite is split the way the code is. Everything about *how vectors behave* -- determinism,
-//! the similarity floor, the channel cap, the discardable cache and its key, the encode budget --
-//! runs against [`HashProvider`], a deterministic character-n-gram projection that satisfies the
-//! weakest property a real encoder must satisfy: identical text embeds identically and similar
-//! text embeds nearby. Everything about *how retrieval uses the channel* -- the fused weight, the
-//! independent injection eligibility, the `embedding_unavailable` degradations, and the promise
-//! that an unconfigured installation is byte-identical -- runs against [`ScriptedChannel`], which
-//! states the channel's answer outright so the assertion is about the wiring and nothing else.
+//! the discardable cache and its key, the second hop's admission record -- runs against
+//! [`HashProvider`], a deterministic character-n-gram projection that satisfies the weakest
+//! property a real encoder must satisfy: identical text embeds identically and similar text embeds
+//! nearby. Everything about *how retrieval uses the channel* -- the `embedding_unavailable`
+//! degradation and the promise that an unconfigured installation is byte-identical -- runs against
+//! [`ScriptedChannel`], which states the channel's answer outright so the assertion is about the
+//! wiring and nothing else.
+//!
+//! There is no query-side section any more. ADR-0007 retired the path that encoded a caller's text
+//! and ranked the corpus against it, so the floor, the channel cap, the encode budget, the query
+//! vector cache and the encode telemetry are gone, and so are the tests that measured them. What
+//! is left is the corpus and the hop that reads it.
 //!
 //! No test here loads a model. That is the point: the pipeline has to be provable on a machine
 //! with no 2 GB download, or it cannot be regression-tested in CI at all.
@@ -29,12 +34,10 @@ use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
 use sctx_search::{
-    ContextPackMode, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
-    EncodeSample, EncodeSampleRecorder, Error, ErrorKind, Hop2AdmissionSample, QueryVectorCache,
-    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
-    SEMANTIC_HOP2_SAMPLE_HISTORY, SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine,
-    SemanticCacheKey, SemanticChannel, SemanticChannelHandle, SemanticHit, SemanticOutcome,
-    SemanticVectorCache, TaskContextPack, TaskContextRequest,
+    ContextPackMode, DocumentVectorSnapshot, EmbeddingProvider, EmbeddingSemanticChannel, Error,
+    Hop2AdmissionSample, SEMANTIC_CORPUS_VERSION, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+    SEMANTIC_HOP2_SAMPLE_HISTORY, SearchEngine, SemanticCacheKey, SemanticChannel,
+    SemanticChannelHandle, SemanticVectorCache, TaskContextPack, TaskContextRequest,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -52,9 +55,6 @@ use tempfile::TempDir;
 struct HashProvider {
     dimensions: usize,
     encodes: AtomicUsize,
-    delay: Option<Duration>,
-    fail: bool,
-    backfilling: bool,
 }
 
 impl HashProvider {
@@ -62,34 +62,6 @@ impl HashProvider {
         Self {
             dimensions: 64,
             encodes: AtomicUsize::new(0),
-            delay: None,
-            fail: false,
-            backfilling: false,
-        }
-    }
-
-    /// A provider that sleeps before answering, for the encode-budget degradation.
-    fn slow(delay: Duration) -> Self {
-        Self {
-            delay: Some(delay),
-            ..Self::new()
-        }
-    }
-
-    /// A slow provider that says a corpus backfill is competing with every encode, for the
-    /// difference between "the budget is unfit" and "the backfill window is open".
-    fn slow_while_backfilling(delay: Duration) -> Self {
-        Self {
-            backfilling: true,
-            ..Self::slow(delay)
-        }
-    }
-
-    /// A provider whose every encode fails, for the load-failure degradation.
-    fn failing() -> Self {
-        Self {
-            fail: true,
-            ..Self::new()
         }
     }
 
@@ -113,21 +85,8 @@ impl EmbeddingProvider for HashProvider {
         self.dimensions
     }
 
-    fn is_backfilling(&self) -> bool {
-        self.backfilling
-    }
-
     fn encode(&self, text: &str) -> Result<Vec<f32>, Error> {
         self.encodes.fetch_add(1, Ordering::SeqCst);
-        if let Some(delay) = self.delay {
-            std::thread::sleep(delay);
-        }
-        if self.fail {
-            return Err(Error::new(
-                ErrorKind::External,
-                "this provider always fails to encode",
-            ));
-        }
         let characters = text.to_lowercase().chars().collect::<Vec<_>>();
         let mut vector = vec![0.0_f32; self.dimensions];
         // Trigrams, with the whole string as its own gram so a text shorter than three characters
@@ -158,60 +117,36 @@ impl EmbeddingProvider for HashProvider {
     }
 }
 
-/// A [`HashProvider`] that reports a similarity floor of its own.
-///
-/// It stands in for a second model family without needing a second model: what matters to the
-/// channel is not which encoder produced the floor but that the floor travelled with the provider
-/// instead of being read from a constant at the call site.
-struct FlooredProvider {
-    inner: HashProvider,
-    floor: u16,
-}
-
-impl EmbeddingProvider for FlooredProvider {
-    fn dimensions(&self) -> usize {
-        self.inner.dimensions()
-    }
-
-    fn encode(&self, text: &str) -> Result<Vec<f32>, Error> {
-        self.inner.encode(text)
-    }
-
-    fn similarity_floor_basis_points(&self) -> u16 {
-        self.floor
-    }
-}
-
 /// A channel that answers whatever the test told it to answer.
+///
+/// The only question a channel is asked now is for its document vectors, so that is the only
+/// thing this scripts: `Some` of a snapshot for a loaded channel, `None` for one that cannot
+/// serve the hop at all.
 struct ScriptedChannel {
-    outcome: SemanticOutcome,
-    queries: Arc<AtomicUsize>,
+    vectors: Option<DocumentVectorSnapshot>,
+    reads: Arc<AtomicUsize>,
 }
 
 impl ScriptedChannel {
-    fn hits(hits: Vec<SemanticHit>) -> (Arc<Self>, Arc<AtomicUsize>) {
-        let queries = Arc::new(AtomicUsize::new(0));
-        (
-            Arc::new(Self {
-                outcome: SemanticOutcome::Hits(hits),
-                queries: Arc::clone(&queries),
-            }),
-            queries,
-        )
-    }
-
     fn unavailable() -> Arc<Self> {
         Arc::new(Self {
-            outcome: SemanticOutcome::Unavailable,
-            queries: Arc::new(AtomicUsize::new(0)),
+            vectors: None,
+            reads: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn loaded(vectors: Vec<(RevisionId, Vec<f32>)>) -> Self {
+        Self {
+            vectors: Some(Arc::new(vectors)),
+            reads: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
 impl SemanticChannel for ScriptedChannel {
-    fn similar_revisions(&self, _query_text: &str) -> SemanticOutcome {
-        self.queries.fetch_add(1, Ordering::SeqCst);
-        self.outcome.clone()
+    fn document_vectors(&self) -> Option<DocumentVectorSnapshot> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.vectors.clone()
     }
 }
 
@@ -703,385 +638,6 @@ fn many_concurrent_writers_lose_no_stores_under_busy_timeout() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Channel: floor, cap, and the encode budget
-// ---------------------------------------------------------------------------------------------
-
-/// Builds a channel whose corpus is the given texts, encoded by a fresh [`HashProvider`].
-fn hash_channel(texts: &[&str]) -> (EmbeddingSemanticChannel, Vec<RevisionId>) {
-    let provider = Arc::new(HashProvider::new());
-    let mut vectors = Vec::new();
-    let mut revisions = Vec::new();
-    for text in texts {
-        let revision = RevisionId::new();
-        revisions.push(revision);
-        vectors.push((revision, provider.encode(text).unwrap()));
-    }
-    (EmbeddingSemanticChannel::new(provider, vectors), revisions)
-}
-
-/// The two corpus texts every floor assertion here uses: one the query repeats verbatim, one about
-/// something else entirely.
-const FLOOR_CORPUS: [&str; 2] = [
-    "retry outside the deduplication window is delivered twice",
-    "espresso extraction pressure curves for a hand pour",
-];
-
-#[test]
-fn a_provider_that_names_no_floor_gets_the_bge_m3_calibration() {
-    assert_eq!(
-        HashProvider::new().similarity_floor_basis_points(),
-        SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        "the trait default is the number T5a measured against bge-m3, so every provider written \
-         before a second family existed keeps scoring exactly as it did"
-    );
-}
-
-#[test]
-fn the_channel_takes_its_floor_from_the_provider() {
-    // Same corpus and same query as the floor test below, so the only difference between the two
-    // outcomes is which floor the channel was handed.
-    let provider = Arc::new(FlooredProvider {
-        inner: HashProvider::new(),
-        floor: 0,
-    });
-    let vectors = FLOOR_CORPUS
-        .iter()
-        .map(|text| (RevisionId::new(), provider.encode(text).unwrap()))
-        .collect::<Vec<_>>();
-    let channel = EmbeddingSemanticChannel::new(provider, vectors);
-
-    let SemanticOutcome::Hits(hits) = channel.similar_revisions(FLOOR_CORPUS[0]) else {
-        panic!("a loaded channel over a non-empty corpus must run");
-    };
-    assert_eq!(
-        hits.len(),
-        FLOOR_CORPUS.len(),
-        "the unrelated text clears a floor of zero, so the channel read the provider's floor and \
-         not the bge-m3 constant; got {hits:?}"
-    );
-}
-
-#[test]
-fn the_similarity_floor_admits_the_near_match_and_rejects_the_unrelated_one() {
-    let (channel, revisions) = hash_channel(&FLOOR_CORPUS);
-
-    let SemanticOutcome::Hits(hits) = channel.similar_revisions(FLOOR_CORPUS[0]) else {
-        panic!("a loaded channel over a non-empty corpus must run");
-    };
-    assert_eq!(
-        hits.len(),
-        1,
-        "only the near text may clear the floor; got {hits:?}"
-    );
-    assert_eq!(hits[0].revision_id, revisions[0]);
-    assert!(
-        hits[0].similarity_basis_points >= SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        "an admitted hit always reports a similarity at or above the floor"
-    );
-
-    // The noise query matches nothing in the corpus, and an empty hit list is a channel that ran,
-    // not a broken one.
-    let outcome = channel.similar_revisions("an entirely unrelated question about gardening");
-    assert!(
-        matches!(&outcome, SemanticOutcome::Hits(hits) if hits.is_empty()),
-        "a query above nothing must report zero hits, never Unavailable: got {outcome:?}"
-    );
-}
-
-#[test]
-fn the_channel_never_contributes_more_than_its_cap() {
-    let text = "the identical decision text every corpus entry carries";
-    let texts = vec![text; SEMANTIC_CHANNEL_LIMIT + 9];
-    let (channel, _) = hash_channel(&texts);
-
-    let SemanticOutcome::Hits(hits) = channel.similar_revisions(text) else {
-        panic!("the channel must run");
-    };
-    assert_eq!(
-        hits.len(),
-        SEMANTIC_CHANNEL_LIMIT,
-        "every corpus entry is an exact match, so only the cap can bound the channel"
-    );
-    // Identical similarity everywhere: the tie-break has to be the Revision ID, or the same query
-    // would fuse differently on different runs.
-    let mut sorted = hits.iter().map(|hit| hit.revision_id).collect::<Vec<_>>();
-    let ordered = sorted.clone();
-    sorted.sort_unstable();
-    assert_eq!(
-        ordered, sorted,
-        "ties must break on Revision ID so a fused score is reproducible"
-    );
-}
-
-#[test]
-fn an_encode_that_overruns_its_budget_reports_the_channel_unavailable() {
-    let provider = Arc::new(HashProvider::slow(Duration::from_millis(400)));
-    let vector = provider.encode("corpus entry").unwrap();
-    let channel = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
-        .with_budget(Duration::from_millis(30));
-
-    assert_eq!(
-        channel.similar_revisions("a query the model is too slow to answer"),
-        SemanticOutcome::Unavailable,
-        "overrunning the encode budget degrades the channel; it never stalls the Pack"
-    );
-}
-
-#[test]
-fn a_repeated_query_is_served_from_the_cache_without_encoding_again() {
-    let provider = Arc::new(HashProvider::new());
-    let vector = provider.encode("corpus entry").unwrap();
-    let channel = EmbeddingSemanticChannel::new(
-        Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
-        vec![(RevisionId::new(), vector)],
-    );
-
-    let first = channel.similar_revisions("the same working intent, read twice");
-    let encodes_after_first = provider.encode_count();
-    let second = channel.similar_revisions("the same working intent, read twice");
-
-    assert_eq!(
-        first, second,
-        "a cached query vector must rank exactly as the freshly encoded one did"
-    );
-    assert_eq!(
-        provider.encode_count(),
-        encodes_after_first,
-        "the second read of one Working Intent must not reach the encoder at all"
-    );
-    let _third = channel.similar_revisions("a different working intent entirely");
-    assert!(
-        provider.encode_count() > encodes_after_first,
-        "a query the cache has never seen must still be encoded"
-    );
-}
-
-#[test]
-fn an_encode_that_overran_its_budget_still_lands_in_the_cache_for_the_next_call() {
-    // The defect this covers is the one that made the channel useless in a real session: a budget
-    // the machine cannot meet used to fail every call identically and forever, because the encode
-    // that overran was simply thrown away. Now the worker finishes into the cache, so the cost is
-    // paid once.
-    let provider = Arc::new(HashProvider::slow(Duration::from_millis(200)));
-    let vector = provider.encode("corpus entry").unwrap();
-    let channel = EmbeddingSemanticChannel::new(
-        Arc::clone(&provider) as Arc<dyn EmbeddingProvider>,
-        vec![(RevisionId::new(), vector)],
-    )
-    .with_budget(Duration::from_millis(20));
-
-    assert_eq!(
-        channel.similar_revisions("a long working intent this budget cannot encode"),
-        SemanticOutcome::Unavailable,
-        "the first call still degrades rather than stalling the Pack"
-    );
-
-    // Wait for the detached worker, which is still encoding, to finish and fill the cache.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while channel.query_cache().is_empty() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    assert!(
-        matches!(
-            channel.similar_revisions("a long working intent this budget cannot encode"),
-            SemanticOutcome::Hits(_)
-        ),
-        "the next read of the same Intent must be a cache hit, not a second timeout"
-    );
-}
-
-#[test]
-fn the_query_cache_evicts_the_least_recently_read_entry() {
-    let cache = QueryVectorCache::with_capacity(2);
-    let key = SemanticCacheKey::new("fingerprint", "ranking");
-    cache.store(&key, "first", Arc::new(vec![1.0_f32]));
-    cache.store(&key, "second", Arc::new(vec![2.0_f32]));
-    // Reading "first" makes "second" the coldest entry.
-    assert!(cache.get(&key, "first").is_some());
-    cache.store(&key, "third", Arc::new(vec![3.0_f32]));
-
-    assert_eq!(cache.len(), 2, "capacity is a bound, not a suggestion");
-    assert!(
-        cache.get(&key, "first").is_some(),
-        "the recently read entry survives"
-    );
-    assert!(
-        cache.get(&key, "third").is_some(),
-        "the newest entry survives"
-    );
-    assert!(
-        cache.get(&key, "second").is_none(),
-        "the least recently read entry is the one evicted"
-    );
-}
-
-#[test]
-fn a_query_vector_is_never_served_across_model_generations() {
-    let cache = QueryVectorCache::with_capacity(8);
-    let original = SemanticCacheKey::new("fingerprint-a", "ranking-1");
-    cache.store(&original, "one intent", Arc::new(vec![1.0_f32]));
-
-    assert!(cache.get(&original, "one intent").is_some());
-    assert!(
-        cache
-            .get(
-                &SemanticCacheKey::new("fingerprint-b", "ranking-1"),
-                "one intent"
-            )
-            .is_none(),
-        "a swapped model must not read the previous model's query vectors"
-    );
-    assert!(
-        cache
-            .get(
-                &SemanticCacheKey::new("fingerprint-a", "ranking-2"),
-                "one intent"
-            )
-            .is_none(),
-        "a ranking version bump changes the embedded text, so its vectors are a new generation"
-    );
-}
-
-#[test]
-fn encode_timings_are_recorded_where_status_and_doctor_can_read_them() {
-    let directory = TempDir::new().unwrap();
-    let cache =
-        Arc::new(SemanticVectorCache::open(&directory.path().join("semantic.sqlite")).unwrap());
-
-    assert_eq!(
-        cache.encode_latency_summary().unwrap(),
-        EncodeLatencySummary::default(),
-        "a channel nobody has queried reports nothing rather than a fabricated zero-latency run"
-    );
-
-    let provider = Arc::new(HashProvider::slow(Duration::from_millis(120)));
-    let vector = provider.encode("corpus entry").unwrap();
-    let channel = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
-        .with_budget(Duration::from_millis(15))
-        .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
-
-    assert_eq!(
-        channel.similar_revisions("a query this budget cannot afford"),
-        SemanticOutcome::Unavailable
-    );
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while cache.recent_encode_samples(8).unwrap().is_empty() && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    let samples = cache.recent_encode_samples(8).unwrap();
-    assert_eq!(samples.len(), 1, "one query, one observation");
-    assert!(
-        samples[0].timed_out,
-        "an encode that overran its budget has to be recorded as one: the Pack cannot tell a \
-         timeout from a missing model, so this is the only place the difference survives"
-    );
-    assert_eq!(samples[0].budget_ms, 15);
-    assert!(
-        samples[0].elapsed_ms >= 100,
-        "the real cost is recorded, not the budget"
-    );
-    assert!(samples[0].query_chars > 0);
-    assert!(
-        !samples[0].backfill_active,
-        "nothing was backfilling, so this timeout is the encoder's own and has to read as one"
-    );
-}
-
-#[test]
-fn a_timeout_taken_while_the_corpus_backfills_is_recorded_as_a_contended_one() {
-    let directory = TempDir::new().unwrap();
-    let cache =
-        Arc::new(SemanticVectorCache::open(&directory.path().join("semantic.sqlite")).unwrap());
-
-    let provider = Arc::new(HashProvider::slow_while_backfilling(Duration::from_millis(
-        120,
-    )));
-    let vector = provider.encode("corpus entry").unwrap();
-    let channel = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
-        .with_budget(Duration::from_millis(15))
-        .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
-
-    assert_eq!(
-        channel.similar_revisions("a query the backfill is standing on"),
-        SemanticOutcome::Unavailable
-    );
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while cache.recent_encode_samples(8).unwrap().is_empty() && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    let samples = cache.recent_encode_samples(8).unwrap();
-    assert_eq!(samples.len(), 1, "one query, one observation");
-    assert!(samples[0].timed_out);
-    assert!(
-        samples[0].backfill_active,
-        "a timeout the backfill caused has to survive as a different fact from one the budget \
-         caused, or `sctx doctor` sends the operator to raise a budget that was never the problem"
-    );
-
-    let summary = cache.encode_latency_summary().unwrap();
-    assert_eq!(summary.timed_out, 1);
-    assert_eq!(summary.timed_out_during_backfill, 1);
-}
-
-#[test]
-fn a_history_of_timeouts_is_what_marks_a_budget_unfit_and_a_short_one_is_not() {
-    let timeout = EncodeSample {
-        query_chars: 283,
-        elapsed_ms: 240,
-        budget_ms: 200,
-        timed_out: true,
-        backfill_active: false,
-    };
-    let inside = EncodeSample {
-        timed_out: false,
-        elapsed_ms: 30,
-        ..timeout
-    };
-
-    assert!(
-        !EncodeLatencySummary::from_samples(&[timeout; 4]).budget_is_unfit(),
-        "four observations is a busy machine, not a verdict about the budget"
-    );
-    assert!(
-        EncodeLatencySummary::from_samples(&[timeout; 10]).budget_is_unfit(),
-        "a full history of timeouts is a budget this machine cannot meet"
-    );
-
-    let mut mixed = vec![inside; 9];
-    mixed.push(timeout);
-    assert!(
-        !EncodeLatencySummary::from_samples(&mixed).budget_is_unfit(),
-        "one timeout among nine healthy encodes is not a misconfiguration"
-    );
-    let summary = EncodeLatencySummary::from_samples(&mixed);
-    assert_eq!(summary.samples, 10);
-    assert_eq!(summary.timed_out, 1);
-    assert_eq!(summary.max_ms, 240);
-
-    // The reason the column exists. The same ten timeouts that condemn the budget above say
-    // nothing about it once they are attributed to the backfill window they were taken in.
-    let contended = EncodeSample {
-        backfill_active: true,
-        ..timeout
-    };
-    let summary = EncodeLatencySummary::from_samples(&[contended; 10]);
-    assert_eq!(summary.timed_out, 10, "the degradations are still recorded");
-    assert_eq!(summary.timed_out_during_backfill, 10);
-    assert!(
-        !summary.budget_is_unfit(),
-        "a history of timeouts taken while the corpus backfilled is a window that closes, not a \
-         budget the machine cannot meet"
-    );
-}
-
-// ---------------------------------------------------------------------------------------------
 // The second hop's admission record (ADR-0007's pre-registered recalibration)
 // ---------------------------------------------------------------------------------------------
 
@@ -1206,37 +762,34 @@ fn a_record_that_cannot_be_written_costs_the_recalibration_and_never_the_retriev
     );
 }
 
+/// An unfilled handle cannot serve the second hop, and can the moment it is published.
+///
+/// The 9--12 second model load must never be something a retrieval waits for, and the difference
+/// between "no vectors yet" and "a corpus the backfill has not reached" is what decides whether
+/// the Pack owes an omission line.
 #[test]
-fn a_provider_that_cannot_encode_reports_the_channel_unavailable() {
-    let provider = Arc::new(HashProvider::failing());
-    let channel =
-        EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vec![0.5_f32; 64])]);
-
-    assert_eq!(
-        channel.similar_revisions("a query nothing can encode"),
-        SemanticOutcome::Unavailable
-    );
-}
-
-#[test]
-fn an_unfilled_handle_is_unavailable_and_becomes_usable_the_moment_it_is_published() {
+fn an_unfilled_handle_serves_no_vectors_and_does_the_moment_it_is_published() {
     let handle = SemanticChannelHandle::new();
     assert!(!handle.is_ready());
-    assert_eq!(
-        handle.similar_revisions("anything at all"),
-        SemanticOutcome::Unavailable,
-        "the 9-12 second model load must never be something a query waits for"
+    assert!(
+        handle.document_vectors().is_none(),
+        "an unloaded channel has nothing for the hop to compare against"
     );
 
-    let (channel, revisions) = hash_channel(&["a decision about retry deduplication windows"]);
-    handle.publish(Arc::new(channel));
+    let provider = HashProvider::new();
+    let revision = RevisionId::new();
+    let vector = provider
+        .encode("a decision about retry deduplication windows")
+        .unwrap();
+    handle.publish(Arc::new(EmbeddingSemanticChannel::new(vec![(
+        revision,
+        vector.clone(),
+    )])));
     assert!(handle.is_ready());
-    let SemanticOutcome::Hits(hits) =
-        handle.similar_revisions("a decision about retry deduplication windows")
-    else {
-        panic!("a published handle answers from its channel");
-    };
-    assert_eq!(hits[0].revision_id, revisions[0]);
+    let published = handle
+        .document_vectors()
+        .expect("a published handle serves its snapshot");
+    assert_eq!(published.as_slice(), &[(revision, vector)]);
 }
 
 /// The handle is also the queue of revisions still owed a vector, and it blocks the filler.
@@ -1285,9 +838,14 @@ fn the_handle_carries_what_the_corpus_still_owes_and_parks_until_something_owes_
     );
 }
 
+/// Reading the corpus for the hop costs no model call at all.
+///
+/// Both sides of every comparison ADR-0007 makes are vectors the backfill already wrote, so the
+/// retrieval path cannot acquire an encode -- which is the property that makes it safe to hand a
+/// half-loaded channel to every request.
 #[test]
-fn the_query_encode_costs_exactly_one_model_call() {
-    let provider = Arc::new(HashProvider::new());
+fn serving_the_hop_costs_no_model_call() {
+    let provider = HashProvider::new();
     let corpus = (0..8)
         .map(|index| {
             (
@@ -1297,14 +855,17 @@ fn the_query_encode_costs_exactly_one_model_call() {
         })
         .collect::<Vec<_>>();
     let baseline = provider.encode_count();
-    let shared: Arc<dyn EmbeddingProvider> = Arc::clone(&provider) as Arc<dyn EmbeddingProvider>;
-    let channel = EmbeddingSemanticChannel::new(shared, corpus);
+    let channel = EmbeddingSemanticChannel::new(corpus);
 
-    let _outcome = channel.similar_revisions("corpus entry 3");
+    let vectors = channel
+        .document_vectors()
+        .expect("a channel over a corpus serves it");
+    assert_eq!(vectors.len(), 8);
+    assert_eq!(channel.corpus_size(), 8);
     assert_eq!(
-        provider.encode_count() - baseline,
-        1,
-        "cosine runs against the cache; only the query is ever encoded on the read path"
+        provider.encode_count(),
+        baseline,
+        "the hop reads the cache; nothing on this path encodes anything"
     );
 }
 
@@ -1386,11 +947,11 @@ fn strip_omissions(pack: &TaskContextPack) -> Value {
 /// The three degradations ADR-0004 named collapse to one, because two of them were about encoding.
 ///
 /// A model that will not load, a model that cannot encode this query, and an encode that overran
-/// its budget were three ways for the query-side channel to fail. Automatic injection no longer
-/// encodes anything: ADR-0007's second hop compares two vectors the corpus backfill already wrote.
-/// So a channel that cannot encode degrades nothing here, and the only degradation left is a
-/// channel with no published corpus snapshot to compare against -- which is what a model still
-/// loading is.
+/// its budget were three ways for the query-side channel to fail. Nothing encodes anything on a
+/// retrieval path any more: ADR-0007's second hop compares two vectors the corpus backfill already
+/// wrote, and the encode budget and the query cache are gone with the path that had them. The only
+/// degradation left is a channel with no published corpus snapshot to compare against -- which is
+/// what a model still loading is.
 #[test]
 fn the_only_degradation_left_is_a_channel_with_no_published_corpus() {
     let fixture = Fixture::new();
@@ -1414,30 +975,15 @@ fn the_only_degradation_left_is_a_channel_with_no_published_corpus() {
          degradation the second hop can still suffer"
     );
 
-    // 2. A model that cannot encode at all, over a published corpus. Nothing degrades: the second
-    //    hop never asks it to encode.
-    let failing = EmbeddingSemanticChannel::new(
-        Arc::new(HashProvider::failing()),
-        vec![(RevisionId::new(), vec![0.5_f32; 64])],
-    );
-    let broken = engine.clone().with_semantic_channel(Arc::new(failing));
+    // 2. A published corpus of vectors nothing in this projection refers to. The channel is not
+    //    degraded -- it answered, with vectors -- and there is no encoder left in it to fail.
+    let published = EmbeddingSemanticChannel::new(vec![(RevisionId::new(), vec![0.5_f32; 64])]);
+    let loaded = engine.clone().with_semantic_channel(Arc::new(published));
     assert_eq!(
-        omission_reasons(&automatic_pack(&broken)),
+        omission_reasons(&automatic_pack(&loaded)),
         vec!["no_lane_evidence".to_owned()],
-        "a provider that cannot encode is not a degraded second hop, because the second hop never \
-         encodes"
-    );
-
-    // 3. An encoder slower than any budget, over a published corpus. Same answer, same reason.
-    let provider = Arc::new(HashProvider::slow(Duration::from_millis(300)));
-    let vector = provider.encode("corpus entry").unwrap();
-    let slow = EmbeddingSemanticChannel::new(provider, vec![(RevisionId::new(), vector)])
-        .with_budget(Duration::from_millis(20));
-    let stalled = engine.clone().with_semantic_channel(Arc::new(slow));
-    assert_eq!(
-        omission_reasons(&automatic_pack(&stalled)),
-        vec!["no_lane_evidence".to_owned()],
-        "the encode budget governs a path automatic injection no longer takes"
+        "a channel that served its snapshot is not a degraded second hop, whatever the snapshot \
+         turns out to hold"
     );
 }
 
@@ -1454,10 +1000,12 @@ fn explicit_search_is_untouched_by_the_channel() {
     );
     let engine = fixture.engine();
 
-    let (channel, queries) = ScriptedChannel::hits(vec![SemanticHit {
-        revision_id: silent_revision,
-        similarity_basis_points: 9_000,
-    }]);
+    let provider = HashProvider::new();
+    let channel = Arc::new(ScriptedChannel::loaded(vec![(
+        silent_revision,
+        provider.encode(SILENT_TOPIC).unwrap(),
+    )]));
+    let reads = Arc::clone(&channel.reads);
     let semantic = engine.clone().with_semantic_channel(channel);
 
     let mut request =
@@ -1466,10 +1014,10 @@ fn explicit_search_is_untouched_by_the_channel() {
     let explicit = semantic.task_context_pack(&request).unwrap();
 
     assert_eq!(
-        queries.load(Ordering::SeqCst),
+        reads.load(Ordering::SeqCst),
         0,
         "ADR-0004 scopes the channel to automatic injection; an explicit, paged query must not \
-         rank against a cache the backfill is still filling"
+         read a corpus snapshot the backfill is still filling"
     );
     let serialized = serde_json::to_string(&explicit).unwrap();
     assert!(!serialized.contains("semantic_similarity"));

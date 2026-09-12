@@ -27,3 +27,59 @@ The embedding channel has been in this repository since ADR-0004 and has never d
 - Keeping the intent path with a re-ranking stage instead of removing it was considered and deferred. It would treat the symptom the measurement actually shows — good ordering, bad admission — but it adds a second model-dependent stage to a channel whose first stage has never been validated in the field, and the two-lane design reaches the same Contexts through the seed hop with a threshold that is measured on both corpora.
 - Treating the corpus-join fix as sufficient on its own was rejected. It was necessary — every number in this ADR is meaningless in the `context_fts` space — but the intent path's top hit was off-topic on the device run *in the clean space too*. Fixing what the encoder is fed does not make a ranking signal into a gate.
 - Leaving `SEMANTIC_CORPUS_VERSION` at `"1"` and calibrating against the shipped `context_fts` space, on the grounds that calibrating where it runs is ADR-0004's own rule, was rejected. The rule says to calibrate in the space production uses; it does not say to keep a space that was never intended. The shrapnel corpus was a join defect, not a design, and the fixture text and the indexed text agreeing is what makes any calibration in this suite transferable at all.
+
+## Amendment 2026-09-12: the query floor's remaining job did not exist
+
+This ADR says the query-side floor "belongs to neither lane and keeps exactly one job: explicit
+`context_search`". That sentence was wrong when it was written, and the constant it protected has
+therefore been retired along with the whole query path.
+
+**Explicit `context_search` has never held the channel.** Every call builds its own engine —
+`SearchEngine::new(self.runtime().index.clone()).with_context_ttl(...)` in `crates/mcp/src/lib.rs`
+— and nothing attaches a semantic channel to it, so it goes through `search_in_snapshot`, which is
+purely lexical. The claim is not merely stale: the commit that wrote it carried, in the same
+crate, a `semantic_outcome` whose own doc said "Explicit `context_search` is deliberately
+excluded" and which returned early for any mode other than `AutomaticInjection`. Retiring the
+intent path from automatic injection did not relocate the floor to explicit search; it left the
+floor with no caller at all.
+
+**What that made dead, measured on this installation.** `SemanticChannel::similar_revisions` had
+zero production call sites — the trait method, its one implementation, and the handle's forwarding
+were the only four mentions in any `src` tree. Behind it: both query floors (bge-m3's 5200 and
+F2LLM's 2800, the second reachable only through `similarity_floor_basis_points` and then only
+inside `similar_revisions`), the channel cap, the encode budget `SEMANTIC_ENCODE_BUDGET`, the
+process-lifetime query vector cache, and `EncodeSample`. Three live surfaces were consuming that
+last one and reporting it as current: `sctx embedding status`'s `encode_latency` field, `sctx
+doctor`'s `retrieval_embedding` budget warning, and the `[retrieval] embedding_encode_budget_ms`
+key the warning told operators to raise. The `encode_sample` table on this machine holds 41 rows,
+all of them written before the query path was removed, with `observed_at` an AUTOINCREMENT rather
+than a timestamp — so the status command was reporting a frozen history as "the last 64 query
+encodes", and the doctor check was an active warning over a constant input, advising a change to a
+key that governed nothing.
+
+**All of it is removed rather than deprecated.** A `#[deprecated]` surface that reads as live is
+what produced this situation. The config key is the one exception and only in the narrow sense
+that it is still *parsed*: `[retrieval]` denies unknown fields, so silently deleting it would make
+an upgrade fail on any `config.toml` that had been tuned. It is no longer validated, no longer
+reported, and dropped rather than carried forward the next time `sctx embedding install` rewrites
+the table.
+
+**The two floors' numbers survive where they were measured.** They are real readings of two
+encoder spaces against two fixtures, and both probe suites still need a separation guard, so each
+now declares its own local constant with the distribution it came from written beside it — 5095
+noise ceiling against 5640 weakest positive for bge-m3, 2070 against a 3217 main mass for F2LLM.
+What changed is what they claim: a measurement of a fixture rather than a threshold governing
+production. `embedding_qwen3_floor_calibration.rs` is deleted, because its subject was the
+constant rather than the space; the query-side half of
+`embedding_hop2_admission_calibration.rs` is deleted for the same reason, and its finding is the
+evidence quoted in this amendment. `embedding_encode_latency.rs` and
+`embedding_backfill_contention.rs` are kept and repointed: the first still answers what one corpus
+encode costs and what the export costs in memory, the second still measures `SessionGate`'s
+preemption, and neither asserts a budget any more.
+
+The interactive encode path itself stays — `EmbeddingProvider::encode`, the instruction prefix, and
+the gate that lets it preempt a corpus run. Its production callers are `sctx embedding status
+--verify`'s self-check and nothing else, but it is also the primitive every calibration and probe
+suite needs, and removing the ability to encode a query would remove the ability to ever re-measure
+one of these decisions. That is a deliberate exception to "delete what has no production caller",
+and it is recorded here so the next audit does not have to rediscover the reason.

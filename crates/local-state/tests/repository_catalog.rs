@@ -1082,8 +1082,16 @@ fn engineering_auto_scan_defaults_to_on_and_is_explicitly_switchable() {
     );
 }
 
+/// The retired encode budget key is accepted and ignored, and disappears on the next rewrite.
+///
+/// ADR-0007 retired the synchronous query path the budget governed, so the key controls nothing.
+/// It cannot simply be deleted from the document: `[retrieval]` denies unknown fields, so an
+/// operator who tuned it would find their `config.toml` unreadable after an upgrade. It is
+/// therefore still parsed -- at any value, since there is no longer a range that means anything --
+/// no longer surfaced in `RetrievalSettings`, and dropped rather than carried forward when
+/// `sctx embedding install` rewrites the table.
 #[test]
-fn the_encode_budget_is_optional_bounded_and_survives_a_model_reinstall() {
+fn the_retired_encode_budget_key_is_accepted_ignored_and_dropped_on_rewrite() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("预算 配置");
     let store = UserConfigStore::initialize(&root).unwrap();
@@ -1092,63 +1100,38 @@ fn the_encode_budget_is_optional_bounded_and_survives_a_model_reinstall() {
     let runtime = temporary.path().join("libonnxruntime.dylib");
 
     store.set_retrieval_embedding(&model, &runtime).unwrap();
-    let default = store.retrieval_settings().unwrap();
-    assert_eq!(
-        default.embedding_encode_budget_ms, None,
-        "an installation that never needed a budget must not grow a key it did not write"
-    );
-    assert_eq!(
-        default.encode_budget(),
-        None,
-        "absent means the compiled-in default, not zero"
-    );
     assert!(
         !fs::read_to_string(&config_path)
             .unwrap()
             .contains("embedding_encode_budget_ms"),
-        "the default must stay out of the document so it can change without a migration"
+        "a fresh installation never writes the retired key"
     );
+
+    // Any value at all: an upgrade must not turn a tuned installation into an unreadable one,
+    // and a range check over a key that governs nothing would only be theatre.
+    for value in ["0", "2500", "60000"] {
+        let mut text = fs::read_to_string(&config_path).unwrap();
+        let _ = writeln!(text, "embedding_encode_budget_ms = {value}");
+        fs::write(&config_path, text).unwrap();
+        store
+            .retrieval_settings()
+            .expect("the retired key is accepted at any value");
+        let text = fs::read_to_string(&config_path)
+            .unwrap()
+            .replace(&format!("\nembedding_encode_budget_ms = {value}"), "");
+        fs::write(&config_path, text).unwrap();
+    }
 
     let mut text = fs::read_to_string(&config_path).unwrap();
     let _ = writeln!(text, "embedding_encode_budget_ms = 2500");
     fs::write(&config_path, text).unwrap();
-    let tuned = store.retrieval_settings().unwrap();
-    assert_eq!(tuned.embedding_encode_budget_ms, Some(2_500));
-    assert_eq!(
-        tuned.encode_budget(),
-        Some(std::time::Duration::from_millis(2_500))
-    );
-
-    // Reinstalling the model rewrites both paths. A budget the operator measured for this machine
-    // is not part of that, and losing it would silently restore the failure they tuned it away.
     store.set_retrieval_embedding(&model, &runtime).unwrap();
-    assert_eq!(
-        store
-            .retrieval_settings()
+    assert!(
+        !fs::read_to_string(&config_path)
             .unwrap()
-            .embedding_encode_budget_ms,
-        Some(2_500),
-        "`sctx embedding install` must not discard a tuned encode budget"
+            .contains("embedding_encode_budget_ms"),
+        "a rewrite drops the retired key rather than keeping a dead knob alive"
     );
-
-    for refused in ["0", "10", "60000"] {
-        let mut text = fs::read_to_string(&config_path).unwrap();
-        text = text.replace(
-            "embedding_encode_budget_ms = 2500",
-            &format!("embedding_encode_budget_ms = {refused}"),
-        );
-        fs::write(&config_path, text).unwrap();
-        assert_eq!(
-            store.retrieval_settings().unwrap_err().kind(),
-            ErrorKind::InvalidInput,
-            "a budget of {refused} ms is refused rather than clamped, so a typo is a message"
-        );
-        let text = fs::read_to_string(&config_path).unwrap().replace(
-            &format!("embedding_encode_budget_ms = {refused}"),
-            "embedding_encode_budget_ms = 2500",
-        );
-        fs::write(&config_path, text).unwrap();
-    }
 }
 
 #[test]

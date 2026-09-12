@@ -6,12 +6,12 @@
 //! that publish lands, every automatic Pack reports `embedding_unavailable` and answers from the
 //! lexical channels exactly as it would on an installation that never configured a model.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc};
 
 use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
 use sctx_local_state::{RetrievalSettings, UserConfigStore};
 use sctx_search::{
-    EmbeddingSemanticChannel, EncodeSampleRecorder, SearchEngine, SemanticCacheKey,
+    EmbeddingSemanticChannel, Hop2AdmissionRecorder, SearchEngine, SemanticCacheKey,
     SemanticChannelHandle, SemanticVectorCache, load_onnx_provider, model_fingerprint,
 };
 
@@ -34,16 +34,13 @@ pub(crate) fn spawn_semantic_loader(root: &Path) -> Option<SemanticChannelHandle
     let settings = retrieval_settings(root);
     let model_path = settings.embedding_model_path.clone()?;
     let runtime_path = settings.embedding_runtime_path.clone()?;
-    let budget = settings.encode_budget();
     let handle = SemanticChannelHandle::new();
     let background = handle.clone();
     let root = root.to_path_buf();
     if std::thread::Builder::new()
         .name("sctx-embedding-loader".to_owned())
         .spawn(move || {
-            if let Err(error) =
-                load_and_backfill(&root, &model_path, &runtime_path, budget, &background)
-            {
+            if let Err(error) = load_and_backfill(&root, &model_path, &runtime_path, &background) {
                 // stderr is the MCP server's advisory channel; stdout carries the protocol. A
                 // failed model load degrades retrieval, it never fails a request.
                 eprintln!("sctx: embedding channel unavailable: {error}");
@@ -72,7 +69,6 @@ fn load_and_backfill(
     root: &Path,
     model_path: &Path,
     runtime_path: &Path,
-    budget: Option<Duration>,
     handle: &SemanticChannelHandle,
 ) -> sctx_search::Result<()> {
     let provider = load_onnx_provider(model_path, runtime_path)?;
@@ -90,22 +86,20 @@ fn load_and_backfill(
     let engine = SearchEngine::new(open_index(root));
     let embeddable = current_corpus(&engine, &cache, &key)?;
 
-    // Every publish carries the same budget and the same recorder, and shares one query vector
-    // cache through `from_cache`, so a later one inherits the earlier one's warmth instead of
-    // resetting a session back to a cold encode.
-    let build = |provider: Arc<dyn sctx_search::EmbeddingProvider>| {
-        let channel = EmbeddingSemanticChannel::from_cache(provider, &cache, &key)?
-            .with_encode_recorder(Arc::clone(&cache) as Arc<dyn EncodeSampleRecorder>);
-        Ok::<_, sctx_search::Error>(match budget {
-            Some(budget) => channel.with_budget(budget),
-            None => channel,
-        })
+    // Every publish reads the corpus snapshot the cache currently holds and carries the same
+    // recorder, so a later one widens what the second hop can reach without disturbing anything
+    // an earlier one answered.
+    let build = || {
+        Ok::<_, sctx_search::Error>(
+            EmbeddingSemanticChannel::from_cache(&cache, &key)?
+                .with_hop2_recorder(Arc::clone(&cache) as Arc<dyn Hop2AdmissionRecorder>),
+        )
     };
 
-    handle.publish(Arc::new(build(Arc::clone(&provider))?));
+    handle.publish(Arc::new(build()?));
 
     if fill_missing_vectors(&provider, &cache, &key, embeddable)? {
-        handle.publish(Arc::new(build(Arc::clone(&provider))?));
+        handle.publish(Arc::new(build()?));
     }
 
     // From here the thread exists only to answer Confirmations. It parks, so it costs nothing
@@ -132,7 +126,7 @@ fn load_and_backfill(
             }
         };
         if embeddable {
-            handle.publish(Arc::new(build(Arc::clone(&provider))?));
+            handle.publish(Arc::new(build()?));
         }
     }
 }

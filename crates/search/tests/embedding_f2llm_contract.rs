@@ -31,16 +31,12 @@
 
 mod f2llm_snapshot;
 
-use std::sync::Arc;
-
 use f2llm_snapshot::provider;
-use sctx_domain::RevisionId;
 use sctx_search::{
-    EmbeddingProvider, EmbeddingSemanticChannel, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-    QueryVectorCache, SEMANTIC_QUERY_CACHE_CAPACITY, SemanticCacheKey, SemanticChannel,
+    EmbeddingProvider,
     embedding::{
         SEMANTIC_MAX_TOKENS,
-        onnx::{ModelFamily, OnnxEmbeddingProvider, TextRole},
+        onnx::{ModelFamily, TextRole},
     },
 };
 use serde_json::Value;
@@ -143,13 +139,6 @@ fn the_f2llm_encoder_reproduces_the_reference_tokens_and_vectors() {
         "an F2LLM snapshot carries config.json model_type qwen3; anything else means family \
          detection read the wrong thing"
     );
-    assert_eq!(
-        provider.similarity_floor_basis_points(),
-        QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        "a loaded provider reports its own family's floor, so bge-m3's calibration cannot be \
-         applied to this space"
-    );
-
     for case in golden_cases() {
         let text = golden_text(&case);
         let role = golden_role(&case);
@@ -252,37 +241,18 @@ fn the_query_instruction_stays_inside_the_provider() {
          unaltered behind it"
     );
 
-    // And it never escapes the provider. The cache in front of the encoder is keyed on the text a
-    // session asked about, so warming it with a query and reading it back with that same query has
-    // to hit. A provider that made its caller prepend the instruction would key this cache on the
-    // prefixed text instead, carrying an 87-character constant into every entry.
-    let corpus = cases
-        .iter()
-        .filter(|case| golden_role(case) == TextRole::Document)
-        .map(|case| {
-            let vector = provider
-                .encode_bulk(golden_text(case))
-                .expect("encode a corpus text");
-            (RevisionId::new(), vector)
-        })
-        .collect::<Vec<_>>();
-    assert!(!corpus.is_empty(), "the fixture holds document cases");
-
-    let query_cache = Arc::new(QueryVectorCache::with_capacity(
-        SEMANTIC_QUERY_CACHE_CAPACITY,
-    ));
-    let shared: Arc<dyn EmbeddingProvider> = Arc::<OnnxEmbeddingProvider>::clone(provider);
-    let channel =
-        EmbeddingSemanticChannel::new(shared, corpus).with_query_cache(Arc::clone(&query_cache));
-    let _outcome = channel.similar_revisions(query_text);
-
-    let cached = query_cache
-        .get(&SemanticCacheKey::new("in-memory", "in-memory"), query_text)
-        .expect("the query vector is cached under the raw query text");
-    let agreement = cosine(&cached[..HEAD], &golden_head(query));
+    // And it never escapes the provider: a caller hands `encode` the text a session asked about
+    // and gets the prefixed encoding back, without ever seeing the prefix. The check used to run
+    // through the channel's query vector cache, which was keyed on the raw text; ADR-0007 retired
+    // that cache along with the query path, so it is asked of the provider directly, which is
+    // where the asymmetry has always lived.
+    let encoded = provider
+        .encode(query_text)
+        .expect("encode the query text through the interactive path");
+    let agreement = cosine(&encoded[..HEAD], &golden_head(query));
     assert!(
         agreement >= VECTOR_AGREEMENT,
-        "the vector cached under the raw text is the prefixed encoding, not an unprefixed one: \
-         agreement {agreement}"
+        "the vector `encode` returns for the raw text is the prefixed encoding, not an unprefixed \
+         one: agreement {agreement}"
     );
 }

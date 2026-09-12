@@ -57,10 +57,18 @@ use association_probe_harness::{
         print_category_comparison, print_similarity_separation, run_suite,
     },
 };
-use sctx_search::{
-    EmbeddingProvider, EmbeddingSemanticChannel, QueryVectorCache, SEMANTIC_QUERY_CACHE_CAPACITY,
-    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SearchEngine, SemanticChannel,
-};
+use sctx_search::{EmbeddingProvider, EmbeddingSemanticChannel, SearchEngine, SemanticChannel};
+
+/// Highest score any noise probe of this fixture may reach, in basis points.
+///
+/// It was `SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`, a production constant, until ADR-0007 retired
+/// the query path that read it; the number itself is a measurement of *this fixture against this
+/// encoder* and is kept where that measurement is taken. T5a's run: the highest-scoring noise
+/// query reaches 5095 and the lowest-scoring cross-lingual positive 5640, so 5200 sits 105 basis
+/// points above the noise ceiling and 440 below the weakest positive. What it guards is unchanged
+/// -- that this encoder separates this fixture's noise from its positives at all -- and it no
+/// longer claims to govern anything in production.
+const BGE_NOISE_CEILING_BASIS_POINTS: u16 = 5_200;
 use serde_json::Value;
 
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ext-v1.json");
@@ -140,28 +148,15 @@ fn the_embedding_channel_lifts_paraphrase_and_cross_lingual_without_costing_iden
     let fingerprint = sctx_search::model_fingerprint(&model).unwrap();
     let (cache, key, embeddable) = embed_corpus(&engine, &provider, &root, &fingerprint);
 
-    let channel = Arc::new(
-        EmbeddingSemanticChannel::from_cache(Arc::clone(&provider), &cache, &key).unwrap(),
-    );
+    let corpus = cache.load(&key).unwrap();
+    let channel = Arc::new(EmbeddingSemanticChannel::from_cache(&cache, &key).unwrap());
     assert_eq!(channel.corpus_size(), embeddable);
 
-    let (_worst_positive, best_noise) = print_similarity_separation(&fixture, channel.as_ref());
+    let (_worst_positive, best_noise) = print_similarity_separation(&fixture, &provider, &corpus);
     assert!(
-        best_noise < SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        "the floor must sit above every noise query on this set: best noise {best_noise}, floor \
-         {SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS}"
-    );
-
-    // `print_similarity_separation` has now encoded every probe query once, so the shared query
-    // cache holds them all. Handing the fused channel an empty cache of its own is what makes the
-    // "first encode" measurement below actually a first encode -- otherwise the run would report
-    // the cached cost for every probe and quietly lose the number this test exists to pin.
-    let channel = Arc::new(
-        EmbeddingSemanticChannel::from_cache(Arc::clone(&provider), &cache, &key)
-            .unwrap()
-            .with_query_cache(Arc::new(QueryVectorCache::with_capacity(
-                SEMANTIC_QUERY_CACHE_CAPACITY,
-            ))),
+        best_noise < BGE_NOISE_CEILING_BASIS_POINTS,
+        "this encoder must separate the fixture's noise from its positives: best noise \
+         {best_noise}, measured ceiling {BGE_NOISE_CEILING_BASIS_POINTS}"
     );
 
     let semantic_engine = engine
@@ -237,9 +232,9 @@ fn assert_latency_budgets(
          task_context p95, measured {first_increment:?}"
     );
 
-    // The same long queries again. Their vectors are in the query cache now, so this is what every
-    // repeat read of one Intent costs -- and it is the case ADR-0004's original 100 ms clause
-    // survives on.
+    // The same long queries again. Nothing on this path encodes any more -- ADR-0007 retired the
+    // query side, so a repeat read costs whatever the first one did -- and the assertion below is
+    // now about reproducibility rather than about a cache.
     let repeated = run_suite(harness, semantic_engine, fixture);
     let repeated_long_p95 = percentile(repeated.long_latencies.clone(), 95);
     let repeated_increment = repeated_long_p95.saturating_sub(lexical_long_p95);
@@ -254,7 +249,7 @@ fn assert_latency_budgets(
     );
     assert_eq!(
         repeated.hits, fused.hits,
-        "the query vector cache must not change what the channel retrieves"
+        "two identical runs over one corpus must retrieve identically"
     );
 }
 

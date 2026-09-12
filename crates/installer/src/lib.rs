@@ -4678,18 +4678,6 @@ const RETRIEVAL_ENABLE: &str = "run `sctx embedding install`, which downloads th
      --model bge-m3` installs the older BAAI/bge-m3 export instead, and `--model-url <BASE>` \
      fetches whichever one from an internal mirror.";
 
-/// What an operator has to do when the encode budget does not fit their hardware.
-///
-/// The default is calibrated against a real Working Intent on current Apple Silicon; slower
-/// machines exist, and on one of them the channel loads, embeds the corpus, reports no error, and
-/// contributes to nothing. This is the only place that fact becomes visible, so it has to carry
-/// the whole remedy rather than a pointer to it.
-const RETRIEVAL_BUDGET: &str = "The encode budget is calibrated for this machine's hardware, not \
-     configured per installation. Raise it by setting `[retrieval] embedding_encode_budget_ms` in \
-     `config.toml` to something above the p95 above (a value of 50--30000 is accepted), then \
-     restart `sctx mcp serve`. Shortening the Working Intent's goal and current direction also \
-     helps: the encode cost scales with the length of the query they build.";
-
 /// Reports the optional embedding recall channel (ADR-0004).
 ///
 /// It never reports [`CheckStatus::Error`]. The channel is opt-in and additive: an installation
@@ -4928,26 +4916,12 @@ fn configured_retrieval_check(root: &Path, model_path: &Path, runtime_path: &Pat
                 .ok()
         })
         .map_or(0, |revisions| revisions.len());
-    let encodes = cache
-        .as_ref()
-        .ok()
-        .and_then(|cache| cache.encode_latency_summary().ok())
-        .unwrap_or_default();
-    if encodes.budget_is_unfit() {
-        return warning(
-            "retrieval_embedding",
-            format!(
-                "Configured, but {} of the last {} query encodes overran the {} ms budget \
-                 (p50 {} ms, p95 {} ms), so those retrievals degraded to lexical recall. \
-                 {RETRIEVAL_BUDGET}",
-                encodes.timed_out,
-                encodes.samples,
-                encodes.budget_ms,
-                encodes.p50_ms,
-                encodes.p95_ms
-            ),
-        );
-    }
+    // No encode-budget warning any more, and its absence is the point. That warning read a
+    // frozen history: the rows came from `similar_revisions`, ADR-0007 retired the last caller of
+    // it, and the check then kept advising operators to raise `[retrieval]
+    // embedding_encode_budget_ms` -- a key that governed nothing -- on the strength of encodes
+    // taken before the release that removed the path. The check reports what this installation
+    // holds, which is the fact that is still true.
     // Named rather than inferred: two exports are installable and they do not share a vector
     // space, so "which model is this" is the first thing anyone comparing two machines needs.
     let model = embedding::installed_model(model_path).map_or_else(
@@ -4958,13 +4932,9 @@ fn configured_retrieval_check(root: &Path, model_path: &Path, runtime_path: &Pat
         "retrieval_embedding",
         format!(
             "Configured: model {model} at {}, runtime {}, {cached} Context revision(s) embedded \
-             so far. Query encodes: {} sampled, {} over budget, p95 {} ms against a {} ms budget.",
+             so far.",
             model_path.display(),
             runtime_path.display(),
-            encodes.samples,
-            encodes.timed_out,
-            encodes.p95_ms,
-            encodes.budget_ms
         ),
     )
 }

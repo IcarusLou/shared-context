@@ -52,10 +52,21 @@ use association_probe_harness::{
     },
 };
 use sctx_search::{
-    EmbeddingProvider, EmbeddingSemanticChannel, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-    QueryVectorCache, SEMANTIC_QUERY_CACHE_CAPACITY, SearchEngine, SemanticChannel,
+    EmbeddingProvider, EmbeddingSemanticChannel, SearchEngine, SemanticChannel,
     embedding::onnx::OnnxEmbeddingProvider,
 };
+
+/// Highest score any noise probe of this fixture may reach against this encoder, in basis points.
+///
+/// It was `QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`, a production constant, until ADR-0007
+/// retired the query path that read it; the number is a measurement of *this fixture against this
+/// encoder* and is kept where that measurement is taken. The 2026-09-07 run separates into eight
+/// noise queries at 303--2070, two outlying positives at 2403 and 2447, and the other 75
+/// positives at 3217--8588, so 2800 sits 730 basis points above every noise query and 417 below
+/// the main mass of positives. Cosine floors are not portable between embedding spaces -- this
+/// family's noise ceiling is more than three thousand basis points below bge-m3's -- which is why
+/// this is its own number and not a second opinion about the bge-m3 suite's.
+const F2LLM_NOISE_CEILING_BASIS_POINTS: u16 = 2_800;
 use serde_json::Value;
 
 const PROBE_FIXTURE: &str = include_str!("../../../fixtures/association/probe-ext-v1.json");
@@ -138,12 +149,6 @@ fn the_f2llm_channel_holds_cross_lingual_and_paraphrase_at_the_calibrated_floor(
         load_started.elapsed()
     );
     let provider = Arc::<OnnxEmbeddingProvider>::clone(provider) as Arc<dyn EmbeddingProvider>;
-    assert_eq!(
-        provider.similarity_floor_basis_points(),
-        QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        "this suite grades the Qwen3 floor; a provider reporting another one means the wrong \
-         export is loaded"
-    );
     // A literal fingerprint rather than `model_fingerprint` of the directory: this suite loads the
     // model out of a directory of symlinks into the Hugging Face cache, and `model_fingerprint`
     // reads `DirEntry::metadata`, which on Unix does not follow a symlink -- so it sees a directory
@@ -151,27 +156,17 @@ fn the_f2llm_channel_holds_cross_lingual_and_paraphrase_at_the_calibrated_floor(
     // has to be stable for the length of one run, because the cache lives in a temporary home.
     let (cache, key, embeddable) = embed_corpus(&engine, &provider, &root, "f2llm-probe-snapshot");
 
-    let channel = Arc::new(
-        EmbeddingSemanticChannel::from_cache(Arc::clone(&provider), &cache, &key).unwrap(),
-    );
+    let corpus = cache.load(&key).unwrap();
+    let channel = Arc::new(EmbeddingSemanticChannel::from_cache(&cache, &key).unwrap());
     assert_eq!(channel.corpus_size(), embeddable);
 
-    let (_worst_positive, best_noise) = print_similarity_separation(&fixture, channel.as_ref());
+    let (_worst_positive, best_noise) = print_similarity_separation(&fixture, &provider, &corpus);
     assert!(
-        best_noise < QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        "the floor must sit above every noise query on this set: best noise {best_noise}, floor \
-         {QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS}"
+        best_noise < F2LLM_NOISE_CEILING_BASIS_POINTS,
+        "this encoder must separate the fixture's noise from its positives: best noise \
+         {best_noise}, measured ceiling {F2LLM_NOISE_CEILING_BASIS_POINTS}"
     );
 
-    // The separation pass just encoded every probe query, so the fused run gets a fresh query
-    // cache: otherwise its latency numbers would all be cache hits.
-    let channel = Arc::new(
-        EmbeddingSemanticChannel::from_cache(Arc::clone(&provider), &cache, &key)
-            .unwrap()
-            .with_query_cache(Arc::new(QueryVectorCache::with_capacity(
-                SEMANTIC_QUERY_CACHE_CAPACITY,
-            ))),
-    );
     let semantic_engine = engine
         .clone()
         .with_semantic_channel(Arc::clone(&channel) as Arc<dyn SemanticChannel>);
@@ -228,9 +223,9 @@ fn the_f2llm_channel_holds_cross_lingual_and_paraphrase_at_the_calibrated_floor(
 ///
 /// Nothing here is graded against the bge-m3 suite's budgets: those are that model's measured cost
 /// plus headroom, and this family's own ladder is measured in
-/// `crates/search/tests/embedding_encode_latency.rs`. The query vector cache is different -- it is
-/// the same code whichever model is loaded, and a cache that changed what the channel retrieves
-/// would be a defect rather than a slower model.
+/// `crates/search/tests/embedding_encode_latency.rs`. Reproducibility is different -- it is the
+/// same code whichever model is loaded, and two identical runs that retrieved differently would be
+/// a defect rather than a slower model.
 fn report_latency(
     harness: &Harness,
     semantic_engine: &SearchEngine,
@@ -253,6 +248,6 @@ fn report_latency(
     );
     assert_eq!(
         repeated.hits, fused.hits,
-        "the query vector cache must not change what the channel retrieves"
+        "two identical runs over one corpus must retrieve identically"
     );
 }

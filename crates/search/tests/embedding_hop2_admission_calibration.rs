@@ -1,13 +1,20 @@
-//! Calibrates [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`], and re-reads the query-side floor in
-//! the same space.
+//! Calibrates [`SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS`].
 //!
-//! Every other measurement in this suite asks a query-shaped question: a probe goes in, a ranked
-//! list comes out, and the floor decides how much of the list is worth showing. The second hop asks
-//! a different one. It starts from a Context the session already touched and asks which *other*
-//! Contexts belong beside it -- document against document, no query in the picture -- and the answer
-//! is admitted or refused rather than ranked. So the number it needs is not the query floor
-//! measured again; it is a different statistic of a different distribution, and this file measures
-//! it.
+//! Every earlier measurement in this suite asked a query-shaped question: a probe went in, a
+//! ranked list came out, and a floor decided how much of the list was worth showing. The second
+//! hop asks a different one. It starts from a Context the session already touched and asks which
+//! *other* Contexts belong beside it -- document against document, no query in the picture -- and
+//! the answer is admitted or refused rather than ranked. So the number it needs is not a query
+//! floor measured again; it is a different statistic of a different distribution, and this file
+//! measures it.
+//!
+//! This file used to hold a second test that re-read the query-side floor over the same corpus.
+//! Its finding is what retired that floor: ranking was intact on every Intent -- the best
+//! on-topic Context beat the best off-topic one by 2902 to 5584 basis points, without exception --
+//! while the floor itself admitted 31 of 96 off-topic Contexts, 32.3%. A ranking signal was being
+//! asked to make an admission decision, and no value of that constant could have made it one.
+//! ADR-0007 replaced the path, its amendment records the retirement, and the test went with the
+//! constant it measured.
 //!
 //! `#[ignore]`d because it needs roughly 2.4 GB of weights this repository deliberately does not
 //! ship. Point it at a Hugging Face snapshot and the ONNX Runtime library:
@@ -36,19 +43,6 @@
 //! second hop performs, and scoring one side through the query path would measure a number the hop
 //! never computes.
 //!
-//! The second test reuses the same corpus for the query side. The fixture's `intents` are Working
-//! Intents in the shape a real session produces -- goal, current direction and in-scope list -- and
-//! joining them with a space is what `semantic_query_text` does before handing the string to the
-//! provider. Scoring those against the *cross-topic* Contexts says how much of this corpus
-//! [`QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS`] admits when the Contexts are about something
-//! else, which is the number that decides whether that floor is still load-bearing.
-//!
-//! That second measurement has a limit worth stating where it is taken rather than where it is
-//! quoted: these Intents were written alongside these Contexts, so they share vocabulary that a
-//! real Working Intent -- written before the work is understood, describing a process rather than
-//! the knowledge -- does not. The number it produces is therefore an *optimistic* bound on the
-//! intent path, and the pessimistic one comes from the device run recorded in ADR-0007. Both point
-//! the same way, which is the only claim made from either.
 
 #![cfg(all(feature = "embedding-onnx", unix))]
 
@@ -58,8 +52,7 @@ use std::sync::OnceLock;
 
 use f2llm_snapshot::provider;
 use sctx_search::{
-    EmbeddingProvider, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-    SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, embedding::cosine_similarity,
+    EmbeddingProvider, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, embedding::cosine_similarity,
 };
 use serde_json::Value;
 
@@ -484,120 +477,5 @@ fn the_second_hop_floor_sits_in_a_band_no_cross_topic_pair_reaches() {
         cross_repo_kept >= RETAINED_CROSS_REPO_SAME_TOPIC,
         "the floor admits {cross_repo_kept}/{cross_repo_total} cross-repository joins, below the \
          {RETAINED_CROSS_REPO_SAME_TOPIC} this calibration measured"
-    );
-}
-
-#[test]
-#[ignore = "needs a real F2LLM-v2-0.6B snapshot; see the module docs"]
-fn the_query_floor_admits_most_of_a_cross_topic_corpus() {
-    let corpus = corpus();
-    let provider = provider().as_ref();
-
-    println!("\n--- Working Intent against the whole corpus (basis points) ---");
-    println!(
-        "{:<26} {:>9} {:>9} {:>9} {:>13} {:>13}",
-        "intent", "best(on)", "best(off)", "gap", "off>=2800", "off>=hop2"
-    );
-
-    let mut total_off_topic = 0_usize;
-    let mut admitted_off_topic = 0_usize;
-    let mut admitted_off_topic_at_hop2 = 0_usize;
-    let mut worst_inversion: Option<(String, u16, u16)> = None;
-
-    for intent in fixture()["intents"]
-        .as_array()
-        .expect("the fixture holds an intent array")
-    {
-        // What `semantic_query_text` builds: goal, current direction, in-scope list, joined with a
-        // space. Out-of-scope is deliberately absent there and therefore absent here.
-        let mut parts = vec![
-            intent["goal"].as_str().expect("an intent carries a goal"),
-            intent["current_direction"]
-                .as_str()
-                .expect("an intent carries a direction"),
-        ];
-        parts.extend(
-            intent["in_scope"]
-                .as_array()
-                .expect("an intent carries an in-scope list")
-                .iter()
-                .map(|scope| scope.as_str().expect("in-scope holds strings")),
-        );
-        let vector = provider
-            .encode(&parts.join(" "))
-            .expect("every intent encodes");
-        let topic = intent["topic"].as_str().expect("an intent carries a topic");
-
-        let mut best_on = 0_u16;
-        let mut best_off = 0_u16;
-        let mut off_topic = 0_usize;
-        let mut off_admitted = 0_usize;
-        let mut off_admitted_hop2 = 0_usize;
-        for context in corpus {
-            let score = basis_points(cosine_similarity(&vector, &context.vector));
-            if context.topic == topic {
-                best_on = best_on.max(score);
-            } else {
-                best_off = best_off.max(score);
-                off_topic += 1;
-                if score >= QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS {
-                    off_admitted += 1;
-                }
-                if score >= SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS {
-                    off_admitted_hop2 += 1;
-                }
-            }
-        }
-
-        let id = intent["id"].as_str().expect("an intent carries an id");
-        println!(
-            "{:<26} {best_on:>9} {best_off:>9} {:>9} {:>13} {:>13}",
-            id,
-            i32::from(best_on) - i32::from(best_off),
-            format!("{off_admitted}/{off_topic}"),
-            format!("{off_admitted_hop2}/{off_topic}")
-        );
-
-        total_off_topic += off_topic;
-        admitted_off_topic += off_admitted;
-        admitted_off_topic_at_hop2 += off_admitted_hop2;
-        if best_off >= best_on {
-            worst_inversion = Some((id.to_owned(), best_on, best_off));
-        }
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    let rate = admitted_off_topic as f64 / total_off_topic as f64 * 100.0;
-    #[allow(clippy::cast_precision_loss)]
-    let hop2_rate = admitted_off_topic_at_hop2 as f64 / total_off_topic as f64 * 100.0;
-    println!(
-        "\nfloor {QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS} admits \
-         {admitted_off_topic}/{total_off_topic} ({rate:.1}%) of the off-topic corpus; the \
-         document-side floor {SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS} would admit \
-         {admitted_off_topic_at_hop2}/{total_off_topic} ({hop2_rate:.1}%)"
-    );
-    if let Some((id, on, off)) = &worst_inversion {
-        println!("an off-topic Context outscores every on-topic one for {id}: {off} against {on}");
-    }
-
-    // Not an assertion about the floor's value, which this corpus cannot settle: the fixture holds
-    // no noise queries, and the query floor's remaining job -- explicit `context_search` -- is a
-    // path where a caller asked for a broad list. What is asserted is that the number this test
-    // exists to publish was computed over the denominator the fixture describes, because a rate
-    // quoted in a doc comment is worth exactly what its denominator is.
-    let expected_off_topic = fixture()["intents"]
-        .as_array()
-        .expect("the fixture holds an intent array")
-        .iter()
-        .map(|intent| {
-            corpus
-                .iter()
-                .filter(|context| context.topic != intent["topic"].as_str().unwrap_or_default())
-                .count()
-        })
-        .sum::<usize>();
-    assert_eq!(
-        total_off_topic, expected_off_topic,
-        "the off-topic denominator is not the corpus this fixture describes"
     );
 }

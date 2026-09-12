@@ -48,14 +48,10 @@ mod lanes;
 pub use lanes::{AnchorMatchBasis, AnchorSource};
 
 pub use embedding::{
-    DocumentVectorSnapshot, EmbeddingProvider, EmbeddingSemanticChannel, EncodeLatencySummary,
-    EncodeSample, EncodeSampleRecorder, Hop2AdmissionSample,
-    QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, QueryVectorCache, RecordedHop2Admission,
-    SEMANTIC_CHANNEL_LIMIT, SEMANTIC_CORPUS_VERSION, SEMANTIC_ENCODE_BUDGET,
-    SEMANTIC_ENCODE_SAMPLE_HISTORY, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
-    SEMANTIC_HOP2_SAMPLE_HISTORY, SEMANTIC_QUERY_CACHE_CAPACITY,
-    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SemanticCacheKey, SemanticChannel,
-    SemanticChannelHandle, SemanticHit, SemanticOutcome, SemanticVectorCache, load_onnx_provider,
+    DocumentVectorSnapshot, EmbeddingProvider, EmbeddingSemanticChannel, Hop2AdmissionRecorder,
+    Hop2AdmissionSample, RecordedHop2Admission, SEMANTIC_CORPUS_VERSION,
+    SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, SEMANTIC_HOP2_SAMPLE_HISTORY, SemanticCacheKey,
+    SemanticChannel, SemanticChannelHandle, SemanticVectorCache, load_onnx_provider,
     model_fingerprint, semantic_cache_path,
 };
 
@@ -78,10 +74,11 @@ const GRAPH_GENERATION_ATTEMPTS: usize = 3;
 pub const GRAPH_READ_FAILED_REASON: &str = "graph_read_failed";
 /// Omission reason for a configured embedding channel that could not answer this query.
 ///
-/// It covers all three degradations ADR-0004 names -- the model failed to load, the background
-/// load has not finished, or the encode overran [`SEMANTIC_ENCODE_BUDGET`] -- because they are one
-/// fact to the Agent reading the Pack: the semantic channel did not contribute, and the lexical
-/// answer it is holding is complete on its own terms.
+/// It covers both remaining degradations -- the model failed to load, or the background load has
+/// not finished -- because they are one fact to the Agent reading the Pack: the semantic channel
+/// did not contribute, and the lexical answer it is holding is complete on its own terms. The
+/// third one ADR-0004 named, an encode that overran its budget, went with the query path: nothing
+/// on this path encodes anything.
 pub const EMBEDDING_UNAVAILABLE_REASON: &str = "embedding_unavailable";
 /// Omission reason for a projection that was rebuilt underneath every retrieval attempt.
 pub const GRAPH_GENERATION_UNSTABLE_REASON: &str = "graph_generation_unstable";

@@ -1,22 +1,30 @@
-//! Proves a query is not starved by the corpus backfill that runs beside it, and that the
-//! backfill is not starved in return.
+//! Proves an interactive encode is not starved by the corpus backfill that runs beside it, and
+//! that the backfill is not starved in return.
 //!
-//! `sctx mcp serve` publishes the semantic channel *before* it finishes embedding the corpus, so
-//! for the length of the backfill every user query shares one ONNX session with a loop of the most
-//! expensive encodes in the system. On this machine a full-length corpus encode is about 1060 ms
-//! at p95 against a 2000 ms budget, so this is not a fairness problem that yielding between corpus
-//! texts can solve: one corpus text already costs half the budget, and on the loaded machine the
-//! budget was raised for it costs all of it. The repair aborts the corpus run in flight when a
-//! query arrives.
+//! Every encode in the process is serialised through one ONNX session, and the corpus backfill is
+//! a loop of the most expensive encodes there are: on this machine a full-length corpus encode is
+//! about 1060 ms at p95. So this is not a fairness problem that yielding between corpus texts can
+//! solve -- an interactive encode that queued behind one would pay all of that -- and the repair
+//! aborts the corpus run in flight when an interactive encode arrives. `SessionGate` is what
+//! implements it and this is what measures it.
+//!
+//! What arrives interactively is smaller than it was. ADR-0007 retired the query path, so the
+//! interactive side is no longer a Pack asking a question every second; it is `sctx embedding
+//! status --verify`, the calibration suites, and anything else that calls
+//! `EmbeddingProvider::encode` while a backfill is running. The property is unchanged and the
+//! numbers are still the numbers, but there is no budget left for it to be measured against --
+//! these ladders print what the contention costs rather than asserting a constant that no longer
+//! exists.
 //!
 //! Two phases, because a fix for either half alone is easy and wrong:
 //!
-//! * **Contended** -- a query every 150 ms, which is far past any real Pack rate. Measures what a
-//!   real 283-character Intent query costs while the backfill runs. A fix that made queries fast
-//!   by never backfilling would pass this and leave the corpus permanently unembedded.
-//! * **Realistic** -- a query every 1.5 s, about the fastest an agent session issues automatic
-//!   Packs. Measures whether the backfill still gets through corpus texts. A fix that made the
-//!   backfill fast by ignoring queries would pass this and starve the query path.
+//! * **Contended** -- an interactive encode every 150 ms, far past any real arrival rate.
+//!   Measures what a real 283-character text costs while the backfill runs. A fix that made
+//!   interactive encodes fast by never backfilling would pass this and leave the corpus
+//!   permanently unembedded.
+//! * **Realistic** -- one every 1.5 s. Measures whether the backfill still gets through corpus
+//!   texts. A fix that made the backfill fast by ignoring interactive encodes would pass this and
+//!   starve the other side.
 //!
 //! `#[ignore]`d because it needs the operator's own model export:
 //!
@@ -37,18 +45,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sctx_domain::RevisionId;
-use sctx_search::{
-    EmbeddingProvider, EmbeddingSemanticChannel, SEMANTIC_ENCODE_BUDGET, SemanticChannel,
-    SemanticOutcome, load_onnx_provider,
-};
+use sctx_search::{EmbeddingProvider, load_onnx_provider};
 
 /// Characters in each corpus text the backfill encodes. Past the truncation ceiling, so it is the
 /// most expensive encode the backfill can issue and the worst case a query could wait behind.
 const CORPUS_CHARS: usize = 1400;
 
-/// Characters in each measured query. The length of the real Working Intent query that exposed the
-/// budget defect T5d repaired.
+/// Characters in each measured interactive encode. The length of the real Working Intent query
+/// that exposed the budget defect T5d repaired, kept so this run is comparable with that one.
 const QUERY_CHARS: usize = 283;
 
 /// Queries in the contended phase. Enough that a p95 is a measurement rather than the worst of
@@ -109,12 +113,12 @@ fn percentile(sorted: &[Duration], fraction: f64) -> Duration {
     sorted[rank.min(sorted.len() - 1)]
 }
 
-/// What one phase of queries-against-a-backfill cost, on both sides.
+/// What one phase of interactive-encodes-against-a-backfill cost, on both sides.
 struct Phase {
     p50: Duration,
     p95: Duration,
     max: Duration,
-    unavailable: usize,
+    failed: usize,
     queries: usize,
     corpus_encodes: usize,
     samples: Vec<Duration>,
@@ -124,7 +128,6 @@ struct Phase {
 /// what both sides got.
 fn run_phase(
     provider: &Arc<dyn EmbeddingProvider>,
-    channel: &EmbeddingSemanticChannel,
     queries: usize,
     interval: Duration,
     salt_base: usize,
@@ -153,15 +156,15 @@ fn run_phase(
     };
 
     let mut samples = Vec::with_capacity(queries);
-    let mut unavailable = 0_usize;
+    let mut failed = 0_usize;
     for salt in 0..queries {
         std::thread::sleep(interval);
         let query = intent_text(QUERY_CHARS, salt_base + salt);
         let started = Instant::now();
-        let outcome = channel.similar_revisions(&query);
+        let outcome = provider.encode(&query);
         samples.push(started.elapsed());
-        if outcome == SemanticOutcome::Unavailable {
-            unavailable += 1;
+        if outcome.is_err() {
+            failed += 1;
         }
     }
     stop.store(true, Ordering::Relaxed);
@@ -173,7 +176,7 @@ fn run_phase(
         p50: percentile(&sorted, 0.50),
         p95: percentile(&sorted, 0.95),
         max: *sorted.last().expect("a phase runs at least one query"),
-        unavailable,
+        failed,
         queries,
         corpus_encodes: encoded.load(Ordering::Relaxed),
         samples,
@@ -192,14 +195,14 @@ fn report(name: &str, phase: &Phase) {
     );
     println!(
         "{:>8}  {:>8}  {:>8}  {:>11}",
-        "p50 ms", "p95 ms", "max ms", "unavailable"
+        "p50 ms", "p95 ms", "max ms", "failed"
     );
     println!(
         "{:>8}  {:>8}  {:>8}  {:>8}/{}",
         phase.p50.as_millis(),
         phase.p95.as_millis(),
         phase.max.as_millis(),
-        phase.unavailable,
+        phase.failed,
         phase.queries
     );
     println!(
@@ -219,7 +222,6 @@ fn a_backfill_and_a_query_each_get_what_they_need() {
         panic!("set SCTX_PROBE_EMBEDDING_MODEL and SCTX_PROBE_EMBEDDING_RUNTIME; see module docs");
     };
     let provider = load_onnx_provider(&model, &runtime).expect("load the configured bge-m3 export");
-    let dimensions = provider.dimensions();
 
     // Warm-up: the first encode of a session and the first encode at each sequence length pay
     // one-time ORT costs no steady-state query pays.
@@ -231,46 +233,22 @@ fn a_backfill_and_a_query_each_get_what_they_need() {
         }
     }
 
-    let channel = EmbeddingSemanticChannel::new(
-        Arc::clone(&provider),
-        vec![(RevisionId::new(), vec![0.5_f32; dimensions])],
-    );
-    println!(
-        "\nbudget under test: {} ms",
-        SEMANTIC_ENCODE_BUDGET.as_millis()
-    );
-
-    let contended = run_phase(
-        &provider,
-        &channel,
-        CONTENDED_QUERIES,
-        CONTENDED_INTERVAL,
-        0,
-    );
+    let contended = run_phase(&provider, CONTENDED_QUERIES, CONTENDED_INTERVAL, 0);
     report("contended (150 ms apart)", &contended);
 
-    let realistic = run_phase(
-        &provider,
-        &channel,
-        REALISTIC_QUERIES,
-        REALISTIC_INTERVAL,
-        1_000,
-    );
+    let realistic = run_phase(&provider, REALISTIC_QUERIES, REALISTIC_INTERVAL, 1_000);
     report("realistic (1.5 s apart)", &realistic);
     println!();
 
+    // No budget to compare against any more: ADR-0007 retired the path that had one. What is
+    // still a property rather than a reading is that every interactive encode *completed* --
+    // preemption aborts the corpus run, and an implementation that reported the abort to the
+    // interactive caller instead would show up here.
     assert_eq!(
-        contended.unavailable, 0,
-        "{} of {CONTENDED_QUERIES} real-length queries degraded to embedding_unavailable while \
-         the corpus backfilled: the backfill is starving the query path",
-        contended.unavailable
-    );
-    assert!(
-        contended.p95 <= SEMANTIC_ENCODE_BUDGET,
-        "a 283-character query took {} ms at p95 while the corpus backfilled, over the {} ms \
-         budget",
-        contended.p95.as_millis(),
-        SEMANTIC_ENCODE_BUDGET.as_millis()
+        contended.failed, 0,
+        "{} of {CONTENDED_QUERIES} interactive encodes failed while the corpus backfilled: \
+         preemption is being charged to the wrong side",
+        contended.failed
     );
     // The other half of the property. Starving the backfill would make every assertion above pass
     // and leave the corpus permanently unembedded, which is a worse failure than the transient one
@@ -278,7 +256,7 @@ fn a_backfill_and_a_query_each_get_what_they_need() {
     assert!(
         realistic.corpus_encodes >= REALISTIC_CORPUS_FLOOR,
         "the backfill completed only {} corpus texts against {REALISTIC_QUERIES} queries \
-         {REALISTIC_INTERVAL:?} apart: yielding to queries has become starving the backfill, and \
+         {REALISTIC_INTERVAL:?} apart: yielding has become starving the backfill, and \
          the corpus would take days to embed on a session that is merely in use",
         realistic.corpus_encodes
     );

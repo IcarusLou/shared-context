@@ -41,10 +41,7 @@ use ort::{
 use sctx_domain::{Error, ErrorKind, Result};
 use tokenizers::Tokenizer;
 
-use super::{
-    EmbeddingProvider, QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, SEMANTIC_MAX_TOKENS,
-    SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS, normalize,
-};
+use super::{EmbeddingProvider, SEMANTIC_MAX_TOKENS, normalize};
 
 /// The ONNX Runtime library is process-global: `ort::init_from` may only take effect once, before
 /// any session exists. A second `[retrieval]` path in the same process would be ignored rather
@@ -104,13 +101,6 @@ const MAX_BULK_DEFERRAL: Duration = Duration::from_millis(500);
 /// that is roughly one query in a hundred on a server under constant load, and none at all on one
 /// that ever goes quiet.
 const BULK_PROGRESS_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How long after the last corpus encode the provider still calls itself backfilling.
-///
-/// The backfill releases the session between texts to read the next revision and write the last
-/// vector. Those gaps are short but real, and an encode sample taken inside one would otherwise be
-/// recorded as uncontended -- which is exactly the reading that makes a fit budget look unfit.
-const BACKFILL_RECENCY: Duration = Duration::from_secs(2);
 
 /// What an encode is for, which is what decides who waits for whom.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -311,15 +301,6 @@ impl SessionGate {
     /// Records that a corpus text was encoded whole, restarting the progress deadline.
     fn note_bulk_progress(&self) {
         self.lock().last_bulk_progress = Some(Instant::now());
-    }
-
-    /// Whether corpus work is competing for this session right now, or just was.
-    fn is_backfilling(&self) -> bool {
-        let state = self.lock();
-        state.bulk_pending > 0
-            || state
-                .last_bulk_end
-                .is_some_and(|ended| ended.elapsed() < BACKFILL_RECENCY)
     }
 }
 
@@ -719,13 +700,6 @@ impl EmbeddingProvider for OnnxEmbeddingProvider {
         self.encode_checked(text, Priority::Interactive)
     }
 
-    fn similarity_floor_basis_points(&self) -> u16 {
-        match self.family {
-            ModelFamily::BgeM3 => SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-            ModelFamily::Qwen3 => QWEN3_SEMANTIC_SIMILARITY_FLOOR_BASIS_POINTS,
-        }
-    }
-
     fn encode_bulk(&self, text: &str) -> Result<Vec<f32>> {
         // The scope is taken before admission so a corpus text that is still queuing already
         // counts as backfill pressure: a query encoded while it waits is a contended encode, and
@@ -750,10 +724,6 @@ impl EmbeddingProvider for OnnxEmbeddingProvider {
                 }
             }
         }
-    }
-
-    fn is_backfilling(&self) -> bool {
-        self.gate.is_backfilling()
     }
 }
 
