@@ -1178,3 +1178,98 @@ fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str)
         Policy::compiled_default().session(),
     )
 }
+
+/// A `close`-boundary Checkpoint used to end every later reminder as well as the Episode.
+///
+/// From the turn after the close, every automated boundary resolves to
+/// `Closed { newly_closed: false }`, which reached neither the reminder text nor the reminder
+/// gate. Two replays measured the cost: a 21.8h Cursor Session ended with
+/// `checkpoint_reminder_count = 0` against 429 recorded actions, and ten commits landed after its
+/// Checkpoint with nothing recorded about any of them.
+///
+/// The revival is bounded by the same two conditions the gate already applied — real tool activity
+/// since the last reminder or Checkpoint, and at most `CHECKPOINT_REMINDER_LIMIT` of them — and it
+/// never brings back the closure receipt R2-3 removed.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn work_continuing_after_a_closed_episode_earns_capped_reminders_again() {
+    let harness = Harness::new();
+    let runtime = TaskRuntime::initialize(&harness.root).unwrap();
+    let session = "codex-continued-work";
+    harness.activate("codex", session);
+    let (locator, episode) = open_checkpoint(&runtime, "codex", session);
+    let raw = "CONTINUED_WORK";
+    let stop = codex_event(session, &harness.workspace, "Stop", raw);
+
+    // The closing turn still reports the closure exactly once.
+    let closed = harness.hook("codex", &stop);
+    assert!(
+        closed["systemMessage"]
+            .as_str()
+            .is_some_and(|message| message.contains("durably closed")),
+        "{closed:#}"
+    );
+    assert!(matches!(
+        runtime
+            .read_work_episode(episode)
+            .unwrap()
+            .unwrap()
+            .episode
+            .status,
+        WorkEpisodeStatus::Closed { .. }
+    ));
+
+    // Idle turns after the close stay exactly as silent as R2-3 (A8) made them: the Checkpoint
+    // answered the question, and nothing has happened since to reopen it.
+    for _ in 0..3 {
+        assert_eq!(harness.hook("codex", &stop), json!({}));
+    }
+    assert_eq!(runtime.checkpoint_reminder_activity(&locator), 0);
+
+    // Work resumes. Now the Session has something uncheckpointed again, and the boundary says so.
+    let mut reminders = 0;
+    for round in 0..4 {
+        harness.hook(
+            "codex",
+            &codex_event(
+                session,
+                &harness.workspace,
+                "PostToolUse",
+                &format!("{raw}_{round}"),
+            ),
+        );
+        assert!(runtime.checkpoint_reminder_activity(&locator) > 0);
+        let response = harness.hook("codex", &stop);
+        if response == json!({}) {
+            continue;
+        }
+        reminders += 1;
+        assert_flat_checkpoint_guidance(&response);
+        let message = response["systemMessage"].as_str().unwrap();
+        assert!(
+            message.contains("kept working since"),
+            "the revived reminder must name the work that is uncheckpointed: {message}"
+        );
+        assert!(
+            !message.contains("durably closed"),
+            "R2-3 removed the repeated closure receipt and it must stay removed: {message}"
+        );
+        // A turn with no activity of its own earns nothing, even inside the budget.
+        assert_eq!(harness.hook("codex", &stop), json!({}));
+    }
+    assert_eq!(
+        reminders, 3,
+        "the revived reminder shares the gate's per-Session budget"
+    );
+    // Spent budget returns the branch to silence rather than substituting a sentence to repeat.
+    harness.hook(
+        "codex",
+        &codex_event(
+            session,
+            &harness.workspace,
+            "PostToolUse",
+            "CONTINUED_WORK_LAST",
+        ),
+    );
+    assert_eq!(harness.hook("codex", &stop), json!({}));
+}

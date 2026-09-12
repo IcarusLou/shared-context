@@ -1592,6 +1592,7 @@ impl TaskRuntime {
                 ],
             )
             .map_err(sql_error("insert Agent Checkpoint"))?;
+        reset_checkpoint_reminder_activity(&transaction, task_session_id)?;
         match input.boundary {
             CheckpointBoundary::Continue => {
                 advance_episode_version(&transaction, episode_id, input.expected_episode_version)?;
@@ -1774,6 +1775,7 @@ impl TaskRuntime {
                 ],
             )
             .map_err(sql_error("insert content-addressed Agent Checkpoint"))?;
+        reset_checkpoint_reminder_activity(&transaction, task_session_id)?;
         let mut validation_episode = episode_with_inline;
         validation_episode.close(&checkpoint)?;
         close_episode_version(
@@ -2170,6 +2172,39 @@ impl TaskRuntime {
             .commit()
             .map_err(sql_error("commit checkpoint reminder gate"))?;
         Ok(allow)
+    }
+
+    /// Reads how much real tool activity this Session has recorded since its last checkpoint
+    /// reminder or Checkpoint, without spending any part of the reminder budget.
+    ///
+    /// [`gate_turn_stop_checkpoint_reminder`](Self::gate_turn_stop_checkpoint_reminder) both reads
+    /// and consumes, which is right for a caller that has already decided a reminder is warranted.
+    /// The closed-Episode boundary has to decide that first --- an Episode that closed and then
+    /// saw nothing happen is a finished piece of work, not an unrecorded one --- so it asks here
+    /// before asking the gate.
+    ///
+    /// Fails *closed*, unlike the gate: zero on a missing row or any error. The gate fails open
+    /// because suppressing a reminder hides a Checkpoint that is genuinely missing; this answer is
+    /// the evidence for the claim "this Session kept working", and a counter that could not be
+    /// read is not evidence of anything.
+    #[must_use]
+    pub fn checkpoint_reminder_activity(&self, locator: &ExternalSessionLocator) -> u64 {
+        self.checkpoint_reminder_activity_inner(locator)
+            .unwrap_or(0)
+    }
+
+    fn checkpoint_reminder_activity_inner(&self, locator: &ExternalSessionLocator) -> Result<u64> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        let activity: i64 = connection
+            .query_row(
+                "SELECT activity_since_checkpoint_reminder FROM external_session
+                 WHERE agent_kind = ?1 AND external_session_key = ?2",
+                params![locator.agent_kind, locator.external_session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("read checkpoint reminder activity"))?;
+        Ok(u64::try_from(activity).unwrap_or(0))
     }
 
     /// Records one real PostToolUse-driven Signal event toward the reminder-activity counter
@@ -6344,6 +6379,34 @@ fn require_task_is_active(
             "Work Episode Task is not the ExternalSession ActiveTask",
         ));
     }
+    Ok(())
+}
+
+/// Restarts the checkpoint-reminder activity counter for every Session driving this `TaskSession`.
+///
+/// The counter answers exactly one question --- has this Session done real work since it was last
+/// told to checkpoint? --- and a Checkpoint settles that question as completely as a reminder
+/// does: the work before it is recorded, so it can no longer be the reason to ask for another one.
+/// Without this reset, the first boundary after a Checkpoint would inherit the whole Session's
+/// tool history and read as fresh uncheckpointed activity, which is what
+/// [`TaskRuntime::gate_turn_stop_checkpoint_reminder`] and the closed-Episode reminder both key
+/// off.
+///
+/// Every boundary resets it, not only a closing one: the reminder asks for a Checkpoint, and a
+/// `Continue` Checkpoint is one.
+fn reset_checkpoint_reminder_activity(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+) -> Result<()> {
+    transaction
+        .execute(
+            "UPDATE external_session SET activity_since_checkpoint_reminder = 0
+             WHERE active_task_session_id = ?1",
+            params![task_session_id.to_string()],
+        )
+        .map_err(sql_error(
+            "reset checkpoint reminder activity at a Checkpoint",
+        ))?;
     Ok(())
 }
 

@@ -28,9 +28,9 @@ use sctx_agent_adapter::{
     shared_context_activation_marker_with_policy,
 };
 use sctx_domain::{
-    Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
-    ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind,
-    ContextRevisionDraft, DecisionSource, DomainProjection, Error, ErrorKind,
+    AgentCheckpointId, Applicability, CandidateReviewStatus, ConflictParticipant,
+    ConflictResolutionDraft, ConflictResolutionResult, ContextGovernanceStatus, ContextId,
+    ContextKind, ContextRevisionDraft, DecisionSource, DomainProjection, Error, ErrorKind,
     EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, PublicationId, RepositoryId, ResolutionOutcome, Result, ReviewDraft,
     ReviewSummary, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, TaskSessionSnapshot,
@@ -2686,6 +2686,17 @@ fn finalize_checkpointed_episode(
         } else {
             String::new()
         };
+        if system_message.is_empty() {
+            system_message = continued_work_reminder(
+                &runtime,
+                locator,
+                trigger,
+                trigger_name,
+                policy,
+                episode_id,
+                final_checkpoint_id,
+            );
+        }
     }
     Ok(ResolvedTaskOperation {
         system_message: Some(system_message),
@@ -2706,6 +2717,35 @@ fn checkpoint_reminder_text(
     policy: &Policy,
     nag: String,
 ) -> String {
+    checkpoint_reminder_text_with(
+        runtime,
+        locator,
+        trigger,
+        policy,
+        nag,
+        // Deliberately without the `call task_checkpoint` directive the budgeted reminders above
+        // carry: repeating even a softened version of the same instruction would still read as
+        // urging, which is exactly what the throttle exists to stop doing.
+        "Shared Context TurnStop: checkpoint still pending; this Session already received its \
+         automated reminders for it.",
+    )
+}
+
+/// [`checkpoint_reminder_text`] with the throttled ending as a parameter.
+///
+/// Two callers want different silences once the budget is spent. A Session with no Checkpoint at
+/// all is told once that it has stopped being reminded, because the absence is still true and the
+/// line replaces a nag it would otherwise keep receiving. A Session whose Episode already closed
+/// gets nothing (`""`): its steady state is the silence R2-3 (A8) established, and a spent budget
+/// simply returns it there rather than substituting a different sentence to repeat forever.
+fn checkpoint_reminder_text_with(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+    policy: &Policy,
+    nag: String,
+    throttled: &str,
+) -> String {
     // The team's `## stop` line rides only on a reminder that is actually asking for a Checkpoint.
     // The throttled variant below deliberately drops it along with the directive it qualifies:
     // restating the standard a Checkpoint has to meet, on a turn where we have already stopped
@@ -2721,13 +2761,51 @@ fn checkpoint_reminder_text(
     if runtime.gate_turn_stop_checkpoint_reminder(locator) {
         nag
     } else {
-        // Deliberately without the `call task_checkpoint` directive the budgeted reminders above
-        // carry: repeating even a softened version of the same instruction would still read as
-        // urging, which is exactly what the throttle exists to stop doing.
-        "Shared Context TurnStop: checkpoint still pending; this Session already received its \
-         automated reminders for it."
-            .to_owned()
+        throttled.to_owned()
     }
+}
+
+/// Asks for the next Checkpoint when a Session kept working after its Work Episode closed.
+///
+/// This is the branch that produced nothing at all. A `close`-boundary Checkpoint ends the
+/// Episode, and from the next turn onward every boundary resolves to
+/// `Closed { newly_closed: false }` --- a state that reached neither the reminder text nor the
+/// reminder gate, so no later turn could ever ask for another Checkpoint. Two independent replays
+/// show what that costs: a 21.8h Cursor Session finished with `checkpoint_reminder_count = 0`
+/// against 429 recorded tool actions, and ten commits and +3148 lines landed after its Checkpoint
+/// with nothing recorded about any of it. Reviving the branch also revives the team's `## stop`
+/// policy segment, which only ever rides on a reminder that is asking for a Checkpoint.
+///
+/// The boundary with R2-3 (A8) is the message, not the branch. A8 removed the *closure receipt* --
+/// "Work Episode X is durably closed" repeated on every turn --- and that stays removed: this
+/// fires only where A8 already resolved to silence, never alongside the receipt, and the receipt's
+/// one permitted replay (a Candidate Build that just became terminal) still wins the turn.
+///
+/// Fresh activity is the entire precondition. An Episode that closed and then saw nothing happen
+/// is finished work, and asking it for another Checkpoint would be exactly the reflex-nagging the
+/// throttle exists to stop.
+fn continued_work_reminder(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+    trigger_name: &str,
+    policy: &Policy,
+    episode_id: WorkEpisodeId,
+    final_checkpoint_id: AgentCheckpointId,
+) -> String {
+    if runtime.checkpoint_reminder_activity(locator) == 0 {
+        return String::new();
+    }
+    checkpoint_reminder_text_with(
+        runtime,
+        locator,
+        trigger,
+        policy,
+        format!(
+            "Shared Context {trigger_name}: Work Episode {episode_id} is closed at Checkpoint {final_checkpoint_id} and this Session has kept working since. Call task_checkpoint again with complete direct Claims/Unknowns for the work done after that Checkpoint; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+        ),
+        "",
+    )
 }
 
 fn recover_one_pending_episode_build(
