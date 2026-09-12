@@ -419,6 +419,9 @@ impl CheckoutReferenceResolver {
     #[must_use]
     pub fn resolve(&self, candidate: &PathCandidate) -> Option<ResolvedReference> {
         let repository_id = self.repository_id.clone()?;
+        if candidate.absolute {
+            return self.resolve_absolute(repository_id, &candidate.path);
+        }
         if self.tracked.contains(&candidate.path)
             && let Ok(path) = RepoRelativePath::new(candidate.path.clone())
         {
@@ -439,6 +442,41 @@ impl CheckoutReferenceResolver {
             repository_id,
             path,
             derived_from_unique_basename: true,
+        })
+    }
+
+    /// Places a host-absolute spelling only when this checkout actually contains that exact file.
+    ///
+    /// The unique-basename inference is deliberately unavailable here. A spelling the Agent wrote
+    /// as `/private/tmp/notes.md` names a file on the machine; a checkout that happens to track
+    /// exactly one `notes.md` is a different file with the same name, and placing one as the other
+    /// would fabricate a coordinate. The only sound reading is that the tracked path is the tail
+    /// of what the Agent wrote — `/Users/me/work/TikTok/components/x/Foo.kt` ends with
+    /// `components/x/Foo.kt` — which makes this an exact match, not an inference.
+    ///
+    /// This became load-bearing when `md` entered `PATH_EXTENSIONS`: scratch notes and Skill files
+    /// under `/private/tmp` and `~/.agents` are the single most common absolute spelling in the
+    /// real Sessions, and basenames like `workflow.md` or `protocol.md` are exactly the ones a
+    /// repository is also likely to track.
+    fn resolve_absolute(
+        &self,
+        repository_id: RepositoryId,
+        spelling: &str,
+    ) -> Option<ResolvedReference> {
+        let mut matched = self.tracked.iter().filter(|tracked| {
+            spelling.len() > tracked.len()
+                && spelling.ends_with(tracked.as_str())
+                && spelling.as_bytes()[spelling.len() - tracked.len() - 1] == b'/'
+        });
+        let single = matched.next()?;
+        if matched.next().is_some() {
+            return None;
+        }
+        let path = RepoRelativePath::new(single.clone()).ok()?;
+        Some(ResolvedReference {
+            repository_id,
+            path,
+            derived_from_unique_basename: false,
         })
     }
 }
@@ -910,6 +948,74 @@ mod tests {
         );
     }
 
+    /// The `md` extension makes this shape common: `01a08baf` wrote `/private/tmp/*.md` and
+    /// `~/.agents/skills/**/workflow.md` dozens of times while working inside a checkout that also
+    /// tracks Markdown. Those are different files that share a name.
+    #[test]
+    fn an_out_of_repository_absolute_spelling_never_borrows_a_tracked_basename() {
+        let resolver = CheckoutReferenceResolver::from_tracked_paths(
+            RepositoryId::new(),
+            ["components/poi/docs/protocol.md".to_owned()],
+        );
+        let derivation = derive_claim_references(
+            ContextKind::Discovery,
+            "/private/tmp/protocol.md captured the transcript",
+            "scratch only",
+            &[],
+            &|candidate| resolver.resolve(candidate),
+        );
+        assert!(
+            derivation.engineering_references.is_empty(),
+            "{:?}",
+            derivation.engineering_references
+        );
+        assert_eq!(
+            derivation.unresolved_hints,
+            vec!["private/tmp/protocol.md".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_absolute_spelling_of_a_tracked_file_still_places_as_an_exact_match() {
+        let resolver = CheckoutReferenceResolver::from_tracked_paths(
+            RepositoryId::new(),
+            ["components/poi/docs/protocol.md".to_owned()],
+        );
+        let derivation = derive_claim_references(
+            ContextKind::Contract,
+            "/Users/me/workspace/TikTok/components/poi/docs/protocol.md states the contract",
+            "",
+            &[],
+            &|candidate| resolver.resolve(candidate),
+        );
+        assert_eq!(derivation.engineering_references.len(), 1);
+        assert_eq!(
+            derivation.engineering_references[0].locator.path().as_str(),
+            "components/poi/docs/protocol.md"
+        );
+        assert_eq!(
+            derivation.engineering_references[0].limitations,
+            vec![DERIVED_BY_SERVER_LIMITATION.to_owned()],
+            "a tail match is exact, not a basename inference"
+        );
+    }
+
+    #[test]
+    fn a_suffix_that_is_not_a_whole_path_component_is_not_a_tail_match() {
+        let resolver = CheckoutReferenceResolver::from_tracked_paths(
+            RepositoryId::new(),
+            ["live/index.scss".to_owned()],
+        );
+        let derivation = derive_claim_references(
+            ContextKind::Issue,
+            "/tmp/notlive/index.scss is a copy",
+            "",
+            &[],
+            &|candidate| resolver.resolve(candidate),
+        );
+        assert!(derivation.engineering_references.is_empty());
+    }
+
     #[test]
     fn missing_checkout_never_panics_and_resolves_nothing() {
         let resolver = CheckoutReferenceResolver::from_checkout(
@@ -919,6 +1025,7 @@ mod tests {
                 path: "Alpha.kt".to_owned(),
                 basename: "Alpha.kt".to_owned(),
                 has_directory: false,
+                absolute: false,
                 line_span: None,
             }],
         );
@@ -927,6 +1034,7 @@ mod tests {
                 path: "Alpha.kt".to_owned(),
                 basename: "Alpha.kt".to_owned(),
                 has_directory: false,
+                absolute: false,
                 line_span: None,
             }),
             None

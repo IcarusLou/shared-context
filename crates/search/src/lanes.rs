@@ -1530,12 +1530,21 @@ mod tests {
         );
         assert_eq!(
             anchors.len(),
-            145,
-            "every touched file anchors, superseded Signals included -- and the Session's one \
-             `artifact_hints` entry contributes nothing, because `.md` is not in the extension \
-             list that makes a dotted run read as a repository path"
+            146,
+            "every touched file anchors, superseded Signals included, plus the Session's one \
+             `artifact_hints` entry -- `.md` joined the extension list from this very Session's \
+             corpus, so the hint now reads as a path where it used to read as prose"
+        );
+        assert!(
+            anchors
+                .iter()
+                .any(|anchor| anchor.path == "private/tmp/x-ttk-map-view-refactor-plan.md"),
+            "{anchors:#?}"
         );
 
+        // The widened extension list changes what is *asked*, not what is found: a scratch plan
+        // under `/private/tmp` is not a file any Context references, so the Session is still
+        // disjoint from the corpus and the Pack is still empty.
         let seeds = corpus.hits(&anchors);
         assert!(seeds.is_empty(), "{seeds:#?}");
         assert!(corpus.expand(&[]).is_empty());

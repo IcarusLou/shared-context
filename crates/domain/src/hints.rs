@@ -19,9 +19,19 @@ use std::collections::BTreeSet;
 use serde_json::Value;
 
 /// File extensions that make a dotted run a repository path rather than prose.
+///
+/// The second row was added from two real Sessions' own prose (Codex `01a08baf`, Cursor
+/// `4b2e9fb5`, cross-checked against `01a08017` and `7d8cbab1`): every one of these spellings was
+/// written by an Agent about a file it had opened, and every one of them read as prose before —
+/// `live-tag.lepus` did not even survive as an identifier, because none of `live`, `tag`, `lepus`
+/// clears the identifier gate. Only extensions with corpus evidence are listed; `log`, `png`,
+/// `txt`, `sh` and `jar` also occurred but name build output, assets, scratch files and artifacts
+/// rather than the source a Claim is about, and `build.log:512` is pinned as a non-path by
+/// [`tests::ignores_unsupported_extension_and_all_caps_identifiers`].
 const PATH_EXTENSIONS: &[&str] = &[
     "kt", "java", "rs", "ts", "tsx", "js", "py", "go", "swift", "m", "mm", "kts", "gradle", "yaml",
-    "yml", "toml", "json", "proto", "xml",
+    "yml", "toml", "json", "proto", "xml", //
+    "md", "lepus", "ttml", "ttss", "scss", "cjs",
 ];
 
 /// Words that look like identifiers but name no repository coordinate.
@@ -49,6 +59,14 @@ pub struct PathCandidate {
     pub basename: String,
     /// True when the spelling already carries at least one directory component.
     pub has_directory: bool,
+    /// True when the Agent wrote a host-absolute spelling (`/private/tmp/notes.md`, `~/x/a.md`).
+    ///
+    /// [`PathCandidate::path`] is always stored without its leading separator, so this flag is the
+    /// only surviving record that the spelling named a location on the machine rather than a
+    /// coordinate inside a repository. A resolver must not place such a spelling by its basename:
+    /// `/private/tmp/notes.md` and a checkout's `docs/notes.md` are different files that happen to
+    /// share a name.
+    pub absolute: bool,
     /// `:120` or `:120-140` as written, kept for the hint text only.
     pub line_span: Option<String>,
 }
@@ -233,11 +251,14 @@ fn read_line_span(characters: &[char], from: usize) -> Option<String> {
 }
 
 fn classify_run(run: &str, line_span: Option<String>, scan: &mut TextScan) {
+    // `~/x/a.md` reaches here as `/x/a.md`: `~` is not a run character, so a home-relative
+    // spelling is host-absolute for this purpose too, which is exactly how it should be read.
+    let absolute = run.starts_with('/');
     let trimmed = run.trim_matches(|character| matches!(character, '.' | '-' | '/'));
     if trimmed.is_empty() {
         return;
     }
-    if let Some(candidate) = path_candidate(trimmed, line_span) {
+    if let Some(candidate) = path_candidate(trimmed, absolute, line_span) {
         scan.paths.push(candidate);
         return;
     }
@@ -248,7 +269,7 @@ fn classify_run(run: &str, line_span: Option<String>, scan: &mut TextScan) {
     }
 }
 
-fn path_candidate(value: &str, line_span: Option<String>) -> Option<PathCandidate> {
+fn path_candidate(value: &str, absolute: bool, line_span: Option<String>) -> Option<PathCandidate> {
     let extension = value.rsplit_once('.')?.1;
     if !PATH_EXTENSIONS
         .iter()
@@ -264,6 +285,7 @@ fn path_candidate(value: &str, line_span: Option<String>) -> Option<PathCandidat
         path: value.to_owned(),
         basename: basename.to_owned(),
         has_directory: value.contains('/'),
+        absolute,
         line_span,
     })
 }
@@ -406,9 +428,75 @@ mod tests {
             path: "Alpha.kt".to_owned(),
             basename: "Alpha.kt".to_owned(),
             has_directory: false,
+            absolute: false,
             line_span: None,
         };
         assert_eq!(candidate.hint_text(), "Alpha.kt");
         assert_eq!(candidate.stem(), "Alpha");
+    }
+
+    /// Every spelling here is quoted from Codex `01a08baf` or Cursor `4b2e9fb5`; before this
+    /// whitelist grew, each one was read as prose and contributed nothing at all.
+    #[test]
+    fn front_end_and_document_extensions_from_the_real_corpus_read_as_paths() {
+        for (text, path, stem) in [
+            (
+                "subspaces/search/libs/search-components/src/text-badge/index.lepus imports it",
+                "subspaces/search/libs/search-components/src/text-badge/index.lepus",
+                "index",
+            ),
+            (
+                "living-card/live-card-info.ttml renders the badge",
+                "living-card/live-card-info.ttml",
+                "live-card-info",
+            ),
+            (
+                "user-avatar/index.ttss sizes it",
+                "user-avatar/index.ttss",
+                "index",
+            ),
+            (
+                "search-atom-style/style/color.scss holds the token",
+                "search-atom-style/style/color.scss",
+                "color",
+            ),
+            (
+                "scripts/live-tag.test.cjs covers it",
+                "scripts/live-tag.test.cjs",
+                "live-tag.test",
+            ),
+            (
+                "poi/docs/x-ttk-map-view/protocol.md states the contract",
+                "poi/docs/x-ttk-map-view/protocol.md",
+                "protocol",
+            ),
+        ] {
+            let scan = scan_text(text);
+            assert_eq!(scan.paths.len(), 1, "{text}");
+            assert_eq!(scan.paths[0].path, path);
+            assert_eq!(scan.paths[0].stem(), stem);
+            assert!(!scan.paths[0].absolute, "{text}");
+        }
+    }
+
+    /// A bare `live-tag.lepus` used to contribute nothing: it is not a path without the
+    /// extension, and none of `live`, `tag`, `lepus` clears the identifier gate on its own.
+    #[test]
+    fn a_lepus_spelling_now_contributes_the_terms_it_used_to_lose() {
+        let terms = derived_hint_terms(["live-tag.lepus went stale"]);
+        assert!(terms.contains(&"live-tag.lepus".to_owned()), "{terms:?}");
+        assert!(terms.contains(&"live-tag".to_owned()), "{terms:?}");
+    }
+
+    #[test]
+    fn a_host_absolute_spelling_is_marked_even_though_its_path_is_stored_relative() {
+        let scan = scan_text("/private/tmp/x-ttk-map-view-notes.md holds the transcript");
+        assert_eq!(scan.paths.len(), 1);
+        assert!(scan.paths[0].absolute);
+        assert_eq!(scan.paths[0].path, "private/tmp/x-ttk-map-view-notes.md");
+        let home = scan_text("~/.agents/skills/shared-context/references/workflow.md says so");
+        assert!(home.paths[0].absolute, "{:?}", home.paths);
+        let inside = scan_text("components/business/poi/build.yaml lists it");
+        assert!(!inside.paths[0].absolute);
     }
 }
