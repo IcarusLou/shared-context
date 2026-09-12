@@ -1260,6 +1260,9 @@ impl Installer {
                 let config_lock = config_lock_path(&config.path)?;
                 remove_path_if_exists(&config_lock, &mut report.removed)?;
             }
+            // After the loop, so the Codex MCP uninstall's own write to `config.toml` cannot
+            // overwrite this one.
+            prune_codex_hook_trust(&self.context.home, &mut report);
             let mut had_expected_skill_ownership = false;
             for skill in &manifest.skills {
                 if is_expected_skill_path(&self.context.home, &skill.path) {
@@ -3592,6 +3595,63 @@ fn merge_codex_mcp(
         }],
     );
     Ok(changed)
+}
+
+/// Removes the Codex trust keys that this uninstall has just made dead.
+///
+/// [`uninstall_json_hooks`] takes our hook entries out of `~/.codex/hooks.json`, which leaves the
+/// `[hooks.state]` keys that addressed them pointing at nothing — the same stale-key litter setup
+/// prunes, except self-inflicted and with no later setup coming to clear it. Keys addressing a
+/// position the file still has (the operator's own hooks in the same file) are untouched, and so is
+/// every other key source.
+///
+/// Best effort by design: an uninstall that removed everything it owns must not fail over a
+/// leftover in a file that is the operator's to begin with.
+fn prune_codex_hook_trust(home: &Path, report: &mut UninstallReport) {
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    if !config_path.is_file() {
+        return;
+    }
+    let pruned = || -> Result<usize> {
+        let key_source = path_text(&hooks_path)?;
+        let addressed = if hooks_path.is_file() {
+            codex_trust::addressed_keys(&read_json_object(&hooks_path)?, &key_source)?
+        } else {
+            BTreeSet::new()
+        };
+        let _lock = ConfigLock::acquire(&config_path)?;
+        let mut document = read_utf8_or_empty(&config_path)?
+            .parse::<DocumentMut>()
+            .map_err(|error| {
+                invalid(format!(
+                    "invalid Codex TOML in {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+        let update =
+            codex_trust::apply_trust(&mut document, &key_source, &BTreeMap::new(), &addressed)?;
+        if update.changed() {
+            let rendered = document.to_string();
+            rendered.parse::<DocumentMut>().map_err(|error| {
+                invalid(format!(
+                    "pruning Codex hook trust would break the TOML: {error}"
+                ))
+            })?;
+            atomic_write(
+                &config_path,
+                rendered.as_bytes(),
+                existing_mode(&config_path, 0o600)?,
+            )?;
+        }
+        Ok(update.pruned)
+    }();
+    if let Err(error) = pruned {
+        report.warnings.push(format!(
+            "preserved the Codex hook trust keys in {}: {error}",
+            config_path.display()
+        ));
+    }
 }
 
 fn uninstall_config(config: &OwnedConfig, report: &mut UninstallReport) -> Result<()> {

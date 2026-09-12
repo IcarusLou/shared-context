@@ -2714,6 +2714,42 @@ fn doctor_reports_whether_codex_actually_trusts_the_installed_hooks() {
     );
 }
 
+/// Uninstall takes our hooks out of `hooks.json`, which is what makes its own trust keys dead.
+#[test]
+fn uninstall_takes_its_dead_trust_keys_with_it_and_leaves_the_operators() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let source = hooks.to_str().unwrap().to_owned();
+    // The operator trusts their own `Stop` hook, which lives at group 0 of the same file.
+    let mut body = fs::read_to_string(&config).unwrap();
+    write!(
+        body,
+        "\n[hooks.state.\"{source}:stop:0:0\"]\ntrusted_hash = \"sha256:theirs\"\n"
+    )
+    .unwrap();
+    fs::write(&config, body).unwrap();
+    assert_eq!(stored_codex_trust(&config).len(), 7);
+
+    let report = harness.installer("1.0.0").uninstall().unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("preserved the Codex hook trust keys"))
+    );
+    let stored = stored_codex_trust(&config);
+    assert_eq!(
+        stored.keys().cloned().collect::<Vec<_>>(),
+        vec![format!("{source}:stop:0:0")],
+        "uninstall must reclaim only the keys it made dead"
+    );
+}
+
 /// A rolled-back setup must leave `config.toml` byte-for-byte as it found it, trust keys included.
 #[test]
 fn a_failed_setup_restores_the_codex_trust_state_it_had_rewritten() {
