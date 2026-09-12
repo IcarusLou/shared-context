@@ -202,6 +202,37 @@ pub fn normalized_identifiers<'a>(texts: impl IntoIterator<Item = &'a str>) -> B
     identifiers
 }
 
+/// The type-shaped spellings of one body of prose, in the order the Agent wrote them.
+///
+/// A Claim that says `MapSceneRuntime.present() re-enters the layout pass` names a file just as
+/// squarely as one that writes `MapSceneRuntime.kt:88` — it simply points at the type instead of
+/// at the path. Both real long Sessions wrote overwhelmingly in the first style, which is why a
+/// derivation that only reads path spellings placed nothing at all for them.
+///
+/// Only leading-upper-case CamelCase survives the filter, and it is deliberately narrower than
+/// [`normalized_identifiers`]: a type name is what a file is usually named after, whereas
+/// `retargetEnvironment` and `enter_from_value` name a member and a value and would only widen the
+/// lookup without naming a file. Case is preserved, because the lookup this feeds compares against
+/// real file stems.
+#[must_use]
+pub fn symbol_mentions<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    scan_texts(texts)
+        .identifiers
+        .into_iter()
+        .filter(|identifier| is_symbol_mention(identifier))
+        .filter(|identifier| seen.insert(identifier.clone()))
+        .collect()
+}
+
+/// Whether one already validated identifier spelling reads as a type name.
+#[must_use]
+pub fn is_symbol_mention(identifier: &str) -> bool {
+    !identifier.contains('_')
+        && identifier.starts_with(|character: char| character.is_ascii_uppercase())
+        && camel_case_segments(identifier) >= 2
+}
+
 /// Collects every string leaf of one JSON document, so structured Evidence content is read as
 /// prose without its keys leaking into the identifier set.
 pub fn json_string_leaves(value: &Value, out: &mut Vec<String>) {
@@ -345,6 +376,7 @@ pub fn camel_case_segments(value: &str) -> usize {
 mod tests {
     use super::{
         PathCandidate, camel_case_segments, derived_hint_terms, normalized_identifiers, scan_text,
+        symbol_mentions,
     };
 
     #[test]
@@ -486,6 +518,41 @@ mod tests {
         let terms = derived_hint_terms(["live-tag.lepus went stale"]);
         assert!(terms.contains(&"live-tag.lepus".to_owned()), "{terms:?}");
         assert!(terms.contains(&"live-tag".to_owned()), "{terms:?}");
+    }
+
+    /// The two spellings quoted from the real Sessions, and the members beside them that must not
+    /// be mistaken for the type they hang off.
+    #[test]
+    fn symbol_mentions_keep_type_names_and_drop_members_values_and_acronyms() {
+        let symbols = symbol_mentions([
+            "MapSceneRuntime.present() re-enters the layout pass",
+            "CameraController.retargetEnvironment is called twice and enter_from_value is stale",
+            "ILiveEntryService has no implementation; POI_ENTRY and HEAD are not types",
+        ]);
+        assert_eq!(
+            symbols,
+            vec![
+                "MapSceneRuntime".to_owned(),
+                "CameraController".to_owned(),
+                "ILiveEntryService".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_symbol_mention_is_written_once_however_many_times_it_is_mentioned() {
+        assert_eq!(
+            symbol_mentions([
+                "MapSceneRuntime then MapSceneRuntime again",
+                "MapSceneRuntime"
+            ]),
+            vec!["MapSceneRuntime".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_path_stem_is_not_a_symbol_mention_because_the_path_channel_already_has_it() {
+        assert!(symbol_mentions(["MapSceneRuntime.kt:88 returns early"]).is_empty());
     }
 
     #[test]

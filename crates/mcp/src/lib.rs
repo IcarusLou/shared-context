@@ -75,10 +75,10 @@ use sctx_task_runtime::{
     AgentCheckpointSubmission, CandidateBuildDuplicatePreparation, CandidateBuildItemPreparation,
     CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView,
     CandidateConfirmationFinalize, CandidateReviewDiscard, CandidateReviewDiscardStatus,
-    CandidateReviewRecord, CheckoutReferenceResolver, ContextInjectionSource, ContextUsageOutcome,
-    ContextUsageRecord, DirectCheckpointClaimDraft, DirectEvidenceDraft, InjectedContext,
-    IntentRevisionWriteStatus, ProposedSpaceGroupMappingStatus, TaskRuntime, WorkEpisodeView,
-    reference_derivation,
+    CandidateReviewRecord, CheckoutReferenceResolver, ClaimResolver, ContextInjectionSource,
+    ContextUsageOutcome, ContextUsageRecord, DirectCheckpointClaimDraft, DirectEvidenceDraft,
+    InjectedContext, IntentRevisionWriteStatus, ProposedSpaceGroupMappingStatus, TaskRuntime,
+    WorkEpisodeView, reference_derivation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2123,29 +2123,45 @@ impl Runtime {
     /// one resolving checkout wins, none or several leaves an unresolved retrieval hint.
     fn derive_episode_claim_references(&self, episode: &WorkEpisodeView) -> Result<bool> {
         let episode_id = episode.episode.episode_id;
-        let Some(candidates) = self.tasks.pending_claim_reference_candidates(episode_id)? else {
+        let Some(mentions) = self.tasks.pending_claim_reference_candidates(episode_id)? else {
             return Ok(false);
         };
         let resolvers = self
             .episode_checkouts(episode)?
             .into_iter()
             .map(|(repository_id, checkout)| {
-                CheckoutReferenceResolver::from_checkout(repository_id, &checkout, &candidates)
+                CheckoutReferenceResolver::from_checkout(
+                    repository_id,
+                    &checkout,
+                    &mentions.paths,
+                    &mentions.symbols,
+                )
             })
             .collect::<Vec<_>>();
         if resolvers.is_empty() {
             self.tasks
-                .derive_episode_claim_references(episode_id, &reference_derivation::unresolvable)?;
+                .derive_episode_claim_references(episode_id, &ClaimResolver::nothing())?;
             return Ok(true);
         }
-        self.tasks
-            .derive_episode_claim_references(episode_id, &|candidate| {
-                let mut resolved = resolvers
-                    .iter()
-                    .filter_map(|resolver| resolver.resolve(candidate));
-                let first = resolved.next()?;
-                resolved.next().is_none().then_some(first)
-            })?;
+        self.tasks.derive_episode_claim_references(
+            episode_id,
+            &ClaimResolver::new(
+                &|candidate| {
+                    reference_derivation::combine_resolutions(
+                        resolvers
+                            .iter()
+                            .map(|resolver| resolver.resolve_path(candidate)),
+                    )
+                },
+                &|symbol| {
+                    reference_derivation::combine_resolutions(
+                        resolvers
+                            .iter()
+                            .map(|resolver| resolver.resolve_symbol(symbol)),
+                    )
+                },
+            ),
+        )?;
         Ok(true)
     }
 

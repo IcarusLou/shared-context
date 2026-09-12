@@ -1149,7 +1149,7 @@ fn old_empty_checkpoint_wire_survives_retry_derivation_and_candidate_build() {
     replace_wire(&old);
 
     let derived = runtime
-        .derive_episode_claim_references(episode_id, &|_| None)
+        .derive_episode_claim_references(episode_id, &sctx_task_runtime::ClaimResolver::nothing())
         .unwrap();
     assert_eq!(derived.len(), 1);
     assert!(derived[0].engineering_references.is_empty());

@@ -14,11 +14,11 @@ use sctx_domain::{
     TaskSignal, TaskSignalKind, WorkEpisodeId, WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{
-    AgentCheckpointSubmission, CheckoutReferenceResolver, DirectCheckpointClaimDraft,
-    DirectEvidenceDraft, TaskRuntime,
+    AgentCheckpointSubmission, CheckoutReferenceResolver, ClaimResolver,
+    DirectCheckpointClaimDraft, DirectEvidenceDraft, TaskRuntime,
     reference_derivation::{
-        DERIVED_BY_SERVER_LIMITATION, UNIQUE_BASENAME_LIMITATION, claim_hints,
-        derive_claim_references, unresolvable,
+        DERIVED_BY_SERVER_LIMITATION, SYMBOL_MENTION_LIMITATION, UNIQUE_BASENAME_LIMITATION,
+        claim_hints, claim_symbol_mentions, derive_claim_references,
     },
 };
 use tempfile::TempDir;
@@ -75,7 +75,11 @@ fn resolver_for(checkout: &Path, texts: &[&str]) -> CheckoutReferenceResolver {
             sctx_task_runtime::reference_derivation::claim_path_candidates(text, "", &[])
         })
         .collect::<Vec<_>>();
-    CheckoutReferenceResolver::from_checkout(repository_id(), checkout, &candidates)
+    let symbols = texts
+        .iter()
+        .flat_map(|text| claim_symbol_mentions(text, "", &[]))
+        .collect::<Vec<_>>();
+    CheckoutReferenceResolver::from_checkout(repository_id(), checkout, &candidates, &symbols)
 }
 
 /// The read-only `git ls-files` answer is memoized per checkout revision, and the checkout's own
@@ -157,9 +161,19 @@ fn derive_with_checkout(
         .pending_claim_reference_candidates(episode_id)
         .unwrap()
         .expect("a freshly acknowledged Episode still needs its spellings placed");
-    let resolver = CheckoutReferenceResolver::from_checkout(repository_id(), checkout, &candidates);
+    let resolver = CheckoutReferenceResolver::from_checkout(
+        repository_id(),
+        checkout,
+        &candidates.paths,
+        &candidates.symbols,
+    );
     runtime
-        .derive_episode_claim_references(episode_id, &|candidate| resolver.resolve(candidate))
+        .derive_episode_claim_references(
+            episode_id,
+            &ClaimResolver::new(&|candidate| resolver.resolve_path(candidate), &|symbol| {
+                resolver.resolve_symbol(symbol)
+            }),
+        )
         .unwrap()
 }
 
@@ -316,6 +330,106 @@ fn unique_basename_in_checkout_becomes_a_file_reference_and_topic_hint() {
     );
 }
 
+/// The Claim shape both real long Sessions actually wrote, end to end through a live checkout.
+///
+/// Codex `01a08baf` spent seventeen hours writing `MapSceneRuntime.present()` and
+/// `CameraController.retargetEnvironment` and never once spelled a path, so the path-only reading
+/// placed nothing at all for it and the Pack had no seed to start from. The type name is enough:
+/// the file is named after the type, and `git ls-files` answers it in the same query.
+#[test]
+fn a_claim_that_only_points_at_types_places_the_files_named_after_them() {
+    let checkout = probe_checkout(&[
+        "components/poi/map/engine/MapSceneRuntime.kt",
+        "components/poi/map/camera/CameraController.kt",
+        "components/poi/map/engine/Unmentioned.kt",
+    ]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derive-symbol-mention");
+    let outcome = runtime
+        .submit_agent_checkpoint(&AgentCheckpointSubmission {
+            locator,
+            claims: vec![claim(
+                ContextKind::Issue,
+                "MapSceneRuntime.present() 在布局回调里重入，导致相机被重置。",
+                "CameraController.retargetEnvironment 在同一帧内被调用两次。",
+                "重入路径上没有任何守卫。",
+            )],
+            unknowns: Vec::new(),
+        })
+        .unwrap();
+
+    let episode_id = outcome.episode.episode.episode_id;
+    let derivations = derive_with_checkout(&runtime, episode_id, checkout.path());
+    let persisted = runtime.read_work_episode(episode_id).unwrap().unwrap();
+    let persisted = &persisted.checkpoints[0].claims[0];
+    let paths = persisted
+        .engineering_references
+        .iter()
+        .map(|reference| reference.locator.path().as_str().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        vec![
+            "components/poi/map/camera/CameraController.kt".to_owned(),
+            "components/poi/map/engine/MapSceneRuntime.kt".to_owned(),
+        ],
+        "a type name the checkout can place is a coordinate; `Unmentioned.kt` is not named"
+    );
+    for reference in &persisted.engineering_references {
+        assert_eq!(reference.artifact_kind, ArtifactKind::File);
+        assert_eq!(
+            reference.limitations,
+            vec![
+                DERIVED_BY_SERVER_LIMITATION.to_owned(),
+                SYMBOL_MENTION_LIMITATION.to_owned(),
+            ],
+            "an inferred coordinate always says so"
+        );
+    }
+    assert!(derivations[0].ambiguous_mentions.is_empty());
+    assert!(
+        persisted
+            .topic_key_hint
+            .as_deref()
+            .is_some_and(|topic| topic.ends_with("engine/MapSceneRuntime.kt")),
+        "the type the Claim named first wins the tie, exactly as a path spelling would: {:?}",
+        persisted.topic_key_hint
+    );
+}
+
+/// A type name several tracked files answer to is written down, not silently dropped.
+#[test]
+fn an_ambiguous_type_name_is_reported_as_the_ambiguity_it_is() {
+    let checkout = probe_checkout(&["android/MapSceneRuntime.kt", "ios/MapSceneRuntime.swift"]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derive-symbol-ambiguous");
+    let outcome = runtime
+        .submit_agent_checkpoint(&AgentCheckpointSubmission {
+            locator,
+            claims: vec![claim(
+                ContextKind::Issue,
+                "MapSceneRuntime 在布局回调里重入。",
+                "两端实现同名。",
+                "没有守卫。",
+            )],
+            unknowns: Vec::new(),
+        })
+        .unwrap();
+
+    let episode_id = outcome.episode.episode.episode_id;
+    let derivations = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert!(
+        derivations[0].engineering_references.is_empty(),
+        "placing one of two files would be a guess"
+    );
+    assert_eq!(derivations[0].ambiguous_mentions.len(), 1);
+    assert_eq!(
+        derivations[0].ambiguous_mentions[0].spelling,
+        "MapSceneRuntime"
+    );
+    assert_eq!(derivations[0].ambiguous_mentions[0].matches, 2);
+}
+
 #[test]
 fn ambiguous_basename_and_untracked_path_never_resolve() {
     let checkout = probe_checkout(&["one/Manager.kt", "two/Manager.kt", "only/Alpha.kt"]);
@@ -328,7 +442,7 @@ fn ambiguous_basename_and_untracked_path_never_resolve() {
         "Manager.kt:10 disagrees with Missing.kt:4 while Alpha.kt:7 holds",
         "ambiguity must never become a graph fact",
         &[],
-        &|candidate| resolver.resolve(candidate),
+        &ClaimResolver::paths(&|candidate| resolver.resolve_path(candidate)),
     );
     let paths = derivation
         .engineering_references
@@ -431,7 +545,7 @@ fn same_content_replay_returns_the_first_derivation_even_after_the_checkout_move
         "a derived Episode never asks Git again"
     );
     let rebuilt = runtime
-        .derive_episode_claim_references(episode_id, &unresolvable)
+        .derive_episode_claim_references(episode_id, &ClaimResolver::nothing())
         .unwrap();
     assert_eq!(
         rebuilt[0].engineering_references,
@@ -452,7 +566,7 @@ fn candidate_build_can_recompute_the_same_hints_from_the_persisted_claim() {
         statement,
         "早退跳过导航",
         &[],
-        &|candidate| resolver.resolve(candidate),
+        &ClaimResolver::paths(&|candidate| resolver.resolve_path(candidate)),
     );
     let recomputed = claim_hints(
         statement,
@@ -529,9 +643,13 @@ fn probe_fixture_contexts_derive_expected_references() {
 
     let mut derived_paths = Vec::new();
     for (index, kind, statement, rationale, summary) in contexts {
-        let derivation = derive_claim_references(*kind, statement, rationale, &[summary], &|c| {
-            resolver.resolve(c)
-        });
+        let derivation = derive_claim_references(
+            *kind,
+            statement,
+            rationale,
+            &[summary],
+            &ClaimResolver::paths(&|c| resolver.resolve_path(c)),
+        );
         let paths = derivation
             .engineering_references
             .iter()
@@ -584,7 +702,7 @@ fn extraction_is_pure_without_a_resolver() {
         "build.log:512 reported BUILD SUCCESSFUL for assembleDebug",
         "no source path is written down",
         &[],
-        &unresolvable,
+        &ClaimResolver::nothing(),
     );
     assert!(derivation.engineering_references.is_empty());
     assert_eq!(

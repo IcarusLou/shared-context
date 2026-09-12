@@ -33,8 +33,9 @@ pub mod recall_stats;
 pub mod reference_derivation;
 
 pub use reference_derivation::{
-    CheckoutReferenceResolver, ClaimReferenceDerivation, DerivedClaimReferences, PathCandidate,
-    ResolvedReference, claim_topic_key, derive_claim_references, unresolvable,
+    AmbiguousMention, CheckoutReferenceResolver, ClaimReferenceDerivation, ClaimResolver,
+    DerivedClaimReferences, EpisodeClaimMentions, MentionChannel, MentionResolution, PathCandidate,
+    ResolvedReference, claim_topic_key, combine_resolutions, derive_claim_references,
 };
 
 const SCHEMA_VERSION: i64 = 19;
@@ -1865,7 +1866,7 @@ impl TaskRuntime {
         })
     }
 
-    /// Path spellings one Episode's Claims still need placed, or `None` once they were placed.
+    /// Spellings one Episode's Claims still need placed, or `None` once they were placed.
     ///
     /// Candidate Build asks this first so a rebuilt Episode never spawns `git` again: the answer
     /// is `None` as soon as [`TaskRuntime::derive_episode_claim_references`] recorded the first
@@ -1877,7 +1878,7 @@ impl TaskRuntime {
     pub fn pending_claim_reference_candidates(
         &self,
         episode_id: WorkEpisodeId,
-    ) -> Result<Option<Vec<PathCandidate>>> {
+    ) -> Result<Option<EpisodeClaimMentions>> {
         let connection = self.open_connection()?;
         if claim_references_derived(&connection, episode_id)? {
             return Ok(None);
@@ -1885,16 +1886,17 @@ impl TaskRuntime {
         let Some(episode) = read_episode_view(&connection, episode_id)? else {
             return Ok(None);
         };
-        Ok(Some(episode_path_candidates(&episode)))
+        Ok(Some(episode_claim_mentions(&episode)))
     }
 
     /// Derives every Claim's engineering coordinates for one Episode exactly once.
     ///
     /// This is Candidate Build work, never Checkpoint ACK work. The first call resolves each
-    /// path-shaped spelling through `resolve`, writes the resulting References and topic hint back
-    /// onto the persisted Claims, and records that this Episode is derived. Every later call
-    /// reports that persisted answer and calls `resolve` for nothing, so a Build rerun after the
-    /// checkout moved on cannot change a Candidate that already reached review.
+    /// spelling through `resolver` — path spellings first, and type names only for a Claim no path
+    /// could place — writes the resulting References and topic hint back onto the persisted
+    /// Claims, and records that this Episode is derived. Every later call reports that persisted
+    /// answer and calls `resolver` for nothing, so a Build rerun after the checkout moved on
+    /// cannot change a Candidate that already reached review.
     ///
     /// # Errors
     ///
@@ -1903,7 +1905,7 @@ impl TaskRuntime {
     pub fn derive_episode_claim_references(
         &self,
         episode_id: WorkEpisodeId,
-        resolve: &dyn Fn(&PathCandidate) -> Option<ResolvedReference>,
+        resolver: &ClaimResolver<'_>,
     ) -> Result<Vec<DerivedClaimReferences>> {
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Claim derivation transaction")?;
@@ -1925,6 +1927,7 @@ impl TaskRuntime {
                             &borrowed,
                             &claim.engineering_references,
                         ),
+                        ambiguous_mentions: Vec::new(),
                     }
                 } else {
                     let derived = derive_claim_references(
@@ -1932,7 +1935,7 @@ impl TaskRuntime {
                         &claim.statement,
                         &claim.rationale,
                         &borrowed,
-                        resolve,
+                        resolver,
                     );
                     claim
                         .engineering_references
@@ -1952,6 +1955,7 @@ impl TaskRuntime {
                     // of it report the same topic hint.
                     topic_key_hint: claim.topic_key_hint.clone(),
                     unresolved_hints: derivation.unresolved_hints,
+                    ambiguous_mentions: derivation.ambiguous_mentions,
                     applicability_inherited: true,
                 });
             }
@@ -6646,23 +6650,31 @@ fn claim_references_derived(connection: &Connection, episode_id: WorkEpisodeId) 
         .map_err(sql_error("read Claim reference derivation marker"))
 }
 
-/// Every path-shaped spelling in one Episode, so one `git ls-files` answers the whole Build.
-fn episode_path_candidates(episode: &WorkEpisodeView) -> Vec<PathCandidate> {
-    let mut candidates = Vec::new();
+/// Every spelling in one Episode a checkout could place, so one `git ls-files` answers the Build.
+fn episode_claim_mentions(episode: &WorkEpisodeView) -> EpisodeClaimMentions {
+    let mut paths = Vec::new();
+    let mut symbols = Vec::new();
     for checkpoint in &episode.checkpoints {
         for claim in &checkpoint.claims {
             let summaries = claim_evidence_summaries(&episode.episode, claim);
             let borrowed = summaries.iter().map(String::as_str).collect::<Vec<_>>();
-            candidates.extend(reference_derivation::claim_path_candidates(
+            paths.extend(reference_derivation::claim_path_candidates(
+                &claim.statement,
+                &claim.rationale,
+                &borrowed,
+            ));
+            symbols.extend(reference_derivation::claim_symbol_mentions(
                 &claim.statement,
                 &claim.rationale,
                 &borrowed,
             ));
         }
     }
-    candidates.sort();
-    candidates.dedup();
-    candidates
+    paths.sort();
+    paths.dedup();
+    symbols.sort();
+    symbols.dedup();
+    EpisodeClaimMentions { paths, symbols }
 }
 
 /// Recovers the Evidence summaries one persisted Claim was submitted with.
