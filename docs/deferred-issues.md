@@ -93,3 +93,11 @@
 42. **`ContextPackMode::Explicit` 是不可达的死代码，随 B1 一并清点**（裁定 5）。全仓唯一的生产 `TaskContextRequest` 构造点是 `crates/mcp/src/lib.rs` 的 `build_task_context_response`，它永远用 `TaskContextRequest::automatic`，因此没有任何 MCP 工具或 CLI 命令能构造出 Explicit 模式的包。ADR-0007 之后这条模式是融合栈（八通道加权 RRF、`AUTOMATIC_RELEVANCE_FLOOR_BASIS_POINTS`、词法覆盖门、`AutomaticQueryTokenExplanation`）在 pack 侧仅剩的入口；那套机器另一个存活理由是 `task_space_associations`，而它的唯一生产消费者是 candidate 分析栈（B1 冻结）。两者要一起看：B1 解冻时，先确认 candidate 侧还需要哪些通道，再把 Explicit 模式与它拖着的常量族一并删掉，而不是分两次拆。本轮只做了 pack 侧退役，没有删这些符号。
 
 43. **同一次 Checkpoint 落下的多条 Claim 互为种子扩展**。Candidate Build 会把来源 Task 的问题附到它产出的每一份 draft 上，所以一次 Checkpoint 里的几条 Claim 拿到的是**同一个** `problem_view`；ADR-0007 的种子扩展正是按 `problem_view` 相等来连边的，于是它们在包里互相带出来——哪怕内容彼此无关。`retrieval_quality_workflow` 的「unrelated sibling」就是这个形状，该测试现在钉的是**路径**而不是缺席：兄弟条目只能以 `seed_expansion` 出现在一条已锚定 Context 旁边，永远不能自己锚一个它并不引用的文件。这是否算噪声取决于一个尚未实测的判断——「同一次 Checkpoint 提交的东西是不是同一件工作」。S2-2 的前提说是（真实装置上 map 会话的三条 Context 共享一个 `problem_view`，正是要一起读的），这个 fixture 说不一定。升级条件：真实流量里统计同 `problem_view` 兄弟条目的被采纳率；若明显偏低，候选修法是让 Build 按 Claim 而不是按 Task 派生 `problem_view`，而不是去动种子扩展。
+
+## 2026-09-11 新增(双径重建 0c 回放发现)
+
+44. **径 A 锚点的分支/时间耦合**:engineering reference 记录的是沉淀时刻的路径,回放/切分支后锚点文件可能在当前 checkout 不存在(实测:FE 会话 2 个锚点文件只存在于 feat/switch-live-tag),径 A 静默 miss。方向与 #41 relocation-aware 反查一致,可合并处理:miss 时先查 relocation 记录,再考虑分支感知。
+
+45. **显式 context_search 成为 wire 大户**:自动包收敛到 ≤8000 tokens 后,单次 context_search 实测 65.8KB(被 Cursor 溢写成文件)。B1 解冻 Explicit 模式清点时,把显式检索纳入与 pack 相同的信封口径与降级链。
+
+46. **回放工具五项(归组)**:turn-timeout 仅在 stdout 有新行时检查(需独立看门狗);两个回放并发会让 --resume 全挂(需互斥);manifest 的模型 fidelity 与 hook payload 实测不符(auto-smart vs 宣称值,应回填);Cursor 子会话(无 sessionStart 的子 conversation)各自获发 activation marker(一次回放=三个被授权 session,授权面值得收紧);pack_deliveries 对"同批 ctx 重复投放"少计(task_injection 去重所致,跨宿主 count=pushes 的承诺不成立)。另:host/turn-N.jsonl 记录完整 MCP result,建议并回 hosts/cursor.py 作为 wire 观测源。

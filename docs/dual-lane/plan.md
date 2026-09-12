@@ -100,3 +100,11 @@ S2-1 → S2-2 → S2-3 可流水(2 依赖 1 的种子形态,3 依赖 1+2);S2-4 �
 - 降级链五档,每档完整合法 JSON、serde 往返测试;conditions/conflicts/derived_state 任何档不丢(安全);截断先于 Space 派生(S2-4 不变量保持);detail_level 报告实际发出的形态。
 - 实测修正 plan 假设:26 条全库全锚定+无界 budget 下 ceiling 触发(15 items,实测 wire 8151<10000)——上限按设计工作即验收,已如实入测试与提交记录。
 - inputSchema 零字节变化(为一个默认调用者摸不到的旋钮不值得一次兼容性事件——曾加 description 后主动回退)。
+
+## 0c 回放对照与合并门(2026-09-11,record)
+
+三次 Cursor 回放(FE 原样 ×2、地图跨端时间盒 ×1,bundle 在 ~/.shared-context-audit/2026091*),判定:**回放对照无回归——通过**。实测:满包 6 条/15.5KB(旧栈 11–15 条/37–66KB 且 3/4 被宿主溢写成文件);FE 零跑题且 FE 关键内容 turn5/6 在包;地图会话空包成立(反事实复算:16 触碰文件 vs 54 锚点零交集);42/42 合法 JSON、0 截断、0 降级触发;强杀下 sessionEnd/租约清理正常;hop2 样本 58 行,floor 5200 实测干净分割(5190 拒/5206 准);budget-as-cap 的 14 条 omit 如实列出。阳性对照:喂 1 个锚定文件即刻 lane A 命中——空包是输入为空,不是链路坏。
+
+合并门七项:workspace 1081/0、fmt/clippy 零、hop2_ratchet 13/18/0、lane_probes 9/0/0/0、三套空包断言、红线零 diff、回放通过——全绿。
+
+两项非阻断观察(入 deferred):#44 锚点的分支/时间耦合(FE 回放前 4 轮空包成因:2 个锚点文件在回放基线 commit 不存在;与 #41 relocation-aware 同方向);#45 显式 context_search 成为新 wire 大户(单次 65.8KB,B1 解冻时纳入同一信封口径)。回放工具自身问题(turn-timeout 无看门狗、不可并发、manifest 模型 fidelity 失真、子会话各拿 marker、pack_deliveries 对重复投放少计)归组记录,修复随回放工具线。
