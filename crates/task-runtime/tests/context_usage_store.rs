@@ -55,8 +55,14 @@ fn injected() -> (InjectedContext, InjectedContext) {
     )
 }
 
+/// Re-injection advances the latest exposure and never rewrites the first one.
+///
+/// Rewriting `injected_at_unix_seconds` put the audit trail out of order against
+/// `context_usage`: on a real 21-hour Session, `ctx_98e9c226` was judged `ignored` at 04:53:22
+/// and then read back as injected at 05:34:56, so the verdict appeared to precede the injection
+/// it judged. The verdict itself is untouched by a re-push either way, and this pins both halves.
 #[test]
-fn re_injecting_one_context_refreshes_only_its_timestamp() {
+fn re_injecting_one_context_advances_only_its_latest_exposure() {
     let root = TempDir::new().unwrap();
     let runtime = TaskRuntime::initialize(root.path()).unwrap();
     let (task_id, revision) = open_task(&runtime, "session-injection");
@@ -69,6 +75,18 @@ fn re_injecting_one_context_refreshes_only_its_timestamp() {
             ContextInjectionSource::IntentUpdate,
             &[first, second, first],
             1_000,
+        )
+        .unwrap();
+    // A verdict lands between the two pushes, exactly as a Checkpoint does.
+    let judged_at = 1_500;
+    runtime
+        .record_context_usage_at(
+            &[ContextUsageRecord {
+                context_id: first.context_id,
+                task_id,
+                outcome: ContextUsageOutcome::Ignored,
+            }],
+            judged_at,
         )
         .unwrap();
     runtime
@@ -87,7 +105,23 @@ fn re_injecting_one_context_refreshes_only_its_timestamp() {
         .iter()
         .find(|record| record.context_id == first.context_id)
         .unwrap();
-    assert_eq!(refreshed.injected_at_unix_seconds, 2_000);
+    assert_eq!(
+        refreshed.injected_at_unix_seconds, 1_000,
+        "first exposure never moves"
+    );
+    assert_eq!(
+        refreshed.last_injected_at_unix_seconds, 2_000,
+        "the re-push is recorded as a re-push"
+    );
+    let untouched = records
+        .iter()
+        .find(|record| record.context_id == second.context_id)
+        .unwrap();
+    assert_eq!(untouched.injected_at_unix_seconds, 1_000);
+    assert_eq!(
+        untouched.last_injected_at_unix_seconds, 1_000,
+        "a Context pushed once carries the same moment twice"
+    );
     assert_eq!(
         refreshed.source,
         ContextInjectionSource::IntentUpdate,
@@ -95,6 +129,28 @@ fn re_injecting_one_context_refreshes_only_its_timestamp() {
     );
     assert_eq!(refreshed.revision_id, first.revision_id);
     assert_eq!(refreshed.intent_revision_id, revision);
+
+    // The verdict is a verdict: re-exposure neither changes it nor erases it, and the audit
+    // trail now reads in the order the events happened.
+    assert_eq!(
+        runtime
+            .context_usage_totals(&[first.context_id])
+            .unwrap()
+            .get(&first.context_id)
+            .copied()
+            .unwrap_or_default(),
+        ContextUsageTotals {
+            reused: 0,
+            ignored: 1,
+            refuted: 0,
+        },
+        "the verdict survives the re-push unchanged"
+    );
+    assert!(
+        refreshed.injected_at_unix_seconds < judged_at,
+        "a Context is judged after it was injected, never before"
+    );
+
     assert!(
         runtime
             .read_task_injections(TaskId::new())

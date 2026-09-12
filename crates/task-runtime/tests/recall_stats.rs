@@ -136,7 +136,7 @@ fn recall_snapshot_reads_live_wal_and_separates_evidence_without_source_writes()
     let stats = read_recall_stats(root).unwrap();
     assert_eq!(state_files(root), before);
     assert!(stats.runtime_available);
-    assert_eq!(stats.schema_version, Some(21));
+    assert_eq!(stats.schema_version, Some(22));
     assert_eq!(
         (
             stats.totals.injections,

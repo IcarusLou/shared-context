@@ -6,8 +6,9 @@
 //! counters for the `TurnStop` checkpoint reminder gate, WP-V6 fix 3). Version 18 -> 19 adds relation and usage-basis audit
 //! columns; version 19 -> 20 turns the one-column Claim derivation marker into a record of what
 //! that derivation found; version 20 -> 21 adds the table that holds a Prompt submitted before
-//! its Session had a Task. The eight chain, so a version 13 database reopened today lands on the
-//! current version.
+//! its Session had a Task; version 21 -> 22 separates first from latest exposure on
+//! `task_injection`. The nine chain, so a version 13 database reopened today lands on the current
+//! version.
 //!
 //! There is no standalone "build an old database" helper, so these construct one honestly: they
 //! open a fresh (current-schema) `TaskRuntime`, write representative business rows through the
@@ -143,7 +144,7 @@ fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 21,
+        version, 22,
         "migration must chain through to the current version"
     );
     let hook_event_exists: bool = connection
@@ -312,7 +313,7 @@ fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        21
+        22
     );
     assert!(
         runtime
@@ -395,7 +396,7 @@ fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        21
+        22
     );
     let totals = runtime
         .context_usage_totals(&[ignored, reused, refuted])
@@ -494,7 +495,7 @@ fn schema_version_16_adds_disposition_provenance_without_rewriting_a_decision() 
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        21
+        22
     );
     let rejections_exist: bool = connection
         .query_row(
@@ -611,7 +612,7 @@ fn schema_version_17_adds_the_checkpoint_reminder_counters_at_zero() {
         connection
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        21,
+        22,
         "migration must chain through to the current version"
     );
     let (reminder_count, activity): (i64, i64) = connection
@@ -679,7 +680,7 @@ fn schema_migrations_are_reentrant_over_existing_columns() {
             .unwrap()
             .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
             .unwrap(),
-        21
+        22
     );
     assert!(
         runtime
@@ -739,7 +740,7 @@ fn schema_version_18_adds_audit_columns_without_losing_decisions_or_usage() {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            22
         );
         let rows = connection.prepare("SELECT outcome, recorded_at_unix_seconds, basis FROM context_usage ORDER BY context_id")
             .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
@@ -820,7 +821,7 @@ fn schema_version_19_records_what_the_derivation_found_and_keeps_old_markers_clo
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            22
         );
         let record = runtime
             .reference_derivation_record(episode_id)
@@ -882,7 +883,7 @@ fn schema_version_20_adds_the_pending_prompt_table_without_touching_anything_els
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            21
+            22
         );
         assert_eq!(
             connection
@@ -899,6 +900,92 @@ fn schema_version_20_adds_the_pending_prompt_table_without_touching_anything_els
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+    }
+}
+
+/// Version 21 -> 22 separates first exposure from latest exposure on `task_injection`.
+///
+/// The load-bearing property is what an upgraded row *means*. Before this version the single
+/// timestamp was rewritten on every re-push, so it already holds the *latest* exposure and the
+/// first one it overwrote is gone. The backfill therefore copies it, and an upgraded row reads as
+/// "these two moments are the same" -- indistinguishable from a Context pushed once, which is the
+/// honest answer. Only pushes recorded from here on can tell the difference, and the existing
+/// `context_usage` verdict beside it is not touched by either.
+#[test]
+fn schema_version_21_separates_first_exposure_from_latest_without_inventing_one() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "injection-exposure-migration").unwrap();
+    let task_id = TaskId::new();
+    runtime
+        .open_or_create(
+            locator,
+            task_id,
+            intent("survive the injection exposure upgrade"),
+            Vec::new(),
+        )
+        .unwrap();
+    let context_id = sctx_domain::ContextId::new();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE task_injection DROP COLUMN last_injected_at_unix_seconds;
+             PRAGMA user_version = 21;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_injection (
+                task_id, context_id, intent_revision_id, revision_id,
+                injected_at_unix_seconds, source
+             ) VALUES (?1, ?2, ?3, ?4, 7_000, 'intent_update')",
+            params![
+                task_id.to_string(),
+                context_id.to_string(),
+                sctx_domain::TaskIntentRevisionId::new().to_string(),
+                sctx_domain::RevisionId::new().to_string(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO context_usage (
+                context_id, task_id, outcome, recorded_at_unix_seconds, basis
+             ) VALUES (?1, ?2, 'ignored', 6_000, 'checkpoint_derived')",
+            params![context_id.to_string(), task_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Twice, because every migration in this chain has to be re-runnable.
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        let records = runtime.read_task_injections(task_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].injected_at_unix_seconds, 7_000);
+        assert_eq!(
+            records[0].last_injected_at_unix_seconds, 7_000,
+            "an upgraded row claims no first exposure it never recorded"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT recorded_at_unix_seconds FROM context_usage
+                     WHERE context_id = ?1 AND task_id = ?2",
+                    params![context_id.to_string(), task_id.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            6_000,
+            "the verdict recorded beside it is untouched"
         );
     }
 }

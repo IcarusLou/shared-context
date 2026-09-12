@@ -40,7 +40,7 @@ pub use reference_derivation::{
     derive_claim_references,
 };
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -684,7 +684,21 @@ pub struct TaskInjectionRecord {
     pub context_id: ContextId,
     pub revision_id: RevisionId,
     pub intent_revision_id: TaskIntentRevisionId,
+    /// When this Context first reached this Task. It never moves.
+    ///
+    /// Re-injection used to overwrite it, which put the audit trail out of order: a verdict
+    /// recorded at the Checkpoint appeared to precede the injection it judged, because a later
+    /// push of the same Context rewrote the injection's timestamp past it. Observed on a real
+    /// 21-hour Session: `ctx_98e9c226` was judged `ignored` at 04:53:22 and read back as injected
+    /// at 05:34:56.
     pub injected_at_unix_seconds: u64,
+    /// When this Context last reached this Task, which equals
+    /// [`injected_at_unix_seconds`](Self::injected_at_unix_seconds) until it is pushed again.
+    ///
+    /// Re-exposure is a fact worth keeping — it is how often a Task was shown the same Context —
+    /// and it is a different fact from first exposure. Neither one is a verdict: what the Task
+    /// did with the Context lives in `context_usage` and a re-push never disturbs it.
+    pub last_injected_at_unix_seconds: u64,
     pub source: ContextInjectionSource,
 }
 
@@ -4073,8 +4087,10 @@ impl TaskRuntime {
     /// Records the Contexts one retrieval entry point just injected into a Task.
     ///
     /// `(task_id, context_id)` is unique: re-injecting the same Context into the same Task only
-    /// refreshes `injected_at_unix_seconds`, so the first Intent revision, revision and entry
-    /// point that produced the injection stay the recorded provenance.
+    /// advances `last_injected_at_unix_seconds`, so the first Intent revision, revision, entry
+    /// point **and moment** that produced the injection stay the recorded provenance. Refreshing
+    /// `injected_at_unix_seconds` instead is what used to invert the audit trail against
+    /// `context_usage`, whose verdicts this write never touches either way.
     ///
     /// # Errors
     ///
@@ -4122,10 +4138,11 @@ impl TaskRuntime {
                 .execute(
                     "INSERT INTO task_injection (
                         task_id, context_id, intent_revision_id, revision_id,
-                        injected_at_unix_seconds, source
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        injected_at_unix_seconds, last_injected_at_unix_seconds, source
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
                      ON CONFLICT (task_id, context_id) DO UPDATE SET
-                        injected_at_unix_seconds = excluded.injected_at_unix_seconds",
+                        last_injected_at_unix_seconds =
+                            excluded.last_injected_at_unix_seconds",
                     params![
                         task_id.to_string(),
                         context.context_id.to_string(),
@@ -4153,7 +4170,7 @@ impl TaskRuntime {
         let mut statement = connection
             .prepare(
                 "SELECT context_id, intent_revision_id, revision_id,
-                        injected_at_unix_seconds, source
+                        injected_at_unix_seconds, last_injected_at_unix_seconds, source
                  FROM task_injection WHERE task_id = ?1 ORDER BY context_id ASC",
             )
             .map_err(sql_error("prepare Task injection read"))?;
@@ -4164,7 +4181,8 @@ impl TaskRuntime {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(sql_error("read Task injections"))?;
@@ -4179,7 +4197,10 @@ impl TaskRuntime {
                 injected_at_unix_seconds: u64::try_from(row.3).map_err(|_| {
                     invariant("task_injection.injected_at_unix_seconds is negative")
                 })?,
-                source: ContextInjectionSource::parse(&row.4)?,
+                last_injected_at_unix_seconds: u64::try_from(row.4).map_err(|_| {
+                    invariant("task_injection.last_injected_at_unix_seconds is negative")
+                })?,
+                source: ContextInjectionSource::parse(&row.5)?,
             });
         }
         Ok(records)
@@ -4419,7 +4440,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 20;
     }
     if version == 20 {
-        return migrate_schema_20_to_21(connection);
+        migrate_schema_20_to_21(connection)?;
+        version = 21;
+    }
+    if version == 21 {
+        return migrate_schema_21_to_22(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4752,6 +4777,9 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 injected_at_unix_seconds INTEGER NOT NULL CHECK (
                     injected_at_unix_seconds >= 0
                 ),
+                last_injected_at_unix_seconds INTEGER NOT NULL CHECK (
+                    last_injected_at_unix_seconds >= 0
+                ),
                 source TEXT NOT NULL CHECK (
                     source IN ('intent_update', 'task_context', 'artifact_focus')
                 ),
@@ -4825,7 +4853,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
                 ON auto_confirm_rejection (recorded_at_unix_seconds);
-            PRAGMA user_version = 21;",
+            PRAGMA user_version = 22;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -5147,6 +5175,54 @@ fn migrate_schema_20_to_21(connection: &Connection) -> Result<()> {
         )
         .map_err(sql_error(
             "migrate task runtime schema from version 20 to 21",
+        ))
+}
+
+/// Separates first exposure from latest exposure on `task_injection`.
+///
+/// Purely additive, following the `decision_source` precedent: one column with a constant default,
+/// then one backfill statement. The backfill copies `injected_at_unix_seconds`, which is the only
+/// honest value available -- on an installation that upgrades, that column already holds the
+/// *latest* push for every Context that was injected more than once, and the first push it
+/// overwrote is not recoverable. So an upgraded row reads as "these two moments are the same",
+/// exactly as a row injected once does, and only injections recorded from here on can tell the
+/// difference. Nothing in `context_usage` is touched: a re-push was never a verdict.
+///
+/// Checks for the column before adding it, for the reason [`migrate_schema_17_to_18`] documents:
+/// a fixture in this crate's own harness reaches "version 21" by writing rows through the current
+/// schema and rewinding the stamp, so the column can already be there. The backfill then runs
+/// either way and is idempotent on a row it already filled.
+fn migrate_schema_21_to_22(connection: &Connection) -> Result<()> {
+    let has_last_injected_at = connection
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('task_injection')
+             WHERE name = 'last_injected_at_unix_seconds'",
+        )
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(sql_error("inspect task_injection columns"))?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(sql_error(
+            "begin task runtime schema migration from version 21 to 22",
+        ))?;
+    if !has_last_injected_at {
+        connection
+            .execute_batch(
+                "ALTER TABLE task_injection ADD COLUMN last_injected_at_unix_seconds
+                    INTEGER NOT NULL DEFAULT 0 CHECK (last_injected_at_unix_seconds >= 0);",
+            )
+            .map_err(sql_error("add latest exposure column to task_injection"))?;
+    }
+    connection
+        .execute_batch(
+            "UPDATE task_injection
+                SET last_injected_at_unix_seconds = injected_at_unix_seconds
+              WHERE last_injected_at_unix_seconds = 0;
+             PRAGMA user_version = 22;
+             COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 21 to 22",
         ))
 }
 

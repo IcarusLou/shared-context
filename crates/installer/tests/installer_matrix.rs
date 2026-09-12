@@ -347,11 +347,12 @@ fn assert_runtime_schema_current(root: &Path) {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .unwrap();
-    // 19 is the current schema version: 13 through 18 all gained in-place migrations
-    // (additive `hook_event`, the `context_usage` reset, the omission-only reset, additive
-    // disposition provenance, checkpoint-reminder counters and audit columns) rather than
-    // becoming discardable/unsupported versions, so a fresh or rebuilt Runtime always lands on 19.
-    assert_eq!(version, 21);
+    // 22 is the current schema version: 13 through 21 all gained in-place migrations (additive
+    // `hook_event`, the `context_usage` reset, the omission-only reset, additive disposition
+    // provenance, checkpoint-reminder counters, audit columns, the derivation record, the pending
+    // Prompt table and the latest-exposure column) rather than becoming discardable/unsupported
+    // versions, so a fresh or rebuilt Runtime always lands on 22.
+    assert_eq!(version, 22);
     assert!(sqlite_table_exists(&connection, "auto_confirm_rejection"));
     assert!(sqlite_table_exists(&connection, "task_signal"));
     assert!(sqlite_table_exists(&connection, "hook_event"));
