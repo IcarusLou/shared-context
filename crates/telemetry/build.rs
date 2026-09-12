@@ -5,7 +5,11 @@
 //! working tree, and an installed artifact from last week are indistinguishable. The fingerprint
 //! below is what lets an installed binary say which source it is.
 
-include!("build_fingerprint.rs");
+#[path = "src/build_fingerprint_probe.rs"]
+mod build_fingerprint_probe;
+use std::path::PathBuf;
+
+use build_fingerprint_probe::{BuildFingerprint, probe_build_fingerprint};
 
 fn main() {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from);

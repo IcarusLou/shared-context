@@ -1,11 +1,9 @@
 // The Git build fingerprint probe.
 //
-// This file is `include!`d twice on purpose: once by `build.rs`, which runs it at compile time
-// and turns the result into `SCTX_BUILD_FINGERPRINT`, and once by a `#[cfg(test)]` module in the
-// library, which is the only way to test both of its outcomes without building the crate twice.
-// A build script cannot import the crate it builds, and the no-Git outcome is exactly the one a
-// test in this repository can never reach by building normally -- the repository is a Git
-// checkout.
+// This file has one home (this module) and two consumers. `build.rs` cannot import the crate it
+// builds, so it mounts this same file with `#[path] mod` and runs the probe at compile time; the
+// `#[cfg(test)]` tests below are the library-side compilation, which is the only way the no-Git
+// outcome gets covered -- the repository itself is always a Git checkout.
 //
 // Nothing here may fail a build. A source tree with no `git` on `PATH`, no `.git` at all, or a
 // repository with no commit yet still has to compile; it simply reports `unknown` and stops
@@ -15,13 +13,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// What the probe learned about the checkout a build is running from.
-struct BuildFingerprint {
+pub(crate) struct BuildFingerprint {
     /// `0e54982, clean`, `0e54982, dirty`, `0e54982, unknown`, or `unknown`.
-    text: String,
+    pub(crate) text: String,
     /// Existing paths whose change should re-run the build script. Only paths that exist are
     /// listed: Cargo treats a missing `rerun-if-changed` path as permanently changed, which would
     /// re-run this probe on every single build of every downstream crate.
-    rerun_paths: Vec<PathBuf>,
+    pub(crate) rerun_paths: Vec<PathBuf>,
 }
 
 /// Reads the commit and worktree state of the checkout containing `manifest_dir`.
@@ -29,7 +27,7 @@ struct BuildFingerprint {
 /// The dirty flag counts tracked files only. An untracked file is usually editor or tool residue
 /// and would make nearly every developer build report `dirty` for reasons that never reached the
 /// binary; a tracked modification is the case this flag exists to catch.
-fn probe_build_fingerprint(manifest_dir: &Path) -> BuildFingerprint {
+pub(crate) fn probe_build_fingerprint(manifest_dir: &Path) -> BuildFingerprint {
     let unknown = || BuildFingerprint {
         text: "unknown".to_owned(),
         rerun_paths: Vec::new(),
@@ -108,4 +106,56 @@ fn git_stdout(manifest_dir: &Path, args: &[&str]) -> Option<String> {
 
 fn is_short_commit(commit: &str) -> bool {
     commit.len() == 7 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory inside this repository reports the commit it is checked out at.
+    #[test]
+    fn a_git_checkout_reports_its_commit_and_worktree_state() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let probed = probe_build_fingerprint(manifest_dir);
+        let expected = git_stdout(manifest_dir, &["rev-parse", "--short=7", "HEAD"])
+            .expect("this test runs from a Git checkout with at least one commit");
+
+        let (commit, state) = probed
+            .text
+            .split_once(", ")
+            .unwrap_or_else(|| panic!("fingerprint is not `<commit>, <state>`: {}", probed.text));
+        assert_eq!(commit, expected);
+        assert!(
+            matches!(state, "clean" | "dirty"),
+            "worktree state was not read: {state}"
+        );
+        assert!(
+            probed
+                .rerun_paths
+                .iter()
+                .any(|path| path.ends_with("HEAD") && path.exists()),
+            "an existing HEAD must be declared so a new commit restamps the binary: {:?}",
+            probed.rerun_paths
+        );
+    }
+
+    /// A source tree outside every Git checkout still builds; it just stops claiming a commit.
+    ///
+    /// The temporary directory is created under the system temporary directory rather than in the
+    /// workspace, because a directory *inside* the repository would inherit the repository's Git
+    /// answers and test nothing.
+    #[test]
+    fn a_tree_without_git_reports_unknown_and_declares_no_rerun_paths() {
+        let outside = tempfile::tempdir().expect("create a directory outside every checkout");
+
+        let probed = probe_build_fingerprint(outside.path());
+
+        assert_eq!(probed.text, "unknown");
+        assert!(
+            probed.rerun_paths.is_empty(),
+            "a build with nothing to watch must not declare paths Cargo would treat as \
+             permanently changed: {:?}",
+            probed.rerun_paths
+        );
+    }
 }

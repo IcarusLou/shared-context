@@ -34,55 +34,8 @@ pub use wire::{DecodeError, FRAME_MAGIC, FRAME_MAX_BYTES, FRAME_VERSION, FrameDe
 /// The build-script probe, compiled a second time so both of its outcomes can be tested.
 ///
 /// Building this crate can only ever exercise the outcome of the tree it is built from, and this
-/// repository is a Git checkout, so the no-Git outcome has no other way of being covered.
+/// repository is a Git checkout, so the no-Git outcome has no other way of being covered. The
+/// probe lives in its own module so rust-analyzer sees one canonical home for it; `build.rs`
+/// mounts the same file with `#[path]` because a build script cannot import its own crate.
 #[cfg(test)]
-mod build_fingerprint {
-    include!("../build_fingerprint.rs");
-
-    /// A directory inside this repository reports the commit it is checked out at.
-    #[test]
-    fn a_git_checkout_reports_its_commit_and_worktree_state() {
-        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let probed = probe_build_fingerprint(manifest_dir);
-        let expected = git_stdout(manifest_dir, &["rev-parse", "--short=7", "HEAD"])
-            .expect("this test runs from a Git checkout with at least one commit");
-
-        let (commit, state) = probed
-            .text
-            .split_once(", ")
-            .unwrap_or_else(|| panic!("fingerprint is not `<commit>, <state>`: {}", probed.text));
-        assert_eq!(commit, expected);
-        assert!(
-            matches!(state, "clean" | "dirty"),
-            "worktree state was not read: {state}"
-        );
-        assert!(
-            probed
-                .rerun_paths
-                .iter()
-                .any(|path| path.ends_with("HEAD") && path.exists()),
-            "an existing HEAD must be declared so a new commit restamps the binary: {:?}",
-            probed.rerun_paths
-        );
-    }
-
-    /// A source tree outside every Git checkout still builds; it just stops claiming a commit.
-    ///
-    /// The temporary directory is created under the system temporary directory rather than in the
-    /// workspace, because a directory *inside* the repository would inherit the repository's Git
-    /// answers and test nothing.
-    #[test]
-    fn a_tree_without_git_reports_unknown_and_declares_no_rerun_paths() {
-        let outside = tempfile::tempdir().expect("create a directory outside every checkout");
-
-        let probed = probe_build_fingerprint(outside.path());
-
-        assert_eq!(probed.text, "unknown");
-        assert!(
-            probed.rerun_paths.is_empty(),
-            "a build with nothing to watch must not declare paths Cargo would treat as \
-             permanently changed: {:?}",
-            probed.rerun_paths
-        );
-    }
-}
+mod build_fingerprint_probe;
