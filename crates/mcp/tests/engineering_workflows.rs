@@ -1851,6 +1851,21 @@ fn auto_scan_false_leaves_the_graph_exactly_where_it_was() {
     )
     .unwrap();
     assert_eq!(rebuilt.status_counts.resolved, 1);
+    assert_eq!(
+        rebuilt.reopened_reference_derivations, 0,
+        "no Episode here left a Claim spelling ambiguous, so there is nothing to re-ask"
+    );
+    let diagnosed = association_rebuild_at_root(
+        &root,
+        &AssociationRebuildInput {
+            diagnose_only: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        diagnosed.reopened_reference_derivations, 0,
+        "a diagnose-only rebuild changes nothing, derivation records included"
+    );
 }
 
 /// The same rescan on the path that actually produces most References: a Confirmation whose

@@ -19,13 +19,14 @@ use sctx_domain::{
     AgentCheckpoint, AgentCheckpointId, Applicability, AutomaticContextCandidate, CandidateBuildId,
     CandidateConfirmationPlan, CandidateId, CandidateReviewScope, CandidateReviewStatus,
     CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
-    ContextId, ContextKind, DecisionSource, Error, ErrorKind, EventId, EvidenceSnapshotDraft,
-    EvidenceType, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, ProposedSpaceGroupKey,
-    Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId, TaskIntentRevision,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal, TaskSignalKind,
-    TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId, WorkEpisodeRef,
-    WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    ContextId, ContextKind, DecisionSource, EngineeringReferenceDraft, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionId, ExternalSessionLocator,
+    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
+    ProposedSpaceGroupKey, Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId,
+    TaskIntentRevision, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal,
+    TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId,
+    WorkEpisodeRef, WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
+    WorkingIntentSnapshot,
 };
 use sha2::{Digest, Sha256};
 
@@ -35,10 +36,11 @@ pub mod reference_derivation;
 pub use reference_derivation::{
     AmbiguousMention, CheckoutReferenceResolver, ClaimReferenceDerivation, ClaimResolver,
     DerivedClaimReferences, EpisodeClaimMentions, MentionChannel, MentionResolution, PathCandidate,
-    ResolvedReference, claim_topic_key, combine_resolutions, derive_claim_references,
+    ReferenceDerivationRecord, ResolvedReference, claim_topic_key, combine_resolutions,
+    derive_claim_references,
 };
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
@@ -1866,11 +1868,13 @@ impl TaskRuntime {
         })
     }
 
-    /// Spellings one Episode's Claims still need placed, or `None` once they were placed.
+    /// Spellings one Episode's Claims still need placed, or `None` when nothing is open.
     ///
-    /// Candidate Build asks this first so a rebuilt Episode never spawns `git` again: the answer
-    /// is `None` as soon as [`TaskRuntime::derive_episode_claim_references`] recorded the first
-    /// derivation, whatever that derivation resolved.
+    /// Candidate Build asks this first so a rebuilt Episode normally never spawns `git` again. The
+    /// answer stays `Some` in exactly two cases after the first derivation: the record carries an
+    /// ambiguity, whose answer a changed checkout can settle, or an operator explicitly reopened
+    /// it. An Episode whose derivation was clean — everything placed, or nothing to place — is
+    /// closed for good and costs no lookup.
     ///
     /// # Errors
     ///
@@ -1880,7 +1884,10 @@ impl TaskRuntime {
         episode_id: WorkEpisodeId,
     ) -> Result<Option<EpisodeClaimMentions>> {
         let connection = self.open_connection()?;
-        if claim_references_derived(&connection, episode_id)? {
+        if let Some(record) = read_reference_derivation(&connection, episode_id)?
+            && !record.reopened
+            && record.ambiguous.is_empty()
+        {
             return Ok(None);
         }
         let Some(episode) = read_episode_view(&connection, episode_id)? else {
@@ -1889,14 +1896,66 @@ impl TaskRuntime {
         Ok(Some(episode_claim_mentions(&episode)))
     }
 
-    /// Derives every Claim's engineering coordinates for one Episode exactly once.
+    /// Reads what one Episode's recorded derivation attempt found, if it has run.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors.
+    pub fn reference_derivation_record(
+        &self,
+        episode_id: WorkEpisodeId,
+    ) -> Result<Option<ReferenceDerivationRecord>> {
+        read_reference_derivation(&self.open_connection()?, episode_id)
+    }
+
+    /// Asks for every Episode whose derivation left an ambiguity to be looked at again.
+    ///
+    /// Returns how many Episodes were reopened. This is the operator's lever, and it is
+    /// deliberately no stronger than the automatic one: reopening does not itself re-derive
+    /// anything, it only makes the next Candidate Build for that Episode ask the checkout again
+    /// even when the checkout's answer has not changed. Claim derivation is Build work by
+    /// construction, and an Episode nobody builds again keeps the answer it has.
+    ///
+    /// An Episode whose derivation recorded no ambiguity is never reopened: there is no question
+    /// to re-ask, and re-deriving a clean answer could only burn a Git query.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn reopen_ambiguous_reference_derivations(&self) -> Result<usize> {
+        let connection = self.open_connection()?;
+        let reopened = connection
+            .execute(
+                "UPDATE checkpoint_reference_derivation SET reopened = 1
+                 WHERE reopened = 0
+                   AND ambiguity_json IS NOT NULL
+                   AND json_array_length(ambiguity_json) > 0",
+                [],
+            )
+            .map_err(sql_error("reopen ambiguous Claim reference derivations"))?;
+        Ok(reopened)
+    }
+
+    /// Derives every Claim's engineering coordinates for one Episode.
     ///
     /// This is Candidate Build work, never Checkpoint ACK work. The first call resolves each
     /// spelling through `resolver` — path spellings first, and type names only for a Claim no path
     /// could place — writes the resulting References and topic hint back onto the persisted
-    /// Claims, and records that this Episode is derived. Every later call reports that persisted
-    /// answer and calls `resolver` for nothing, so a Build rerun after the checkout moved on
-    /// cannot change a Candidate that already reached review.
+    /// Claims, and records what it found.
+    ///
+    /// A later call normally replays that recorded answer and calls `resolver` for nothing, so a
+    /// Build rerun after the checkout moved on cannot change a Candidate that already reached
+    /// review. It re-derives in exactly two cases, and only for what was left open:
+    ///
+    /// * the record carries an ambiguity whose current answer differs from the recorded one — the
+    ///   checkout gained or lost a file, so the question has a new answer; or
+    /// * [`TaskRuntime::reopen_ambiguous_reference_derivations`] reopened the Episode.
+    ///
+    /// A re-derivation is additive and never retracts: the persisted References become the union
+    /// of what was recorded and what was just found, deduplicated by coordinate, and a
+    /// `topic_key_hint` that already exists is never overruled. That keeps the operation
+    /// idempotent against an unchanged checkout and keeps a reviewer's already-seen facts intact
+    /// while an ambiguity that has since resolved is allowed to become one.
     ///
     /// # Errors
     ///
@@ -1910,14 +1969,42 @@ impl TaskRuntime {
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Claim derivation transaction")?;
         let episode = require_episode_view(&transaction, episode_id)?;
-        let already_derived = claim_references_derived(&transaction, episode_id)?;
+        let recorded = read_reference_derivation(&transaction, episode_id)?;
+        let derive = match &recorded {
+            None => true,
+            Some(record) => {
+                record.reopened || ambiguity_answer_changed(&record.ambiguous, resolver)
+            }
+        };
         let mut derivations = Vec::new();
         for checkpoint in &episode.checkpoints {
             let mut updated = checkpoint.clone();
             for claim in &mut updated.claims {
                 let summaries = claim_evidence_summaries(&episode.episode, claim);
                 let borrowed = summaries.iter().map(String::as_str).collect::<Vec<_>>();
-                let derivation = if already_derived {
+                let derivation = if derive {
+                    let derived = derive_claim_references(
+                        claim.context_kind_hint.unwrap_or(ContextKind::Discovery),
+                        &claim.statement,
+                        &claim.rationale,
+                        &borrowed,
+                        resolver,
+                    );
+                    merge_engineering_references(
+                        &mut claim.engineering_references,
+                        &derived.engineering_references,
+                    );
+                    // A Claim that carried its own `topic_key_hint` keeps it: derivation fills a
+                    // gap the Agent left, it does not overrule a coordinate the Agent named — and
+                    // that holds for a re-derivation against the Claim's first answer too.
+                    if claim.topic_key_hint.is_none() {
+                        claim.topic_key_hint.clone_from(&derived.topic_key_hint);
+                    }
+                    ClaimReferenceDerivation {
+                        engineering_references: claim.engineering_references.clone(),
+                        ..derived
+                    }
+                } else {
                     ClaimReferenceDerivation {
                         engineering_references: claim.engineering_references.clone(),
                         topic_key_hint: claim.topic_key_hint.clone(),
@@ -1927,25 +2014,10 @@ impl TaskRuntime {
                             &borrowed,
                             &claim.engineering_references,
                         ),
+                        // The ambiguity belongs to the lookup, and a replay performs none; the
+                        // durable answer is the record, which the caller can read directly.
                         ambiguous_mentions: Vec::new(),
                     }
-                } else {
-                    let derived = derive_claim_references(
-                        claim.context_kind_hint.unwrap_or(ContextKind::Discovery),
-                        &claim.statement,
-                        &claim.rationale,
-                        &borrowed,
-                        resolver,
-                    );
-                    claim
-                        .engineering_references
-                        .clone_from(&derived.engineering_references);
-                    // A Claim that carried its own `topic_key_hint` keeps it: derivation fills a
-                    // gap the Agent left, it does not overrule a coordinate the Agent named.
-                    if claim.topic_key_hint.is_none() {
-                        claim.topic_key_hint.clone_from(&derived.topic_key_hint);
-                    }
-                    derived
                 };
                 derivations.push(DerivedClaimReferences {
                     checkpoint_id: updated.checkpoint_id,
@@ -1959,7 +2031,7 @@ impl TaskRuntime {
                     applicability_inherited: true,
                 });
             }
-            if already_derived {
+            if !derive {
                 continue;
             }
             updated.validate_against_episode(&episode.episode)?;
@@ -1972,13 +2044,10 @@ impl TaskRuntime {
                 )
                 .map_err(sql_error("persist derived Claim references"))?;
         }
-        if !already_derived {
-            transaction
-                .execute(
-                    "INSERT INTO checkpoint_reference_derivation (episode_id) VALUES (?1)",
-                    params![episode_id.to_string()],
-                )
-                .map_err(sql_error("record Claim reference derivation"))?;
+        if derive {
+            let mut record = ReferenceDerivationRecord::from_derivations(&derivations);
+            record.derived_at_unix_seconds = Some(unix_seconds(SystemTime::now())?);
+            write_reference_derivation(&transaction, episode_id, &record)?;
         }
         transaction
             .commit()
@@ -4221,7 +4290,11 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         version = 18;
     }
     if version == 18 {
-        return migrate_schema_18_to_19(connection);
+        migrate_schema_18_to_19(connection)?;
+        version = 19;
+    }
+    if version == 19 {
+        return migrate_schema_19_to_20(connection);
     }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
@@ -4576,6 +4649,18 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE TABLE IF NOT EXISTS checkpoint_reference_derivation (
                 episode_id TEXT PRIMARY KEY,
+                derived_at_unix_seconds INTEGER CHECK (
+                    derived_at_unix_seconds IS NULL OR derived_at_unix_seconds >= 0
+                ),
+                placed_count INTEGER NOT NULL DEFAULT 0 CHECK (placed_count >= 0),
+                unresolved_count INTEGER NOT NULL DEFAULT 0 CHECK (unresolved_count >= 0),
+                ambiguity_json TEXT CHECK (
+                    ambiguity_json IS NULL OR json_valid(ambiguity_json)
+                ),
+                unresolved_sample_json TEXT CHECK (
+                    unresolved_sample_json IS NULL OR json_valid(unresolved_sample_json)
+                ),
+                reopened INTEGER NOT NULL DEFAULT 0 CHECK (reopened IN (0, 1)),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS hook_event (
@@ -4605,7 +4690,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
             ) STRICT;
             CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
                 ON auto_confirm_rejection (recorded_at_unix_seconds);
-            PRAGMA user_version = 19;",
+            PRAGMA user_version = 20;",
         )
         .map_err(sql_error("initialize task runtime schema"))
 }
@@ -4821,6 +4906,87 @@ fn migrate_schema_18_to_19(connection: &Connection) -> Result<()> {
     transaction
         .commit()
         .map_err(sql_error("commit runtime audit migration"))
+}
+
+/// Turns the one-column derivation marker into a record of what the derivation found.
+///
+/// Six additive columns, no data rewritten, following the `decision_source` precedent: a row
+/// written before this version keeps `derived_at_unix_seconds IS NULL` and
+/// `ambiguity_json IS NULL`, which reads back as "derived, and nothing is known about how" — the
+/// only thing the marker ever said. A row like that is never re-derived, because a re-derivation
+/// is decided by comparing a recorded ambiguity against the checkout's current answer and there
+/// is no recorded ambiguity to compare. That is the conservative direction: an installation is
+/// upgraded without any Candidate silently changing underneath a reviewer.
+///
+/// The columns are added rather than the table replaced because `episode_id` is a `PRIMARY KEY`
+/// other rows do not reference and nothing about its meaning changed: the row still means "this
+/// Episode has been derived". Only its payload grew.
+fn migrate_schema_19_to_20(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(sql_error("begin reference derivation record migration"))?;
+    for (column, alteration) in [
+        (
+            "derived_at_unix_seconds",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN derived_at_unix_seconds INTEGER CHECK (
+                    derived_at_unix_seconds IS NULL OR derived_at_unix_seconds >= 0
+                )",
+        ),
+        (
+            "placed_count",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN placed_count INTEGER NOT NULL DEFAULT 0 CHECK (placed_count >= 0)",
+        ),
+        (
+            "unresolved_count",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN unresolved_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (unresolved_count >= 0)",
+        ),
+        (
+            "ambiguity_json",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN ambiguity_json TEXT CHECK (
+                    ambiguity_json IS NULL OR json_valid(ambiguity_json)
+                )",
+        ),
+        (
+            "unresolved_sample_json",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN unresolved_sample_json TEXT CHECK (
+                    unresolved_sample_json IS NULL OR json_valid(unresolved_sample_json)
+                )",
+        ),
+        (
+            "reopened",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN reopened INTEGER NOT NULL DEFAULT 0 CHECK (reopened IN (0, 1))",
+        ),
+    ] {
+        // `ADD COLUMN` has no `IF NOT EXISTS`, and a "version 19" fixture reached by rewinding
+        // `user_version` through this crate's own harness already carries the current columns.
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('checkpoint_reference_derivation')
+                    WHERE name = ?1
+                 )",
+                params![column],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("inspect reference derivation columns"))?;
+        if !exists {
+            transaction
+                .execute_batch(alteration)
+                .map_err(sql_error("add reference derivation record column"))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 20")
+        .map_err(sql_error("advance reference derivation schema"))?;
+    transaction
+        .commit()
+        .map_err(sql_error("commit reference derivation record migration"))
 }
 
 fn insert_external_session(
@@ -6637,17 +6803,184 @@ fn read_episode_view(
     }))
 }
 
-/// Whether Candidate Build already placed this Episode's Claim spellings.
-fn claim_references_derived(connection: &Connection, episode_id: WorkEpisodeId) -> Result<bool> {
-    connection
+/// What Candidate Build recorded when it placed this Episode's Claim spellings, if it has.
+fn read_reference_derivation(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Option<ReferenceDerivationRecord>> {
+    let row = connection
         .query_row(
-            "SELECT 1 FROM checkpoint_reference_derivation WHERE episode_id = ?1",
+            "SELECT derived_at_unix_seconds, placed_count, unresolved_count,
+                    ambiguity_json, unresolved_sample_json, reopened
+             FROM checkpoint_reference_derivation WHERE episode_id = ?1",
             [episode_id.to_string()],
-            |_| Ok(()),
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
         )
         .optional()
-        .map(|found| found.is_some())
-        .map_err(sql_error("read Claim reference derivation marker"))
+        .map_err(sql_error("read Claim reference derivation record"))?;
+    let Some((derived_at, placed, unresolved, ambiguity, sample, reopened)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(ReferenceDerivationRecord {
+        placed: usize::try_from(placed).unwrap_or(0),
+        ambiguous: ambiguity
+            .as_deref()
+            .map_or_else(|| Ok(Vec::new()), parse_recorded_ambiguous_mentions)?,
+        unresolved: usize::try_from(unresolved).unwrap_or(0),
+        unresolved_sample: sample
+            .as_deref()
+            .map(|text| {
+                serde_json::from_str::<Vec<String>>(text)
+                    .map_err(json_error("read recorded unresolved spelling sample"))
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        reopened: reopened != 0,
+        derived_at_unix_seconds: derived_at.and_then(|value| u64::try_from(value).ok()),
+    }))
+}
+
+/// Writes or replaces one Episode's derivation record, clearing any reopen request it answers.
+fn write_reference_derivation(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    record: &ReferenceDerivationRecord,
+) -> Result<()> {
+    let ambiguity = serde_json::to_string(
+        &record
+            .ambiguous
+            .iter()
+            .map(|mention| {
+                serde_json::json!({
+                    "spelling": mention.spelling,
+                    "channel": mention.channel.as_str(),
+                    "matches": mention.matches,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(json_error("serialize recorded ambiguous spellings"))?;
+    let sample = serde_json::to_string(&record.unresolved_sample)
+        .map_err(json_error("serialize recorded unresolved spelling sample"))?;
+    transaction
+        .execute(
+            "INSERT INTO checkpoint_reference_derivation (
+                episode_id, derived_at_unix_seconds, placed_count, unresolved_count,
+                ambiguity_json, unresolved_sample_json, reopened
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+             ON CONFLICT (episode_id) DO UPDATE SET
+                derived_at_unix_seconds = excluded.derived_at_unix_seconds,
+                placed_count = excluded.placed_count,
+                unresolved_count = excluded.unresolved_count,
+                ambiguity_json = excluded.ambiguity_json,
+                unresolved_sample_json = excluded.unresolved_sample_json,
+                reopened = 0",
+            params![
+                episode_id.to_string(),
+                record
+                    .derived_at_unix_seconds
+                    .and_then(|value| i64::try_from(value).ok()),
+                i64::try_from(record.placed).unwrap_or(i64::MAX),
+                i64::try_from(record.unresolved).unwrap_or(i64::MAX),
+                ambiguity,
+                sample,
+            ],
+        )
+        .map_err(sql_error("record Claim reference derivation"))?;
+    Ok(())
+}
+
+fn parse_recorded_ambiguous_mentions(text: &str) -> Result<Vec<AmbiguousMention>> {
+    let rows = serde_json::from_str::<Vec<serde_json::Value>>(text)
+        .map_err(json_error("read recorded ambiguous spellings"))?;
+    rows.iter()
+        .map(|row| {
+            let spelling = row
+                .get("spelling")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invariant("recorded ambiguous spelling has no spelling"))?;
+            let channel = row
+                .get("channel")
+                .and_then(serde_json::Value::as_str)
+                .and_then(MentionChannel::parse)
+                .ok_or_else(|| invariant("recorded ambiguous spelling has no readable channel"))?;
+            let matches = row
+                .get("matches")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| invariant("recorded ambiguous spelling has no match count"))?;
+            Ok(AmbiguousMention {
+                spelling: spelling.to_owned(),
+                channel,
+                matches: usize::try_from(matches).unwrap_or(usize::MAX),
+            })
+        })
+        .collect()
+}
+
+/// Whether the checkout now answers any recorded ambiguity differently than it did.
+///
+/// This is the whole re-derivation trigger, and it is stated as an equality rather than as
+/// "resolves now": a spelling that still finds the same number of files has the same answer and
+/// must not cost a rewrite, whereas one that finds a different number — one file, none, or a
+/// different several — is a different question and earns another derivation. An Episode recorded
+/// before the record carried counts has no ambiguity to compare and is therefore never re-derived.
+fn ambiguity_answer_changed(recorded: &[AmbiguousMention], resolver: &ClaimResolver<'_>) -> bool {
+    recorded.iter().any(|mention| {
+        let current = match mention.channel {
+            MentionChannel::Symbol => resolver.resolve_symbol(&mention.spelling),
+            MentionChannel::Path => match ReferenceDerivationRecord::relookup(mention) {
+                Some(candidate) => resolver.resolve_path(&candidate),
+                // A recorded path spelling the scanner no longer reads as a path can only mean the
+                // extension list moved under it. Nothing to re-ask; leave the record alone.
+                None => return false,
+            },
+        };
+        current
+            != MentionResolution::Ambiguous {
+                matches: mention.matches,
+            }
+    })
+}
+
+/// Folds newly derived coordinates into the ones already persisted, without retracting any.
+///
+/// Deduplication is by coordinate — Repository plus locator — and the already persisted draft
+/// wins, so a reviewer never sees a fact's provenance or supporting statement change underneath
+/// them. A coordinate that only the new derivation found is appended; ordering stays the
+/// deterministic coordinate order the first derivation produced.
+fn merge_engineering_references(
+    persisted: &mut Vec<EngineeringReferenceDraft>,
+    derived: &[EngineeringReferenceDraft],
+) {
+    for reference in derived {
+        let known = persisted.iter().any(|existing| {
+            existing.repository_id == reference.repository_id
+                && existing.locator == reference.locator
+        });
+        if !known {
+            persisted.push(reference.clone());
+        }
+    }
+    persisted.sort_by(|left, right| {
+        left.repository_id
+            .to_string()
+            .cmp(&right.repository_id.to_string())
+            .then_with(|| {
+                left.locator
+                    .path()
+                    .as_str()
+                    .cmp(right.locator.path().as_str())
+            })
+    });
 }
 
 /// Every spelling in one Episode a checkout could place, so one `git ls-files` answers the Build.

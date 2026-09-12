@@ -351,7 +351,7 @@ fn assert_runtime_schema_current(root: &Path) {
     // (additive `hook_event`, the `context_usage` reset, the omission-only reset, additive
     // disposition provenance, checkpoint-reminder counters and audit columns) rather than
     // becoming discardable/unsupported versions, so a fresh or rebuilt Runtime always lands on 19.
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
     assert!(sqlite_table_exists(&connection, "auto_confirm_rejection"));
     assert!(sqlite_table_exists(&connection, "task_signal"));
     assert!(sqlite_table_exists(&connection, "hook_event"));
@@ -1022,7 +1022,7 @@ fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state()
 
 #[test]
 fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
-    for version in [10_u32, 20, 999] {
+    for version in [10_u32, 21, 999] {
         let harness = Harness::new();
         let installer = harness.installer("1.2.3");
         installer.setup(&SetupOptions::default()).unwrap();
@@ -1061,7 +1061,7 @@ fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
 
         assert_eq!(
             error.message(),
-            format!("unsupported task runtime schema version {version}; expected 19")
+            format!("unsupported task runtime schema version {version}; expected 20")
         );
         for (path, bytes, mode) in prior {
             assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());

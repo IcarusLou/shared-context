@@ -1379,8 +1379,18 @@ pub struct AssociationRebuildResponse {
     /// budgeted automatic rescan, which never reads history.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relocation_candidates: Vec<ReferenceRelocationCandidate>,
+    /// Episodes whose Claim derivation left an ambiguity and will be asked again on their next
+    /// Candidate Build. Zero on a diagnose-only or budgeted rescan, which change nothing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reopened_reference_derivations: usize,
     pub tree: String,
     pub generation: u64,
+}
+
+/// `skip_serializing_if` for a count whose zero is the ordinary case.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Wall-clock budget for the bounded Graph rescan that follows an interactive Engineering write.
@@ -4237,6 +4247,17 @@ impl Runtime {
         } else {
             Vec::new()
         };
+        // An explicit rebuild is the operator saying "look at the Repositories again". A Claim
+        // spelling that several files answered to is the one derivation result that a changed
+        // checkout can settle, so this is where the door is reopened for it. It does not re-derive
+        // anything here — derivation is Candidate Build work — it only removes the suppression, so
+        // the next Build for that Episode asks even if the file count happens to be unchanged.
+        // A budgeted automatic rescan and a diagnose-only run change nothing.
+        let reopened_reference_derivations = if input.diagnose_only || deadline.is_some() {
+            0
+        } else {
+            self.tasks.reopen_ambiguous_reference_derivations()?
+        };
         Ok(Some(AssociationRebuildResponse {
             diagnose_only: input.diagnose_only,
             stored: !input.diagnose_only,
@@ -4246,6 +4267,7 @@ impl Runtime {
             repositories: repository_summaries,
             status_counts,
             relocation_candidates,
+            reopened_reference_derivations,
             tree: snapshot.metadata.indexed_tree_oid.clone(),
             generation: snapshot.metadata.projection_generation,
         }))

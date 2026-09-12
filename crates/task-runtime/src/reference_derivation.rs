@@ -171,6 +171,18 @@ impl<'a> ClaimResolver<'a> {
         }
     }
 
+    /// Asks the path channel about one spelling.
+    #[must_use]
+    pub fn resolve_path(&self, candidate: &PathCandidate) -> MentionResolution {
+        (self.path)(candidate)
+    }
+
+    /// Asks the type-name channel about one spelling.
+    #[must_use]
+    pub fn resolve_symbol(&self, symbol: &str) -> MentionResolution {
+        (self.symbol)(symbol)
+    }
+
     /// Places nothing; the safe default for a Session with no reachable checkout.
     #[must_use]
     pub const fn nothing() -> ClaimResolver<'static> {
@@ -228,6 +240,76 @@ pub struct ClaimReferenceDerivation {
     pub unresolved_hints: Vec<String>,
     /// Spellings several tracked files answered to, deduplicated and deterministically ordered.
     pub ambiguous_mentions: Vec<AmbiguousMention>,
+}
+
+/// Bound on how many unplaced spellings one Episode's record keeps by name.
+///
+/// The counts are complete; the sample is what makes a count legible to whoever reads it later,
+/// and eight spellings is enough to recognise a pattern without turning a marker row into a log.
+pub const MAX_UNRESOLVED_SAMPLE: usize = 8;
+
+/// What one Episode's recorded derivation attempt found.
+///
+/// This is the record the once-only marker used to be. A bare marker could only say "derived",
+/// which made an ambiguity and a genuine absence the same durable fact; this says which, how
+/// many, and — for the ambiguities — exactly how many files answered each spelling, which is the
+/// one thing a later Build needs in order to decide whether the question has a new answer.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReferenceDerivationRecord {
+    /// Coordinates the derivation placed across every Claim of the Episode.
+    pub placed: usize,
+    /// Spellings several tracked files answered to, with the count that made them ambiguous.
+    pub ambiguous: Vec<AmbiguousMention>,
+    /// Spellings nothing answered to.
+    pub unresolved: usize,
+    /// A bounded sample of [`ReferenceDerivationRecord::unresolved`], by name.
+    pub unresolved_sample: Vec<String>,
+    /// True once an operator asked for this Episode's ambiguities to be looked at again.
+    pub reopened: bool,
+    /// When the recorded derivation ran; `None` for a row written before this was recorded.
+    pub derived_at_unix_seconds: Option<u64>,
+}
+
+impl ReferenceDerivationRecord {
+    /// Folds one Episode's per-Claim derivations into the record that is persisted for it.
+    #[must_use]
+    pub fn from_derivations(derivations: &[DerivedClaimReferences]) -> Self {
+        let mut ambiguous = BTreeSet::new();
+        let mut unresolved_sample = BTreeSet::new();
+        let mut placed = 0;
+        let mut unresolved = 0;
+        for derivation in derivations {
+            placed += derivation.engineering_references.len();
+            ambiguous.extend(derivation.ambiguous_mentions.iter().cloned());
+            // An unresolved hint is every spelling the Claim wrote that no coordinate came out of,
+            // identifiers included: that is exactly the set a reader wants to see a sample of.
+            unresolved += derivation.unresolved_hints.len();
+            unresolved_sample.extend(derivation.unresolved_hints.iter().cloned());
+        }
+        Self {
+            placed,
+            ambiguous: ambiguous.into_iter().collect(),
+            unresolved,
+            unresolved_sample: unresolved_sample
+                .into_iter()
+                .take(MAX_UNRESOLVED_SAMPLE)
+                .collect(),
+            reopened: false,
+            derived_at_unix_seconds: None,
+        }
+    }
+
+    /// Rebuilds the lookup input for one recorded ambiguous spelling.
+    ///
+    /// A path spelling round-trips through the scanner because it is stored the way the Agent
+    /// wrote it, leading separator included; a type name is its own lookup key.
+    #[must_use]
+    pub fn relookup(mention: &AmbiguousMention) -> Option<PathCandidate> {
+        match mention.channel {
+            MentionChannel::Path => hints::scan_text(&mention.spelling).paths.into_iter().next(),
+            MentionChannel::Symbol => None,
+        }
+    }
 }
 
 /// Everything one Episode's Claims name, batched so a single Git query answers the whole Build.
@@ -396,14 +478,21 @@ pub fn derive_claim_references(
     let mut ambiguous = BTreeSet::new();
     let mut placed = BTreeMap::<(String, String), ResolvedMentions>::new();
     for (order, candidate) in paths.iter().enumerate() {
-        match (resolver.path)(candidate) {
+        match resolver.resolve_path(candidate) {
             MentionResolution::Placed(reference) => {
                 absorb_reference(&mut placed, reference, order);
             }
             MentionResolution::Ambiguous { matches } => {
                 hints.insert(candidate.hint_text());
                 ambiguous.insert(AmbiguousMention {
-                    spelling: candidate.path.clone(),
+                    // The leading separator is kept so the spelling round-trips through the
+                    // scanner: a re-lookup of a host-absolute path must take the absolute branch,
+                    // or a recorded ambiguity would be re-checked against the wrong question.
+                    spelling: if candidate.absolute {
+                        format!("/{}", candidate.path)
+                    } else {
+                        candidate.path.clone()
+                    },
                     channel: MentionChannel::Path,
                     matches,
                 });
@@ -422,7 +511,7 @@ pub fn derive_claim_references(
             if placed.len() == MAX_SYMBOL_DERIVED_REFERENCES_PER_CLAIM {
                 break;
             }
-            match (resolver.symbol)(symbol) {
+            match resolver.resolve_symbol(symbol) {
                 MentionResolution::Placed(reference) => {
                     absorb_reference(&mut placed, reference, paths.len() + offset);
                 }

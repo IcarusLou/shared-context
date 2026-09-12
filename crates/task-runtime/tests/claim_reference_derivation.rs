@@ -710,3 +710,274 @@ fn extraction_is_pure_without_a_resolver() {
         vec!["assembleDebug".to_owned()]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The derivation record, and the two ways an ambiguity gets a second look
+// ---------------------------------------------------------------------------------------------
+
+/// One Checkpoint whose single Claim names an ambiguous file and an unplaceable one.
+fn ambiguous_episode(runtime: &TaskRuntime, locator: ExternalSessionLocator) -> WorkEpisodeId {
+    runtime
+        .submit_agent_checkpoint(&AgentCheckpointSubmission {
+            locator,
+            claims: vec![claim(
+                ContextKind::Issue,
+                "Manager.kt:11 注册顺序有误。",
+                "Missing.kt:4 已经不在仓库里。",
+                "两端同名实现互相覆盖。",
+            )],
+            unknowns: Vec::new(),
+        })
+        .unwrap()
+        .episode
+        .episode
+        .episode_id
+}
+
+/// The record is the whole point: what was placed, what was ambiguous with how many files
+/// answering, and a sample of what nothing answered to.
+#[test]
+fn the_derivation_record_says_what_was_placed_ambiguous_and_unplaced() {
+    let checkout = probe_checkout(&["one/Manager.kt", "two/Manager.kt", "only/Alpha.kt"]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derivation-record");
+    let episode_id = ambiguous_episode(&runtime, locator);
+    derive_with_checkout(&runtime, episode_id, checkout.path());
+
+    let record = runtime
+        .reference_derivation_record(episode_id)
+        .unwrap()
+        .expect("the first derivation records what it found");
+    assert_eq!(record.placed, 0);
+    assert_eq!(record.ambiguous.len(), 1);
+    assert_eq!(record.ambiguous[0].spelling, "Manager.kt");
+    assert_eq!(record.ambiguous[0].matches, 2);
+    assert!(record.unresolved >= 2, "{record:?}");
+    assert!(
+        record
+            .unresolved_sample
+            .iter()
+            .any(|spelling| spelling == "Missing.kt:4"),
+        "{:?}",
+        record.unresolved_sample
+    );
+    assert!(record.derived_at_unix_seconds.is_some());
+    assert!(!record.reopened);
+}
+
+/// An Episode that left an ambiguity stays open to being asked again, and the answer it gets
+/// against an unchanged checkout is the answer it already has: nothing is rewritten.
+#[test]
+fn an_unchanged_checkout_replays_the_recorded_answer_instead_of_rewriting_it() {
+    let checkout = probe_checkout(&["one/Manager.kt", "two/Manager.kt"]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derivation-idempotent");
+    let episode_id = ambiguous_episode(&runtime, locator);
+    let first = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert_eq!(first[0].ambiguous_mentions.len(), 1);
+    let recorded = runtime.reference_derivation_record(episode_id).unwrap();
+
+    assert!(
+        runtime
+            .pending_claim_reference_candidates(episode_id)
+            .unwrap()
+            .is_some(),
+        "a recorded ambiguity is a question the checkout may answer differently later"
+    );
+    let again = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert_eq!(
+        again[0].engineering_references,
+        first[0].engineering_references
+    );
+    assert_eq!(again[0].topic_key_hint, first[0].topic_key_hint);
+    assert_eq!(again[0].unresolved_hints, first[0].unresolved_hints);
+    assert!(
+        again[0].ambiguous_mentions.is_empty(),
+        "the same ambiguity is the same answer, so this is a replay, not a derivation"
+    );
+    assert_eq!(
+        runtime.reference_derivation_record(episode_id).unwrap(),
+        recorded,
+        "a replay leaves the record byte-identical, timestamp included"
+    );
+}
+
+/// The relaxation itself: the checkout loses the duplicate, so the spelling has one answer now.
+#[test]
+fn an_ambiguity_the_checkout_has_since_settled_is_derived_on_the_next_build() {
+    let checkout = probe_checkout(&["one/Manager.kt", "two/Manager.kt"]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derivation-settled");
+    let episode_id = ambiguous_episode(&runtime, locator);
+    assert!(
+        derive_with_checkout(&runtime, episode_id, checkout.path())[0]
+            .engineering_references
+            .is_empty()
+    );
+
+    git(checkout.path(), &["rm", "--quiet", "two/Manager.kt"]);
+    let settled = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert_eq!(
+        settled[0]
+            .engineering_references
+            .iter()
+            .map(|reference| reference.locator.path().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["one/Manager.kt".to_owned()],
+        "an ambiguity is a question, and the checkout now has one answer to it"
+    );
+    let record = runtime
+        .reference_derivation_record(episode_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.placed, 1);
+    assert!(
+        record.ambiguous.is_empty(),
+        "nothing is ambiguous any more, so the Episode is closed for good"
+    );
+    assert!(
+        runtime
+            .pending_claim_reference_candidates(episode_id)
+            .unwrap()
+            .is_none()
+    );
+
+    // The persisted Claim carries the coordinate, and asking again changes nothing.
+    let persisted = runtime.read_work_episode(episode_id).unwrap().unwrap();
+    assert_eq!(
+        persisted.checkpoints[0].claims[0]
+            .engineering_references
+            .len(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .derive_episode_claim_references(episode_id, &ClaimResolver::nothing())
+            .unwrap()[0]
+            .engineering_references,
+        settled[0].engineering_references
+    );
+}
+
+/// A re-derivation adds; it never takes a coordinate back. A checkout that lost the file the
+/// first derivation placed does not un-place it.
+#[test]
+fn a_re_derivation_never_retracts_a_coordinate_a_reviewer_may_have_seen() {
+    let checkout = probe_checkout(&["one/Manager.kt", "two/Manager.kt", "only/Alpha.kt"]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derivation-monotone");
+    let episode_id = runtime
+        .submit_agent_checkpoint(&AgentCheckpointSubmission {
+            locator,
+            claims: vec![claim(
+                ContextKind::Issue,
+                "Alpha.kt:7 与 Manager.kt:11 的注册顺序冲突。",
+                "两端同名实现互相覆盖。",
+                "冲突路径上没有守卫。",
+            )],
+            unknowns: Vec::new(),
+        })
+        .unwrap()
+        .episode
+        .episode
+        .episode_id;
+    let first = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert_eq!(
+        first[0]
+            .engineering_references
+            .iter()
+            .map(|reference| reference.locator.path().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["only/Alpha.kt".to_owned()]
+    );
+
+    git(checkout.path(), &["rm", "--quiet", "only/Alpha.kt"]);
+    git(checkout.path(), &["rm", "--quiet", "two/Manager.kt"]);
+    let again = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert_eq!(
+        again[0]
+            .engineering_references
+            .iter()
+            .map(|reference| reference.locator.path().as_str().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["one/Manager.kt".to_owned(), "only/Alpha.kt".to_owned()],
+        "the settled ambiguity is added and the deleted file's coordinate stays"
+    );
+}
+
+/// The operator's lever: reopening makes the next Build ask again even when nothing changed.
+#[test]
+fn reopening_asks_the_checkout_again_and_answering_clears_the_request() {
+    let checkout = probe_checkout(&["one/Manager.kt", "two/Manager.kt"]);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derivation-reopen");
+    let episode_id = ambiguous_episode(&runtime, locator);
+    derive_with_checkout(&runtime, episode_id, checkout.path());
+
+    assert_eq!(runtime.reopen_ambiguous_reference_derivations().unwrap(), 1);
+    assert_eq!(
+        runtime.reopen_ambiguous_reference_derivations().unwrap(),
+        0,
+        "already reopened is not reopened again"
+    );
+    assert!(
+        runtime
+            .reference_derivation_record(episode_id)
+            .unwrap()
+            .unwrap()
+            .reopened
+    );
+
+    let reopened = derive_with_checkout(&runtime, episode_id, checkout.path());
+    assert_eq!(
+        reopened[0].ambiguous_mentions.len(),
+        1,
+        "a reopened Episode is derived again even though the checkout says the same thing"
+    );
+    let record = runtime
+        .reference_derivation_record(episode_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        !record.reopened,
+        "the request is answered, so it is cleared"
+    );
+    assert_eq!(record.ambiguous.len(), 1);
+}
+
+/// A clean derivation is closed for good: no record of a question means no lookup, ever again.
+#[test]
+fn a_clean_derivation_is_never_reopened_and_never_asks_git_again() {
+    let checkout = probe_checkout(FIXTURE_FILES);
+    let root = TempDir::new().unwrap();
+    let (runtime, locator) = open_runtime(&root, "derivation-clean");
+    let episode_id = runtime
+        .submit_agent_checkpoint(&AgentCheckpointSubmission {
+            locator,
+            claims: vec![claim(
+                ContextKind::Issue,
+                "PoiEntranceAssem.kt:118 提前注册。",
+                "兜底被跳过。",
+                "CommentBottomBarManager.kt:96 的兜底被跳过。",
+            )],
+            unknowns: Vec::new(),
+        })
+        .unwrap()
+        .episode
+        .episode
+        .episode_id;
+    derive_with_checkout(&runtime, episode_id, checkout.path());
+    let record = runtime
+        .reference_derivation_record(episode_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.placed, 2);
+    assert!(record.ambiguous.is_empty());
+    assert_eq!(runtime.reopen_ambiguous_reference_derivations().unwrap(), 0);
+    assert!(
+        runtime
+            .pending_claim_reference_candidates(episode_id)
+            .unwrap()
+            .is_none()
+    );
+}
