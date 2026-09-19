@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId, CaptureId,
-    CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft, Error,
-    ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot, RepositoryId, Result, RevisionId,
-    SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId,
-    TaskSessionId, TaskSignalKind, WorkEpisodeId, WorkObservationId,
+    AgentCheckpointId, Applicability, ArtifactLocator, CandidateBuildId, CandidateId,
+    CheckpointClaimId, ConfirmationId, ContextId, ContextRelationKind, ContextRevisionDraft,
+    EngineeringReferenceDraft, Error, ErrorKind, EvidenceId, EvidenceSnapshotDraft, IntentSnapshot,
+    ProposedSpaceGroupKey, RepositoryId, Result, RevisionId, SignalId, SpaceId,
+    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSignalKind, WorkEpisodeId, WorkObservationId,
 };
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -29,6 +30,27 @@ fn require_text_items(values: &[String], field: &str) -> Result<()> {
         if !seen.insert(value) {
             return Err(invalid(format!("{field} must not contain duplicates")));
         }
+    }
+    Ok(())
+}
+
+fn validate_engineering_reference_drafts(
+    references: &[EngineeringReferenceDraft],
+    field: &str,
+) -> Result<()> {
+    for (index, reference) in references.iter().enumerate() {
+        reference.validate()?;
+        if references[..index].contains(reference) {
+            return Err(invalid(format!("{field} must not contain duplicates")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_unknowns(values: &[CheckpointUnknown], field: &str) -> Result<()> {
+    require_unique(values, field)?;
+    for unknown in values {
+        unknown.validate(field)?;
     }
     Ok(())
 }
@@ -117,32 +139,12 @@ impl NonLocatingSignalRef {
     }
 }
 
-/// Stable repository-scoped Artifact coordinates used by Capture contracts.
+/// Stable repository-scoped Artifact coordinates used by checkpoint contracts.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
     pub repository_id: RepositoryId,
     pub locator: ArtifactLocator,
-}
-
-/// Exact Task ownership carried by one redacted Capture source.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CaptureSourceRef {
-    pub capture_id: CaptureId,
-    pub task_session_id: TaskSessionId,
-    pub task_id: TaskId,
-}
-
-impl CaptureSourceRef {
-    fn validate_owner(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
-        if self.task_session_id != task_session_id || self.task_id != task_id {
-            return Err(invalid(
-                "capture_source_ref must belong to the Work Episode Task",
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl ArtifactRef {
@@ -162,7 +164,7 @@ pub struct ContextRevisionRef {
 /// Typed Evidence provenance that never contains raw payload text.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CaptureEvidenceRef {
+pub enum CheckpointEvidenceRef {
     Observation {
         observation_id: WorkObservationId,
     },
@@ -180,7 +182,6 @@ pub enum CaptureEvidenceRef {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "source_kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkSourceRef {
-    Capture(CaptureSourceRef),
     TaskSignal(NonLocatingSignalRef),
     Artifact(ArtifactRef),
     ContextRevision(ContextRevisionRef),
@@ -194,7 +195,6 @@ pub enum WorkSourceRef {
 impl WorkSourceRef {
     fn validate_owner(&self, task_session_id: TaskSessionId, task_id: TaskId) -> Result<()> {
         match self {
-            Self::Capture(capture) => capture.validate_owner(task_session_id, task_id),
             Self::TaskSignal(signal) => signal.validate_owner(task_session_id, task_id),
             Self::Artifact(artifact) => artifact.validate(),
             Self::ContextRevision(_) | Self::ContextEvidence { .. } => Ok(()),
@@ -218,16 +218,6 @@ pub enum ArtifactAction {
     Modified,
 }
 
-/// Bounded normalized Breadcrumb category.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NormalizedBreadcrumbKind {
-    Exploration,
-    Implementation,
-    Validation,
-    Decision,
-}
-
 /// Normalized test result without raw tool output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,10 +231,6 @@ pub enum TestOutcomeStatus {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NormalizedWorkObservation {
-    Breadcrumb {
-        category: NormalizedBreadcrumbKind,
-        summary: String,
-    },
     TestOutcome {
         test_name: String,
         status: TestOutcomeStatus,
@@ -270,7 +256,7 @@ pub enum NormalizedWorkObservation {
     },
     Validation {
         conclusion: String,
-        evidence_refs: Vec<CaptureEvidenceRef>,
+        evidence_refs: Vec<CheckpointEvidenceRef>,
     },
     InlineValidation {
         evidence: EvidenceSnapshotDraft,
@@ -283,7 +269,6 @@ pub enum NormalizedWorkObservation {
 impl NormalizedWorkObservation {
     fn validate(&self, field: &str) -> Result<()> {
         match self {
-            Self::Breadcrumb { summary, .. } => require_text(summary, &format!("{field}.summary")),
             Self::TestOutcome {
                 test_name, summary, ..
             } => {
@@ -559,13 +544,13 @@ impl WorkEpisode {
 /// Structured unresolved engineering question retained by a Checkpoint or Candidate.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CaptureUnknown {
+pub struct CheckpointUnknown {
     pub statement: String,
     pub blocking: bool,
     pub recheck_when: Vec<String>,
 }
 
-impl CaptureUnknown {
+impl CheckpointUnknown {
     fn validate(&self, field: &str) -> Result<()> {
         require_text(&self.statement, &format!("{field}.statement"))?;
         require_text_items(&self.recheck_when, &format!("{field}.recheck_when"))
@@ -573,8 +558,8 @@ impl CaptureUnknown {
 }
 
 /// One server-identified structured engineering claim.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(from = "CheckpointClaimWire")]
 pub struct CheckpointClaim {
     pub claim_id: CheckpointClaimId,
     pub context_kind_hint: Option<crate::ContextKind>,
@@ -582,11 +567,108 @@ pub struct CheckpointClaim {
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
-    pub assumptions: Vec<String>,
-    pub recheck_when: Vec<String>,
-    pub evidence_refs: Vec<CaptureEvidenceRef>,
-    pub artifact_refs: Vec<ArtifactRef>,
-    pub related_contexts: Vec<ContextRevisionRef>,
+    pub evidence_refs: Vec<CheckpointEvidenceRef>,
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
+}
+
+// Retired Claim fields remain empty wire keys for stored checkpoints and old-reader rollback.
+// A sequence visitor rejects nonempty input as a data error, without retaining legacy values.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointClaimWire {
+    claim_id: CheckpointClaimId,
+    context_kind_hint: Option<crate::ContextKind>,
+    topic_key_hint: Option<String>,
+    statement: String,
+    rationale: String,
+    applicability: Applicability,
+    #[serde(rename = "assumptions", deserialize_with = "empty_claim_field")]
+    _assumptions: [(); 0],
+    #[serde(rename = "recheck_when", deserialize_with = "empty_claim_field")]
+    _recheck_when: [(); 0],
+    evidence_refs: Vec<CheckpointEvidenceRef>,
+    #[serde(rename = "artifact_refs", deserialize_with = "empty_claim_field")]
+    _artifact_refs: [(); 0],
+    #[serde(default, rename = "relations", deserialize_with = "empty_claim_field")]
+    _relations: [(); 0],
+    #[serde(default)]
+    engineering_references: Vec<EngineeringReferenceDraft>,
+    #[serde(rename = "related_contexts", deserialize_with = "empty_claim_field")]
+    _related_contexts: [(); 0],
+}
+
+fn empty_claim_field<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<[(); 0], D::Error> {
+    struct EmptyClaimField;
+
+    impl<'de> serde::de::Visitor<'de> for EmptyClaimField {
+        type Value = [(); 0];
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an empty retired checkpoint Claim field")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom(
+                    "retired checkpoint Claim fields must be empty",
+                ));
+            }
+            Ok([])
+        }
+    }
+
+    deserializer.deserialize_seq(EmptyClaimField)
+}
+
+impl From<CheckpointClaimWire> for CheckpointClaim {
+    fn from(wire: CheckpointClaimWire) -> Self {
+        Self {
+            claim_id: wire.claim_id,
+            context_kind_hint: wire.context_kind_hint,
+            topic_key_hint: wire.topic_key_hint,
+            statement: wire.statement,
+            rationale: wire.rationale,
+            applicability: wire.applicability,
+            evidence_refs: wire.evidence_refs,
+            engineering_references: wire.engineering_references,
+        }
+    }
+}
+
+impl Serialize for CheckpointClaim {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let has_references = !self.engineering_references.is_empty();
+        let mut wire =
+            serializer.serialize_struct("CheckpointClaim", 12 + usize::from(has_references))?;
+        // Keep the old order as well as the empty keys: derivation rewrites checkpoint_json.
+        let empty: [(); 0] = [];
+        wire.serialize_field("claim_id", &self.claim_id)?;
+        wire.serialize_field("context_kind_hint", &self.context_kind_hint)?;
+        wire.serialize_field("topic_key_hint", &self.topic_key_hint)?;
+        wire.serialize_field("statement", &self.statement)?;
+        wire.serialize_field("rationale", &self.rationale)?;
+        wire.serialize_field("applicability", &self.applicability)?;
+        wire.serialize_field("assumptions", &empty)?;
+        wire.serialize_field("recheck_when", &empty)?;
+        wire.serialize_field("evidence_refs", &self.evidence_refs)?;
+        wire.serialize_field("artifact_refs", &empty)?;
+        wire.serialize_field("relations", &empty)?;
+        if has_references {
+            wire.serialize_field("engineering_references", &self.engineering_references)?;
+        }
+        wire.serialize_field("related_contexts", &empty)?;
+        wire.end()
+    }
 }
 
 impl CheckpointClaim {
@@ -595,18 +677,14 @@ impl CheckpointClaim {
     /// # Errors
     ///
     /// Returns an input error for missing statement/rationale/Evidence or invalid references.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
         context_kind_hint: Option<crate::ContextKind>,
         topic_key_hint: Option<String>,
         statement: impl Into<String>,
         rationale: impl Into<String>,
         applicability: Applicability,
-        assumptions: Vec<String>,
-        recheck_when: Vec<String>,
-        evidence_refs: Vec<CaptureEvidenceRef>,
-        artifact_refs: Vec<ArtifactRef>,
-        related_contexts: Vec<ContextRevisionRef>,
+        evidence_refs: Vec<CheckpointEvidenceRef>,
+        engineering_references: Vec<EngineeringReferenceDraft>,
     ) -> Result<Self> {
         let claim = Self {
             claim_id: CheckpointClaimId::new(),
@@ -615,11 +693,8 @@ impl CheckpointClaim {
             statement: statement.into(),
             rationale: rationale.into(),
             applicability,
-            assumptions,
-            recheck_when,
             evidence_refs,
-            artifact_refs,
-            related_contexts,
+            engineering_references,
         };
         claim.validate("checkpoint_claim")?;
         Ok(claim)
@@ -633,17 +708,14 @@ impl CheckpointClaim {
         require_text(&self.rationale, &format!("{field}.rationale"))?;
         self.applicability
             .validate(&format!("{field}.applicability"))?;
-        require_text_items(&self.assumptions, &format!("{field}.assumptions"))?;
-        require_text_items(&self.recheck_when, &format!("{field}.recheck_when"))?;
         if self.evidence_refs.is_empty() {
             return Err(invalid(format!("{field}.evidence_refs must not be empty")));
         }
         require_unique(&self.evidence_refs, &format!("{field}.evidence_refs"))?;
-        require_unique(&self.artifact_refs, &format!("{field}.artifact_refs"))?;
-        for artifact in &self.artifact_refs {
-            artifact.validate()?;
-        }
-        require_unique(&self.related_contexts, &format!("{field}.related_contexts"))
+        validate_engineering_reference_drafts(
+            &self.engineering_references,
+            &format!("{field}.engineering_references"),
+        )
     }
 }
 
@@ -657,7 +729,7 @@ pub struct AgentCheckpoint {
     pub task_id: TaskId,
     pub intent_revision_id: TaskIntentRevisionId,
     pub claims: Vec<CheckpointClaim>,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
 }
 
 impl AgentCheckpoint {
@@ -670,7 +742,7 @@ impl AgentCheckpoint {
         episode: &WorkEpisode,
         intent_revision_id: TaskIntentRevisionId,
         claims: Vec<CheckpointClaim>,
-        unknowns: Vec<CaptureUnknown>,
+        unknowns: Vec<CheckpointUnknown>,
     ) -> Result<Self> {
         let checkpoint = Self {
             checkpoint_id: AgentCheckpointId::new(),
@@ -729,11 +801,11 @@ impl AgentCheckpoint {
                 return Err(invalid("agent_checkpoint.claims must not repeat Claims"));
             }
             if claim.evidence_refs.iter().any(|evidence| match evidence {
-                CaptureEvidenceRef::Observation { observation_id } => {
+                CheckpointEvidenceRef::Observation { observation_id } => {
                     !observation_ids.contains(observation_id)
                 }
-                CaptureEvidenceRef::TaskSignal { signal_id } => !signal_ids.contains(signal_id),
-                CaptureEvidenceRef::ContextEvidence { .. } => false,
+                CheckpointEvidenceRef::TaskSignal { signal_id } => !signal_ids.contains(signal_id),
+                CheckpointEvidenceRef::ContextEvidence { .. } => false,
             }) {
                 return Err(invalid(
                     "agent_checkpoint Evidence must belong to the source Work Episode when Task-local",
@@ -756,6 +828,8 @@ pub struct CandidateBuilderProvenance {
     pub source_episode: WorkEpisodeRef,
     pub checkpoint_ids: Vec<AgentCheckpointId>,
     pub observation_ids: Vec<WorkObservationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
 }
 
 impl CandidateBuilderProvenance {
@@ -775,6 +849,7 @@ impl CandidateBuilderProvenance {
             source_episode,
             checkpoint_ids,
             observation_ids,
+            engineering_references: Vec::new(),
         };
         provenance.validate()?;
         Ok(provenance)
@@ -793,6 +868,10 @@ impl CandidateBuilderProvenance {
         require_unique(
             &self.observation_ids,
             "candidate_builder_provenance.observation_ids",
+        )?;
+        validate_engineering_reference_drafts(
+            &self.engineering_references,
+            "candidate_builder_provenance.engineering_references",
         )
     }
 }
@@ -838,6 +917,23 @@ pub enum CandidateAssessmentPath {
     ContextFullText {
         matched_terms: Vec<String>,
     },
+    /// Repository identifiers both the Candidate and the target spell out in their own prose.
+    ///
+    /// Two Claims can describe the same defect in different natural languages and share almost no
+    /// statement tokens, yet both name `SearchProductAnchorAssem`. The shared spelling is an
+    /// engineering-strength signal that survives translation and rewording.
+    SharedIdentifier {
+        identifiers: Vec<String>,
+    },
+    /// One conclusion restated against an accepted Context that carries no matching topic key.
+    ///
+    /// The topic key is optional, so the strongest duplicate path — statement equality on one
+    /// topic — cannot see a Task that recorded the same conclusion in its own words without ever
+    /// typing a topic. Normalized statement overlap can: rewrites of one conclusion sit far above
+    /// unrelated pairs, and this path records where in that band the two Claims met.
+    NearDuplicateStatement {
+        similarity_basis_points: u64,
+    },
     ScopeOverlap {
         domains: Vec<String>,
         platforms: Vec<String>,
@@ -871,6 +967,24 @@ impl CandidateAssessmentPath {
                     return Err(invalid(format!("{field}.matched_terms must not be empty")));
                 }
                 require_text_items(matched_terms, &format!("{field}.matched_terms"))
+            }
+            Self::NearDuplicateStatement {
+                similarity_basis_points,
+            } => {
+                if *similarity_basis_points == 0 || *similarity_basis_points > 10_000 {
+                    return Err(invalid(format!(
+                        "{field}.similarity_basis_points must be between 1 and 10000"
+                    )));
+                }
+                Ok(())
+            }
+            Self::SharedIdentifier { identifiers } => {
+                if identifiers.len() < 2 {
+                    return Err(invalid(format!(
+                        "{field}.identifiers requires at least two shared identifiers"
+                    )));
+                }
+                require_text_items(identifiers, &format!("{field}.identifiers"))
             }
             Self::ScopeOverlap {
                 domains,
@@ -919,15 +1033,41 @@ impl CandidateRelationAssessment {
         }
         require_text_items(&self.reasons, &format!("{field}.reasons"))?;
         if self.relation == CandidateAssessmentRelation::ExactDuplicate
-            && !self
-                .paths
-                .contains(&CandidateAssessmentPath::CanonicalDraftEquality)
+            && !self.claims_a_duplicate_path()
         {
             return Err(invalid(format!(
-                "{field}.exact_duplicate requires canonical draft equality"
+                "{field}.exact_duplicate requires canonical draft equality, statement equality on \
+                 one topic key, or a near-duplicate statement against an accepted Context"
             )));
         }
         Ok(())
+    }
+
+    /// Whether the recorded paths support calling this assessment an exact duplicate.
+    ///
+    /// Three paths reach that conclusion, and no other combination does: the whole canonical draft
+    /// equals the revision, the statement equals it under one shared topic key, or the statement
+    /// restates an accepted Context closely enough to sit in the measured near-duplicate band.
+    fn claims_a_duplicate_path(&self) -> bool {
+        if self
+            .paths
+            .contains(&CandidateAssessmentPath::CanonicalDraftEquality)
+        {
+            return true;
+        }
+        if self
+            .paths
+            .contains(&CandidateAssessmentPath::StatementEquality)
+            && self
+                .paths
+                .iter()
+                .any(|path| matches!(path, CandidateAssessmentPath::TopicEquality { .. }))
+        {
+            return true;
+        }
+        self.paths
+            .iter()
+            .any(|path| matches!(path, CandidateAssessmentPath::NearDuplicateStatement { .. }))
     }
 }
 
@@ -1072,6 +1212,12 @@ pub enum CandidateSpaceRecommendationPath {
     IntentConflict {
         head_count: usize,
     },
+    ProposedFromTaskIntentRevision {
+        proposed_space_group_key: ProposedSpaceGroupKey,
+    },
+    ProposedSpaceGroupResolved {
+        proposed_space_group_key: ProposedSpaceGroupKey,
+    },
     ProposedFromCandidate,
     ManualReview,
 }
@@ -1102,7 +1248,10 @@ impl CandidateSpaceRecommendationPath {
                 }
                 Ok(())
             }
-            Self::ProposedFromCandidate | Self::ManualReview => Ok(()),
+            Self::ProposedFromTaskIntentRevision { .. }
+            | Self::ProposedSpaceGroupResolved { .. }
+            | Self::ProposedFromCandidate
+            | Self::ManualReview => Ok(()),
         }
     }
 }
@@ -1121,6 +1270,8 @@ pub enum CandidateSpaceRecommendation {
     },
     ProposedNewSpaceIntent {
         recommendation_id: SpaceRecommendationId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposed_space_group_key: Option<ProposedSpaceGroupKey>,
         proposed_new_space_intent: IntentSnapshot,
         rationale: String,
         confidence: CandidateConfidence,
@@ -1162,12 +1313,39 @@ impl CandidateSpaceRecommendation {
         rationale: impl Into<String>,
         confidence: CandidateConfidence,
     ) -> Self {
+        Self::proposed_new_for_group_with_paths(
+            fallback_proposed_space_group_key(&intent),
+            intent,
+            rationale,
+            confidence,
+            vec![CandidateSpaceRecommendationPath::ProposedFromCandidate],
+        )
+    }
+
+    /// Recommends one proposed Space Intent for an exact Task Intent revision.
+    pub fn proposed_new_for_group(
+        proposed_space_group_key: ProposedSpaceGroupKey,
+        intent: IntentSnapshot,
+        rationale: impl Into<String>,
+        confidence: CandidateConfidence,
+    ) -> Self {
         let rationale = rationale.into();
-        let paths = vec![CandidateSpaceRecommendationPath::ProposedFromCandidate];
-        let recommendation_id =
-            stable_recommendation_id(&("proposed_new", &intent, &rationale, &confidence, &paths));
+        let paths = vec![
+            CandidateSpaceRecommendationPath::ProposedFromTaskIntentRevision {
+                proposed_space_group_key,
+            },
+        ];
+        let recommendation_id = stable_recommendation_id(&(
+            "proposed_new",
+            proposed_space_group_key,
+            &intent,
+            &rationale,
+            &confidence,
+            &paths,
+        ));
         Self::ProposedNewSpaceIntent {
             recommendation_id,
+            proposed_space_group_key: Some(proposed_space_group_key),
             proposed_new_space_intent: intent,
             rationale,
             confidence,
@@ -1209,11 +1387,35 @@ impl CandidateSpaceRecommendation {
         confidence: CandidateConfidence,
         paths: Vec<CandidateSpaceRecommendationPath>,
     ) -> Self {
+        Self::proposed_new_for_group_with_paths(
+            fallback_proposed_space_group_key(&intent),
+            intent,
+            rationale,
+            confidence,
+            paths,
+        )
+    }
+
+    /// Recommends one Task-Intent-grouped Space Intent with explicit derived paths.
+    pub fn proposed_new_for_group_with_paths(
+        proposed_space_group_key: ProposedSpaceGroupKey,
+        intent: IntentSnapshot,
+        rationale: impl Into<String>,
+        confidence: CandidateConfidence,
+        paths: Vec<CandidateSpaceRecommendationPath>,
+    ) -> Self {
         let rationale = rationale.into();
-        let recommendation_id =
-            stable_recommendation_id(&("proposed_new", &intent, &rationale, &confidence, &paths));
+        let recommendation_id = stable_recommendation_id(&(
+            "proposed_new",
+            proposed_space_group_key,
+            &intent,
+            &rationale,
+            &confidence,
+            &paths,
+        ));
         Self::ProposedNewSpaceIntent {
             recommendation_id,
+            proposed_space_group_key: Some(proposed_space_group_key),
             proposed_new_space_intent: intent,
             rationale,
             confidence,
@@ -1234,6 +1436,7 @@ impl CandidateSpaceRecommendation {
                 validate_recommendation_paths(paths, field)
             }
             Self::ProposedNewSpaceIntent {
+                proposed_space_group_key,
                 proposed_new_space_intent,
                 rationale,
                 confidence,
@@ -1243,7 +1446,26 @@ impl CandidateSpaceRecommendation {
                 proposed_new_space_intent.validate()?;
                 require_text(rationale, &format!("{field}.rationale"))?;
                 confidence.validate(&format!("{field}.confidence"))?;
-                validate_recommendation_paths(paths, field)
+                validate_recommendation_paths(paths, field)?;
+                let grouped_path_key = paths.iter().find_map(|path| match path {
+                    CandidateSpaceRecommendationPath::ProposedFromTaskIntentRevision {
+                        proposed_space_group_key,
+                    } => Some(*proposed_space_group_key),
+                    _ => None,
+                });
+                if paths.iter().any(|path| {
+                    matches!(
+                        path,
+                        CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved { .. }
+                    )
+                }) || grouped_path_key.is_some_and(|path_key| {
+                    proposed_space_group_key.is_none_or(|group_key| path_key != group_key)
+                }) {
+                    return Err(invalid(format!(
+                        "{field}.paths disagree with the proposed Space group"
+                    )));
+                }
+                Ok(())
             }
         }
     }
@@ -1253,6 +1475,12 @@ fn stable_recommendation_id(value: &impl Serialize) -> SpaceRecommendationId {
     let bytes = serde_json::to_vec(value)
         .expect("serializing Candidate Space recommendation identity cannot fail");
     SpaceRecommendationId::from_stable_seed(&bytes)
+}
+
+fn fallback_proposed_space_group_key(intent: &IntentSnapshot) -> ProposedSpaceGroupKey {
+    let seed = serde_json::to_vec(intent)
+        .expect("serializing fallback proposed Space group key cannot fail");
+    ProposedSpaceGroupKey::from_stable_seed(&seed)
 }
 
 fn validate_recommendation_paths(
@@ -1333,6 +1561,24 @@ pub enum CandidateReviewStatus {
     Confirmed,
 }
 
+/// How wide a Candidate Review listing reaches.
+///
+/// Ownership is unaffected either way: a Review is confirmed, discarded and edited only through
+/// the Task that owns it, and the wider scope is read-only. It exists because concurrent Agents
+/// sharing one `external_session_id` hold parallel Tasks, and a Candidate left Pending by a
+/// sibling Task used to be invisible from every other Task — nobody could see it to act on it.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateReviewScope {
+    /// Only the locator's exact `ActiveTask`.
+    #[default]
+    Task,
+    /// Every Task of the locator's `ExternalSession`, read-only.
+    Session,
+}
+
 /// Safe reason why a Candidate Review is visible but not ready for a decision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -1354,10 +1600,12 @@ pub struct CandidateReviewView {
     pub checkpoint_id: AgentCheckpointId,
     pub claim_id: CheckpointClaimId,
     pub content: ContextRevisionDraft,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReferenceDraft>,
     pub analysis: CandidateAnalysis,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
     pub confidence: CandidateConfidence,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
     pub candidate_status: AutomaticCandidateStatus,
     pub review_status: CandidateReviewStatus,
     pub review_version: u64,
@@ -1383,13 +1631,11 @@ impl CandidateReviewView {
     /// Review that could be mistaken for trusted or ready data.
     pub fn validate(&self) -> Result<()> {
         self.content.validate()?;
+        validate_engineering_reference_drafts(&self.engineering_references, "review.references")?;
         self.analysis.validate()?;
         validate_recommendations(&self.space_recommendations)?;
         self.confidence.validate("candidate_review.confidence")?;
-        require_unique(&self.unknowns, "candidate_review.unknowns")?;
-        for unknown in &self.unknowns {
-            unknown.validate("candidate_review.unknown")?;
-        }
+        validate_checkpoint_unknowns(&self.unknowns, "candidate_review.unknowns")?;
         if self.review_version == 0
             || self.expires_at_unix_seconds <= self.created_at_unix_seconds
             || !self.untrusted_data
@@ -1507,7 +1753,7 @@ pub struct AutomaticContextCandidate {
     pub analysis: CandidateAnalysis,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
     pub confidence: CandidateConfidence,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
     pub status: AutomaticCandidateStatus,
 }
 
@@ -1527,7 +1773,7 @@ impl AutomaticContextCandidate {
         analysis: CandidateAnalysis,
         space_recommendations: Vec<CandidateSpaceRecommendation>,
         confidence: CandidateConfidence,
-        unknowns: Vec<CaptureUnknown>,
+        unknowns: Vec<CheckpointUnknown>,
         status: AutomaticCandidateStatus,
     ) -> Result<Self> {
         let candidate = Self {
@@ -1560,7 +1806,7 @@ impl AutomaticContextCandidate {
         analysis: CandidateAnalysis,
         space_recommendations: Vec<CandidateSpaceRecommendation>,
         confidence: CandidateConfidence,
-        unknowns: Vec<CaptureUnknown>,
+        unknowns: Vec<CheckpointUnknown>,
         status: AutomaticCandidateStatus,
     ) -> Result<Self> {
         let candidate = Self {
@@ -1824,8 +2070,10 @@ mod tests {
 
     fn content() -> ContextRevisionDraft {
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Decision,
-            topic_key: Some("capture/fallback-owner".to_owned()),
+            topic_key: Some("checkpoint/fallback-owner".to_owned()),
             statement: "Keep fallback ownership server-side".to_owned(),
             rationale: "Every client consumes one contract".to_owned(),
             applicability: Applicability {
@@ -1846,8 +2094,8 @@ mod tests {
         }
     }
 
-    fn unknown(blocking: bool) -> CaptureUnknown {
-        CaptureUnknown {
+    fn unknown(blocking: bool) -> CheckpointUnknown {
+        CheckpointUnknown {
             statement: "Confirm the v3 rollout date".to_owned(),
             blocking,
             recheck_when: vec!["The rollout plan changes".to_owned()],
@@ -1910,13 +2158,151 @@ mod tests {
         }
     }
 
-    struct CaptureFixture {
+    // Frozen before R2-1: original field order and mandatory empty-vector keys.
+    const OLD_EMPTY_CLAIM: &str = r#"{"claim_id":"clm_00000000-0000-4000-8000-000000000001","context_kind_hint":"validation","topic_key_hint":null,"statement":"Old empty Claim","rationale":"Evidence is retained","applicability":{"domains":[],"platforms":[],"conditions":[]},"assumptions":[],"recheck_when":[],"evidence_refs":[{"kind":"observation","observation_id":"wob_00000000-0000-4000-8000-000000000002"}],"artifact_refs":[],"relations":[],"related_contexts":[]}"#;
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct OldClaimWire {
+        claim_id: CheckpointClaimId,
+        context_kind_hint: Option<crate::ContextKind>,
+        topic_key_hint: Option<String>,
+        statement: String,
+        rationale: String,
+        applicability: Applicability,
+        assumptions: Vec<String>,
+        recheck_when: Vec<String>,
+        evidence_refs: Vec<CheckpointEvidenceRef>,
+        artifact_refs: Vec<ArtifactRef>,
+        #[serde(default)]
+        relations: Vec<crate::ContextRelation>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        engineering_references: Vec<EngineeringReferenceDraft>,
+        related_contexts: Vec<ContextRevisionRef>,
+    }
+
+    #[test]
+    fn empty_claim_wire_bytes_match_the_frozen_old_contract() {
+        let claim: CheckpointClaim = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        claim.validate("claim").unwrap();
+        let encoded = serde_json::to_string(&claim).unwrap();
+        assert_eq!(encoded, OLD_EMPTY_CLAIM);
+        let old: OldClaimWire = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&old).unwrap(), OLD_EMPTY_CLAIM);
+        assert!(old.assumptions.is_empty() && old.recheck_when.is_empty());
+        assert!(old.artifact_refs.is_empty() && old.relations.is_empty());
+        assert!(old.related_contexts.is_empty());
+        let mut without_relations: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        without_relations
+            .as_object_mut()
+            .unwrap()
+            .remove("relations");
+        let old_without_relations: OldClaimWire =
+            serde_json::from_value(without_relations).unwrap();
+        assert!(old_without_relations.relations.is_empty());
+        assert_eq!(
+            serde_json::to_string(&old_without_relations).unwrap(),
+            OLD_EMPTY_CLAIM
+        );
+
+        // Optional references retain their old omit-empty/include-nonempty behavior.
+        let mut with_references: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        with_references["engineering_references"] = json!([]);
+        let empty: CheckpointClaim = serde_json::from_value(with_references.clone()).unwrap();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), OLD_EMPTY_CLAIM);
+        with_references["engineering_references"] = json!([{
+            "repository_id": "wire-fixture",
+            "artifact_kind": "file",
+            "relation": "implements",
+            "locator": {"locator_kind": "file", "path": "src/search.ts"},
+            "supports": "The file implements this Claim",
+            "limitations": []
+        }]);
+        let current: CheckpointClaim = serde_json::from_value(with_references).unwrap();
+        current.validate("claim").unwrap();
+        let encoded = serde_json::to_string(&current).unwrap();
+        let old: OldClaimWire = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(old.engineering_references.len(), 1);
+        assert_eq!(serde_json::to_string(&old).unwrap(), encoded);
+    }
+
+    #[test]
+    fn retired_claim_wire_fields_reject_nonempty_and_unknown_inputs() {
+        let nonempty = [
+            ("assumptions", json!(["A legacy assumption"])),
+            ("recheck_when", json!(["The old contract changes"])),
+            ("artifact_refs", json!([artifact("src/search.ts")])),
+            (
+                "relations",
+                json!([crate::ContextRelation {
+                    target_context_id: ContextId::new(),
+                    kind: ContextRelationKind::RelatedTo,
+                    rationale: "Previously accepted relation".to_owned(),
+                    supports: vec!["The reference supports the claim".to_owned()],
+                }]),
+            ),
+            (
+                "related_contexts",
+                json!([ContextRevisionRef {
+                    context_id: ContextId::new(),
+                    revision_id: RevisionId::new(),
+                }]),
+            ),
+        ];
+        for (field, value) in nonempty {
+            let mut wire: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+            wire[field] = value;
+            let error = serde_json::from_value::<CheckpointClaim>(wire.clone()).unwrap_err();
+            assert!(error.is_data(), "{field}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("retired checkpoint Claim fields must be empty"),
+                "{field}: {error}"
+            );
+            let encoded = serde_json::to_string(&wire).unwrap();
+            let string_error = serde_json::from_str::<CheckpointClaim>(&encoded).unwrap_err();
+            assert!(string_error.is_data(), "{field}: {string_error}");
+            assert!(
+                string_error
+                    .to_string()
+                    .contains("retired checkpoint Claim fields must be empty")
+            );
+            for malformed in [Value::Null, json!({}), json!("empty")] {
+                wire[field] = malformed;
+                assert!(
+                    serde_json::from_value::<CheckpointClaim>(wire.clone()).is_err(),
+                    "{field}"
+                );
+            }
+            wire.as_object_mut().unwrap().remove(field);
+            let absent = serde_json::from_value::<CheckpointClaim>(wire);
+            if field == "relations" {
+                assert!(absent.is_ok(), "relations retains its old default");
+            } else {
+                assert!(
+                    absent.unwrap_err().to_string().contains("missing field"),
+                    "{field}"
+                );
+            }
+        }
+        let mut unknown: Value = serde_json::from_str(OLD_EMPTY_CLAIM).unwrap();
+        unknown["private_payload"] = json!([]);
+        assert!(
+            serde_json::from_value::<CheckpointClaim>(unknown)
+                .unwrap_err()
+                .to_string()
+                .contains("unknown field")
+        );
+    }
+
+    struct CheckpointFixture {
         episode: WorkEpisode,
         checkpoint: AgentCheckpoint,
         observation_id: WorkObservationId,
     }
 
-    fn capture_fixture() -> CaptureFixture {
+    fn checkpoint_fixture() -> CheckpointFixture {
         let task_session_id = TaskSessionId::new();
         let task_id = TaskId::new();
         let revisions = IntentRevisionRange::new(vec![
@@ -1943,14 +2329,11 @@ mod tests {
         episode.add_observation(observation).unwrap();
         let claim = CheckpointClaim::from_parts(
             Some(ContextKind::Decision),
-            Some("capture/fallback-owner".to_owned()),
+            Some("checkpoint/fallback-owner".to_owned()),
             "Keep fallback ownership server-side",
             "Every client consumes one contract",
             Applicability::default(),
-            Vec::new(),
-            vec!["The v3 contract ships".to_owned()],
-            vec![CaptureEvidenceRef::Observation { observation_id }],
-            vec![artifact("src/search.ts")],
+            vec![CheckpointEvidenceRef::Observation { observation_id }],
             Vec::new(),
         )
         .unwrap();
@@ -1958,14 +2341,14 @@ mod tests {
             AgentCheckpoint::from_parts(&episode, revisions.last(), vec![claim], Vec::new())
                 .unwrap();
         episode.close(&checkpoint).unwrap();
-        CaptureFixture {
+        CheckpointFixture {
             episode,
             checkpoint,
             observation_id,
         }
     }
 
-    fn provenance(fixture: &CaptureFixture) -> CandidateBuilderProvenance {
+    fn provenance(fixture: &CheckpointFixture) -> CandidateBuilderProvenance {
         CandidateBuilderProvenance::from_parts(
             fixture.episode.ownership(),
             vec![fixture.checkpoint.checkpoint_id],
@@ -1976,7 +2359,7 @@ mod tests {
 
     #[test]
     fn episode_open_close_and_serialization_keep_only_typed_normalized_inputs() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         assert!(matches!(
             fixture.episode.status,
             WorkEpisodeStatus::Closed {
@@ -2032,9 +2415,8 @@ mod tests {
             TaskId::new(),
             range.first(),
             vec![WorkSourceRef::Artifact(artifact("src/cross.ts"))],
-            NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Exploration,
-                summary: "Cross Task observation".to_owned(),
+            NormalizedWorkObservation::UnresolvedQuestion {
+                question: "Cross Task observation?".to_owned(),
             },
         )
         .unwrap();
@@ -2056,9 +2438,8 @@ mod tests {
             task,
             range.first(),
             vec![WorkSourceRef::TaskSignal(unlisted_signal)],
-            NormalizedWorkObservation::Breadcrumb {
-                category: NormalizedBreadcrumbKind::Exploration,
-                summary: "Signal is not part of this Episode".to_owned(),
+            NormalizedWorkObservation::UnresolvedQuestion {
+                question: "Is this Signal part of the Episode?".to_owned(),
             },
         )
         .unwrap();
@@ -2082,7 +2463,7 @@ mod tests {
 
     #[test]
     fn duplicate_sources_claims_and_recommendations_are_rejected() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let source = WorkSourceRef::Artifact(artifact("src/duplicate.ts"));
         assert!(
             WorkObservation::from_parts(
@@ -2090,9 +2471,8 @@ mod tests {
                 fixture.episode.task_id,
                 fixture.episode.intent_revisions.last(),
                 vec![source.clone(), source],
-                NormalizedWorkObservation::Breadcrumb {
-                    category: NormalizedBreadcrumbKind::Decision,
-                    summary: "Duplicate source".to_owned(),
+                NormalizedWorkObservation::UnresolvedQuestion {
+                    question: "Is the source duplicated?".to_owned(),
                 },
             )
             .is_err()
@@ -2109,7 +2489,7 @@ mod tests {
 
         let mut unowned_evidence = fixture.checkpoint.claims[0].clone();
         unowned_evidence.claim_id = CheckpointClaimId::new();
-        unowned_evidence.evidence_refs = vec![CaptureEvidenceRef::Observation {
+        unowned_evidence.evidence_refs = vec![CheckpointEvidenceRef::Observation {
             observation_id: WorkObservationId::new(),
         }];
         assert!(
@@ -2183,7 +2563,7 @@ mod tests {
 
     #[test]
     fn candidate_builder_must_include_the_episode_final_checkpoint() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let alternate_checkpoint = AgentCheckpoint::from_parts(
             &fixture.episode,
             fixture.episode.intent_revisions.last(),
@@ -2224,14 +2604,11 @@ mod tests {
                 Applicability::default(),
                 Vec::new(),
                 Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
             )
             .is_err()
         );
 
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let mut missing = content();
         missing.evidence.clear();
         assert!(
@@ -2252,7 +2629,7 @@ mod tests {
 
     #[test]
     fn candidate_allows_no_space_multiple_recommendations_and_proposed_new_intent() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let no_space = AutomaticContextCandidate::from_builder(
             &fixture.episode,
             std::slice::from_ref(&fixture.checkpoint),
@@ -2311,6 +2688,14 @@ mod tests {
         assert!(!encoded.contains("transcript"));
         assert!(!encoded.contains("tool_output"));
         assert!(!encoded.contains("raw_payload"));
+
+        let mut legacy = serde_json::to_value(&candidate.space_recommendations[2]).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("proposed_space_group_key");
+        let legacy: CandidateSpaceRecommendation = serde_json::from_value(legacy).unwrap();
+        legacy.validate("legacy_recommendation").unwrap();
     }
 
     #[test]
@@ -2375,7 +2760,7 @@ mod tests {
 
     #[test]
     fn automatic_candidate_source_ownership_and_status_are_verifiable() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let mut unkeyed_decision = content();
         unkeyed_decision.topic_key = None;
         assert!(unkeyed_decision.validate().is_ok());
@@ -2454,7 +2839,7 @@ mod tests {
 
     #[test]
     fn legacy_git_candidate_remains_unowned_and_noninjectable() {
-        let fixture = capture_fixture();
+        let fixture = checkpoint_fixture();
         let candidate =
             ContextCandidate::from_episode(SubmissionId::new(), &fixture.episode, content())
                 .unwrap();

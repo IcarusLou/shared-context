@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Applicability, CandidateId, ConfirmationId, ContextCandidate, ContextId, ContextKind,
-    ContextRelation, ContextRevision, ContextRevisionDraft, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, IntentRevision, IntentSnapshot, Publication, PublicationAction,
-    PublicationDraft, PublicationId, Result, RevisionId, SpaceAssociationId, SpaceId,
+    Applicability, CandidateId, ConfirmationId, ConflictParticipant, ContextCandidate, ContextId,
+    ContextKind, ContextRelation, ContextRevision, ContextRevisionDraft, EngineeringReference,
+    EngineeringReferenceDraft, Error, ErrorKind, EventId, EvidenceSnapshotDraft, IntentRevision,
+    IntentSnapshot, Publication, PublicationAction, PublicationDraft, PublicationId, Result,
+    RevisionId, SemanticConflict, SemanticConflictDraft, SpaceAssociationId, SpaceId,
     SpaceRecommendationId, SubmissionId, WorkEpisodeRef,
 };
 
@@ -23,6 +24,54 @@ where
         return Err(invalid(format!("{field} must not contain duplicates")));
     }
     Ok(())
+}
+
+/// Who decided one Candidate disposition.
+///
+/// It is provenance, never domain semantics: it is recorded in event `annotations` and in the
+/// local Runtime, and it never reaches an event payload, the Confirmation operation hash, or any
+/// replay identity. `Human` is the default and the only value a client that never states one
+/// produces, so every disposition written before this existed reads back as a human decision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionSource {
+    /// An explicit human choice; the default for every request that omits the field.
+    #[default]
+    Human,
+    /// The session Agent acting inside the server-verified automatic permission surface.
+    AgentPolicy,
+}
+
+impl DecisionSource {
+    /// Stable wire and storage name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::AgentPolicy => "agent_policy",
+        }
+    }
+
+    /// Parses the stable wire name.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any spelling other than `human` or `agent_policy`.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "human" => Ok(Self::Human),
+            "agent_policy" => Ok(Self::AgentPolicy),
+            other => Err(invalid(format!(
+                "decision_source must be human or agent_policy, not {other}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Exactly one Primary Space choice supplied when confirming a Candidate.
@@ -62,6 +111,14 @@ pub enum TopicKeyEdit {
     Clear,
 }
 
+/// Explicit replacement for the nullable Candidate `problem_view` field.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProblemViewEdit {
+    Set { value: String },
+    Clear,
+}
+
 /// Field-level replacements applied to the complete Candidate draft at confirmation.
 ///
 /// Absence preserves the Candidate field; [`TopicKeyEdit::Clear`] explicitly removes the topic.
@@ -73,6 +130,8 @@ pub struct OptionalCandidateEdits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic_key: Option<TopicKeyEdit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub problem_view: Option<ProblemViewEdit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statement: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
@@ -83,12 +142,23 @@ pub struct OptionalCandidateEdits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recheck_when: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hints: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relations: Option<Vec<ContextRelation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Vec<EvidenceSnapshotDraft>>,
 }
 
 impl OptionalCandidateEdits {
+    /// True when no field replacement was supplied at all.
+    ///
+    /// Every field is optional and absence preserves the Candidate, so "no edits" and "the default
+    /// value" are the same fact.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Applies only supplied replacements and validates the resulting complete draft.
     ///
     /// # Errors
@@ -101,6 +171,11 @@ impl OptionalCandidateEdits {
                 Some(TopicKeyEdit::Set { value }) => Some(value.clone()),
                 Some(TopicKeyEdit::Clear) => None,
                 None => source.topic_key.clone(),
+            },
+            problem_view: match &self.problem_view {
+                Some(ProblemViewEdit::Set { value }) => Some(value.clone()),
+                Some(ProblemViewEdit::Clear) => None,
+                None => source.problem_view.clone(),
             },
             statement: self
                 .statement
@@ -122,6 +197,7 @@ impl OptionalCandidateEdits {
                 .recheck_when
                 .clone()
                 .unwrap_or_else(|| source.recheck_when.clone()),
+            hints: self.hints.clone().unwrap_or_else(|| source.hints.clone()),
             relations: self
                 .relations
                 .clone()
@@ -329,13 +405,15 @@ impl ContextSpaceAssociation {
 }
 
 /// Exact sibling Events that causally close one Candidate confirmation fact.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfirmationCausalRefs {
     pub space_created_event_id: Option<EventId>,
     pub context_revision_event_id: EventId,
     pub space_association_event_id: EventId,
     pub publication_event_id: EventId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_reference_event_ids: Vec<EventId>,
 }
 
 impl CandidateConfirmationCausalRefs {
@@ -348,6 +426,7 @@ impl CandidateConfirmationCausalRefs {
         if let Some(space_created_event_id) = self.space_created_event_id {
             ids.push(space_created_event_id);
         }
+        ids.extend(self.engineering_reference_event_ids.iter().copied());
         require_unique(&ids, "candidate_confirmation.causal_refs")
     }
 }
@@ -468,21 +547,46 @@ impl CandidateConfirmation {
             created_space_id: self.created_space_id,
             edits: self.edits.clone(),
             final_content_hash: self.final_content_hash.clone(),
-            causal_refs: self.causal_refs,
+            causal_refs: self.causal_refs.clone(),
         }
         .validate()
     }
 }
 
 /// Server-owned Event identities for one atomic Confirmation fact closure.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfirmationPlanEventIds {
     pub space_created_event_id: Option<EventId>,
     pub context_revision_event_id: EventId,
     pub space_association_event_id: EventId,
     pub publication_event_id: EventId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_reference_event_ids: Vec<EventId>,
+    /// One Event identity per automatically opened `SemanticConflict`, in plan order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub semantic_conflict_event_ids: Vec<EventId>,
     pub confirmation_event_id: EventId,
+}
+
+/// Other accepted side of a semantic conflict this Confirmation must open.
+///
+/// The confirming revision is not named here: it does not exist until
+/// [`CandidateConfirmationPlan::reserve`] generates it, and naming it twice would let a caller
+/// disagree with the reserved plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConflictOpeningDraft {
+    pub target: ConflictParticipant,
+    pub reason: String,
+}
+
+/// One `SemanticConflict` reserved inside a Confirmation plan and written in the same batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConflictOpening {
+    pub space_id: SpaceId,
+    pub conflict: SemanticConflict,
 }
 
 /// Server-owned new Space fact reserved inside one Confirmation plan.
@@ -504,6 +608,14 @@ pub struct CandidateConfirmationPlan {
     pub result_revision: ContextRevision,
     pub space_association: ContextSpaceAssociation,
     pub publication: Publication,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engineering_references: Vec<EngineeringReference>,
+    /// Semantic conflicts opened by the confirming revision's own `contradicts` Relations.
+    ///
+    /// They are part of the reserved closure, so a same-content replay of the Confirmation
+    /// resolves to the identical plan hash and writes no second conflict Event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opened_conflicts: Vec<SemanticConflictOpening>,
     pub confirmation: CandidateConfirmation,
     pub event_ids: CandidateConfirmationPlanEventIds,
 }
@@ -519,6 +631,8 @@ impl CandidateConfirmationPlan {
         candidate: &ContextCandidate,
         operation: CandidateConfirmationOperation,
         resolved_primary: CandidatePrimarySelection,
+        engineering_reference_drafts: Vec<EngineeringReferenceDraft>,
+        conflict_openings: Vec<SemanticConflictOpeningDraft>,
     ) -> Result<Self> {
         operation.validate()?;
         if operation.candidate_id != candidate.candidate_id {
@@ -550,6 +664,22 @@ impl CandidateConfirmationPlan {
         let final_draft = request.final_draft(candidate)?;
         let result_revision = ContextRevision::from_draft(Vec::new(), final_draft.clone())?;
         let result_context_id = ContextId::new();
+        for (index, reference) in engineering_reference_drafts.iter().enumerate() {
+            reference.validate()?;
+            if engineering_reference_drafts[..index].contains(reference) {
+                return Err(invalid(
+                    "Candidate Confirmation Engineering References must not contain duplicates",
+                ));
+            }
+        }
+        let engineering_references = engineering_reference_drafts
+            .into_iter()
+            .map(EngineeringReference::from_draft)
+            .collect::<Result<Vec<_>>>()?;
+        let engineering_reference_event_ids = engineering_references
+            .iter()
+            .map(|_| EventId::new())
+            .collect::<Vec<_>>();
         let (primary_space_id, new_space, space_created_event_id) = match resolved_primary {
             CandidatePrimarySelection::Existing { space_id } => (space_id, None, None),
             CandidatePrimarySelection::ProposedNew { intent } => {
@@ -562,6 +692,9 @@ impl CandidateConfirmationPlan {
                             revision_id: RevisionId::new(),
                             parent_revision_ids: Vec::new(),
                             intent,
+                            // The server proposed this Space from the Task Working Intent; no
+                            // human has named it yet, so the Space starts provisional.
+                            provisional: true,
                         },
                     }),
                     Some(EventId::new()),
@@ -588,6 +721,42 @@ impl CandidateConfirmationPlan {
             revision_id: result_revision.revision_id,
             review_event_ids: Vec::new(),
         })?;
+        let mut opened_conflicts = Vec::with_capacity(conflict_openings.len());
+        let mut conflict_targets = Vec::with_capacity(conflict_openings.len());
+        for opening in conflict_openings {
+            if opening.target.context_id == result_context_id
+                || opening.target.publication_id == publication.publication_id
+            {
+                return Err(invalid(
+                    "Candidate Confirmation conflict target must be a different accepted Context",
+                ));
+            }
+            if conflict_targets.contains(&opening.target.context_id) {
+                return Err(invalid(
+                    "Candidate Confirmation conflict targets must not contain duplicates",
+                ));
+            }
+            conflict_targets.push(opening.target.context_id);
+            opened_conflicts.push(SemanticConflictOpening {
+                space_id: primary_space_id,
+                conflict: SemanticConflict::from_draft(SemanticConflictDraft {
+                    participants: vec![
+                        ConflictParticipant {
+                            context_id: result_context_id,
+                            revision_id: result_revision.revision_id,
+                            publication_id: publication.publication_id,
+                        },
+                        opening.target,
+                    ],
+                    reason: opening.reason,
+                    applicability: result_revision.applicability.clone(),
+                })?,
+            });
+        }
+        let semantic_conflict_event_ids = opened_conflicts
+            .iter()
+            .map(|_| EventId::new())
+            .collect::<Vec<_>>();
         let confirmation = CandidateConfirmation::from_draft(CandidateConfirmationDraft {
             candidate_id: candidate.candidate_id,
             submission_id: candidate.submission_id,
@@ -606,6 +775,7 @@ impl CandidateConfirmationPlan {
                 context_revision_event_id,
                 space_association_event_id,
                 publication_event_id,
+                engineering_reference_event_ids: engineering_reference_event_ids.clone(),
             },
         })?;
         let plan = Self {
@@ -616,12 +786,16 @@ impl CandidateConfirmationPlan {
             result_revision,
             space_association,
             publication,
+            engineering_references,
+            opened_conflicts,
             confirmation,
             event_ids: CandidateConfirmationPlanEventIds {
                 space_created_event_id,
                 context_revision_event_id,
                 space_association_event_id,
                 publication_event_id,
+                engineering_reference_event_ids,
+                semantic_conflict_event_ids,
                 confirmation_event_id,
             },
         };
@@ -641,11 +815,20 @@ impl CandidateConfirmationPlan {
         format!("sha256:{:x}", Sha256::digest(bytes))
     }
 
+    /// Returns the exact number of immutable Events materialized by this plan.
+    #[must_use]
+    pub fn expected_event_count(&self) -> usize {
+        4 + usize::from(self.new_space.is_some())
+            + self.engineering_references.len()
+            + self.opened_conflicts.len()
+    }
+
     /// Validates all local identities and causal references in the reserved closure.
     ///
     /// # Errors
     ///
     /// Rejects any inconsistent generated identity, content hash, or selection fact.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<()> {
         self.operation.validate()?;
         if self.operation_hash != self.operation.operation_hash()
@@ -658,6 +841,14 @@ impl CandidateConfirmationPlan {
             || self.space_association.context_id != self.result_context_id
             || self.space_association.primary_space_id != self.confirmation.primary_space_id
             || self.space_association.related_space_ids != self.confirmation.related_space_ids
+            || self.event_ids.engineering_reference_event_ids
+                != self
+                    .confirmation
+                    .causal_refs
+                    .engineering_reference_event_ids
+            || self.event_ids.engineering_reference_event_ids.len()
+                != self.engineering_references.len()
+            || self.event_ids.semantic_conflict_event_ids.len() != self.opened_conflicts.len()
             || context_revision_content_hash(&context_revision_as_draft(&self.result_revision))
                 != self.confirmation.final_content_hash
         {
@@ -668,6 +859,57 @@ impl CandidateConfirmationPlan {
         self.result_revision.validate()?;
         self.space_association.validate()?;
         self.publication.validate()?;
+        let mut reference_ids = HashSet::new();
+        for (index, reference) in self.engineering_references.iter().enumerate() {
+            reference.validate()?;
+            if !reference_ids.insert(reference.reference_id)
+                || self.engineering_references[..index]
+                    .iter()
+                    .any(|existing| same_engineering_reference_content(existing, reference))
+            {
+                return Err(invalid(
+                    "Candidate Confirmation Engineering References must be unique",
+                ));
+            }
+        }
+        let mut conflict_ids = HashSet::new();
+        let mut conflict_targets = HashSet::new();
+        for opening in &self.opened_conflicts {
+            opening.conflict.validate()?;
+            if opening.space_id != self.confirmation.primary_space_id
+                || !conflict_ids.insert(opening.conflict.conflict_id)
+            {
+                return Err(invalid(
+                    "Candidate Confirmation opened conflicts must be unique and Primary-scoped",
+                ));
+            }
+            let mut sides = opening.conflict.participants.iter();
+            let Some(source) = sides.next() else {
+                return Err(invalid(
+                    "Candidate Confirmation conflict has no participants",
+                ));
+            };
+            if source.context_id != self.result_context_id
+                || source.revision_id != self.result_revision.revision_id
+                || source.publication_id != self.publication.publication_id
+            {
+                return Err(invalid(
+                    "Candidate Confirmation conflict must name the confirming revision first",
+                ));
+            }
+            if opening.conflict.applicability != self.result_revision.applicability {
+                return Err(invalid(
+                    "Candidate Confirmation conflict applicability must be the confirming revision's",
+                ));
+            }
+            for side in sides {
+                if !conflict_targets.insert(side.context_id) {
+                    return Err(invalid(
+                        "Candidate Confirmation conflict targets must not repeat",
+                    ));
+                }
+            }
+        }
         self.confirmation.validate()?;
         if self.event_ids.space_created_event_id
             != self.confirmation.causal_refs.space_created_event_id
@@ -702,8 +944,27 @@ impl CandidateConfirmationPlan {
         if let Some(event_id) = self.event_ids.space_created_event_id {
             event_ids.push(event_id);
         }
+        event_ids.extend(
+            self.event_ids
+                .engineering_reference_event_ids
+                .iter()
+                .copied(),
+        );
+        event_ids.extend(self.event_ids.semantic_conflict_event_ids.iter().copied());
         require_unique(&event_ids, "candidate_confirmation_plan.event_ids")
     }
+}
+
+fn same_engineering_reference_content(
+    left: &EngineeringReference,
+    right: &EngineeringReference,
+) -> bool {
+    left.repository_id == right.repository_id
+        && left.artifact_kind == right.artifact_kind
+        && left.relation == right.relation
+        && left.locator == right.locator
+        && left.supports == right.supports
+        && left.limitations == right.limitations
 }
 
 /// Hashes only authoritative Context draft semantics, excluding generated Revision/Evidence IDs.
@@ -724,11 +985,13 @@ pub fn context_revision_as_draft(revision: &ContextRevision) -> ContextRevisionD
     ContextRevisionDraft {
         kind: revision.kind,
         topic_key: revision.topic_key.clone(),
+        problem_view: revision.problem_view.clone(),
         statement: revision.statement.clone(),
         rationale: revision.rationale.clone(),
         applicability: revision.applicability.clone(),
         assumptions: revision.assumptions.clone(),
         recheck_when: revision.recheck_when.clone(),
+        hints: revision.hints.clone(),
         relations: revision.relations.clone(),
         evidence: revision
             .evidence
@@ -759,6 +1022,8 @@ mod tests {
 
     fn content() -> ContextRevisionDraft {
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Decision,
             topic_key: Some("confirmation/topic".to_owned()),
             statement: "Keep the confirmed behavior".to_owned(),

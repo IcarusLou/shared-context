@@ -1,0 +1,33 @@
+{
+  "passed": true,
+  "binary_sha256": "0d7ac23be579e01132c6f4c9e6b786c5bef02e372deef854fb66619d5e5fb10a",
+  "checkpoint_schema_sha256": "fe13a5df7adc7e891236fedb519e58d52ec3c34ca4a1ea35bcbdf8cabe4eaa5a",
+  "codex": {
+    "version": "0.153.4",
+    "model": "gpt-5.6-luna",
+    "real_model_checkpoint": true,
+    "lifecycle_delivery": "test-driver, not native Codex hooks",
+    "builder": "complete",
+    "leases_cleared": true
+  },
+  "cursor": {
+    "version": "2026.08.31-4057e58",
+    "models": [
+      "Auto"
+    ],
+    "real_model_checkpoint": true,
+    "real_model_candidate_list": true,
+    "native_hooks": [
+      "sessionStart",
+      "postToolUse",
+      "postToolUse",
+      "postToolUse",
+      "sessionEnd"
+    ],
+    "native_stop_observed": false,
+    "builder": "complete",
+    "leases_cleared": true
+  },
+  "normal_use_sample": false,
+  "desktop_ui_coverage": false
+}

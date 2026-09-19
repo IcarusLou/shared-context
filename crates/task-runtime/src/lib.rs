@@ -5,33 +5,59 @@
 //! explicit: the runtime never guesses a new Task from Prompt or Workspace text.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use sctx_domain::{
-    AgentCheckpoint, AgentCheckpointId, Applicability, ArtifactRef, AutomaticContextCandidate,
-    CandidateBuildId, CandidateConfirmationPlan, CandidateId, CandidateReviewStatus,
-    CaptureEvidenceRef, CaptureId, CaptureSourceRef, CaptureUnknown, CheckpointClaim,
-    CheckpointClaimId, ConfirmationId, ContextId, ContextRevisionRef, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, ExternalSessionId, ExternalSessionLocator, ExternalSessionSnapshot,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation, Result, SignalId,
-    SubmissionId, TaskId, TaskIntentRevision, TaskIntentRevisionId, TaskSessionId,
-    TaskSessionSnapshot, TaskSignal, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
-    WorkEpisode, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    AgentCheckpoint, AgentCheckpointId, Applicability, AutomaticContextCandidate, CandidateBuildId,
+    CandidateConfirmationPlan, CandidateId, CandidateReviewScope, CandidateReviewStatus,
+    CheckpointClaim, CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
+    ContextId, ContextKind, DecisionSource, EngineeringReferenceDraft, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionId, ExternalSessionLocator,
+    ExternalSessionSnapshot, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
+    ProposedSpaceGroupKey, Result, RevisionId, SignalId, SpaceId, SubmissionId, TaskId,
+    TaskIntentRevision, TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignal,
+    TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord, WorkEpisode, WorkEpisodeId,
+    WorkEpisodeRef, WorkEpisodeStatus, WorkObservation, WorkObservationId, WorkSourceRef,
+    WorkingIntentSnapshot,
+};
+use sha2::{Digest, Sha256};
+
+pub mod recall_stats;
+pub mod reference_derivation;
+
+pub use reference_derivation::{
+    AmbiguousMention, CheckoutReferenceResolver, ClaimReferenceDerivation, ClaimResolver,
+    DerivedClaimReferences, EpisodeClaimMentions, MentionChannel, MentionResolution, PathCandidate,
+    ReferenceDerivationRecord, ResolvedReference, claim_topic_key, combine_resolutions,
+    derive_claim_references,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 22;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+const HOOK_BUSY_TIMEOUT: Duration = Duration::from_millis(25);
 const MAX_EPISODE_LIST_LIMIT: usize = 256;
+/// Busy window for best-effort checkpoint-reminder activity writes. Concurrent tool Hooks
+/// must not serialize behind the interactive [`HOOK_BUSY_TIMEOUT`]; a lost increment only
+/// makes reminder delivery more conservative.
+const CHECKPOINT_REMINDER_ACTIVITY_BUSY_TIMEOUT: Duration = Duration::from_millis(3);
+/// Maximum Context identities bound into one usage-totals query.
+const USAGE_TOTALS_QUERY_CHUNK: usize = 256;
+/// Automated `TurnStop` checkpoint reminders one external Session may receive before the gate
+/// stops showing them (WP-V6 fix 3). See [`TaskRuntime::gate_turn_stop_checkpoint_reminder`].
+const CHECKPOINT_REMINDER_LIMIT: i64 = 3;
 pub const DEFAULT_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 pub const MAX_CANDIDATE_REVIEW_LIST_LIMIT: usize = 100;
+/// Bound on the `ExternalSession` Candidate corpus one Candidate Build may compare against.
+pub const MAX_SESSION_CANDIDATE_REVIEW_SCAN: usize = 200;
 
 /// Result of atomically locating or creating one `ExternalSession`'s first Task.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +74,63 @@ pub struct MergeSignalsOutcome {
     pub inserted_signal_ids: Vec<SignalId>,
 }
 
+/// Result of one automatic Hook-path Signal merge.
+///
+/// Counts only, deliberately: reading a full [`TaskSessionSnapshot`] means reading every Signal
+/// and the current Intent revision, and doing that inside the write transaction would hold the
+/// Runtime write lock for work no Hook caller uses.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HookSignalMergeOutcome {
+    pub inserted: usize,
+    /// How many Signals this merge superseded to stay inside a [`SignalRetentionRule`] bound.
+    pub retired: usize,
+}
+
+/// A bound on how many Active Signals of one group of kinds a Task may keep.
+///
+/// Retention is a caller-supplied policy, not a storage invariant: only the automatic
+/// Hook path, which appends Signals no human reviewed, asks for it. Explicit MCP merges
+/// keep every Signal they insert. Trimming supersedes the oldest Signals by
+/// `signal_ordinal` and never deletes a row, so Signal history stays complete and stable
+/// `SignalId`s remain resolvable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignalRetentionRule {
+    /// The kinds whose Active rows share one budget.
+    pub kinds: Vec<TaskSignalKind>,
+    /// Maximum Active Signals retained across `kinds`.
+    pub max_active: usize,
+}
+
+/// Pending Prompts one Session may hold while it still has no `ActiveTask`.
+///
+/// Two: the Prompt that states the work, and one correction of it. A third is elaboration, and
+/// the Task's own Intent will carry that better than a raw Prompt would.
+pub const MAX_PENDING_PROMPT_SIGNALS: usize = 2;
+
+/// How long a Prompt no Task ever claimed stays on disk.
+///
+/// Longer than the longest Session in the replay corpus (21.8 hours), so a slow Session never
+/// loses the sentence that started it; short enough that text from a Session which never declared
+/// a Task does not live on indefinitely.
+pub const PENDING_PROMPT_MAX_AGE_SECONDS: i64 = 48 * 60 * 60;
+
+/// Pending Prompts the whole installation may hold at once.
+///
+/// Every Session that is activated and then never declares a Task leaves its rows behind, and
+/// nothing else ever collects them, so the table carries its own ceiling.
+pub const MAX_PENDING_PROMPT_ROWS: usize = 256;
+
+/// What became of one Prompt offered to the pending stash.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingPromptOutcome {
+    /// Held; `pending` is how many this Session now holds.
+    Stashed { pending: usize },
+    /// This Session already holds this exact Prompt.
+    AlreadyPending,
+    /// This Session already holds [`MAX_PENDING_PROMPT_SIGNALS`].
+    Full,
+}
+
 /// Result of explicitly creating and activating a new Task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartNewTaskOutcome {
@@ -57,10 +140,15 @@ pub struct StartNewTaskOutcome {
 }
 
 /// Exact semantic disposition of one CAS-guarded Working Intent continue.
+///
+/// `Forked` is only reachable through [`TaskRuntime::continue_working_intent`]: a superseded CAS
+/// parent whose replacement Head states a different normalized goal is treated as a concurrent
+/// Agent inside one `ExternalSession` rather than a stale caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntentRevisionWriteStatus {
     Created,
     AlreadyCurrent,
+    Forked,
 }
 
 /// Current or newly-created Working Intent revision.
@@ -68,6 +156,16 @@ pub enum IntentRevisionWriteStatus {
 pub struct AppendIntentRevisionOutcome {
     pub revision: TaskIntentRevision,
     pub status: IntentRevisionWriteStatus,
+}
+
+/// Result of continuing one Working Intent lineage inside an `ExternalSession`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinueWorkingIntentOutcome {
+    pub snapshot: TaskSessionSnapshot,
+    pub revision: TaskIntentRevision,
+    pub status: IntentRevisionWriteStatus,
+    /// True when this continue re-selected a different retained Task as the `ActiveTask`.
+    pub active_task_switched: bool,
 }
 
 /// Result of explicitly selecting a retained Task as active.
@@ -91,7 +189,6 @@ pub struct SupersedeSignalsOutcome {
 pub struct WorkEpisodeView {
     pub episode: WorkEpisode,
     pub checkpoints: Vec<AgentCheckpoint>,
-    pub diagnostics: Vec<WorkEpisodeDiagnostic>,
 }
 
 /// Whether a Checkpoint preserves the open Episode or closes its final boundary.
@@ -118,12 +215,9 @@ pub struct CheckpointClaimDraft {
     pub statement: String,
     pub rationale: String,
     pub applicability: Applicability,
-    pub assumptions: Vec<String>,
-    pub recheck_when: Vec<String>,
-    pub evidence_refs: Vec<CaptureEvidenceRef>,
+    pub evidence_refs: Vec<CheckpointEvidenceRef>,
     pub inline_validations: Vec<EvidenceSnapshotDraft>,
-    pub artifact_refs: Vec<ArtifactRef>,
-    pub related_contexts: Vec<ContextRevisionRef>,
+    pub engineering_references: Vec<sctx_domain::EngineeringReferenceDraft>,
 }
 
 /// One strict Checkpoint write under `ActiveTask`, Intent and Episode-version CAS.
@@ -135,7 +229,7 @@ pub struct AgentCheckpointWrite {
     pub expected_episode_version: u64,
     pub boundary: CheckpointBoundary,
     pub claims: Vec<CheckpointClaimDraft>,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
 }
 
 /// Idempotent result of one atomic Checkpoint and Episode transition.
@@ -147,11 +241,78 @@ pub struct AgentCheckpointOutcome {
     pub inline_observation_ids: Vec<WorkObservationId>,
 }
 
+/// One bounded, self-contained Evidence input authored directly by the Agent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectEvidenceDraft {
+    pub evidence_type: EvidenceType,
+    pub summary: String,
+    pub limitations: Vec<String>,
+}
+
+/// One model-facing Claim after transport identity fields have been removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectCheckpointClaimDraft {
+    pub context_kind: sctx_domain::ContextKind,
+    pub statement: String,
+    pub rationale: String,
+    pub conditions: Vec<String>,
+    pub evidence: Vec<DirectEvidenceDraft>,
+}
+
+/// One content-addressed Checkpoint submission. Runtime resolves all lifecycle identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentCheckpointSubmission {
+    pub locator: ExternalSessionLocator,
+    pub claims: Vec<DirectCheckpointClaimDraft>,
+    pub unknowns: Vec<CheckpointUnknown>,
+}
+
+/// Durable receipt for one content-addressed Checkpoint operation and Build outbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CheckpointOperationOutcome {
+    pub operation_id: String,
+    pub checkpoint: AgentCheckpoint,
+    pub episode: WorkEpisodeView,
+    pub build: CandidateBuildView,
+    pub replayed: bool,
+    pub inline_observation_ids: Vec<WorkObservationId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckpointOperationRecord {
+    operation_id: String,
+    semantic_json: String,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    checkpoint_id: AgentCheckpointId,
+    episode_id: WorkEpisodeId,
+    build_id: CandidateBuildId,
+}
+
 /// Current rebuildable Candidate analysis stored outside Git knowledge facts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateAnalysisView {
     pub candidate: AutomaticContextCandidate,
     pub analysis_generation: u64,
+}
+
+/// Lifecycle of one Task-Intent-scoped proposed Space reservation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposedSpaceGroupMappingStatus {
+    Reserved,
+    Committed,
+}
+
+/// Runtime mapping from one exact Task Intent revision to its first confirmed new Space.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProposedSpaceGroupMapping {
+    pub proposed_space_group_key: ProposedSpaceGroupKey,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub candidate_id: CandidateId,
+    pub space_id: SpaceId,
+    pub status: ProposedSpaceGroupMappingStatus,
 }
 
 /// Minimal durable discovery/audit record for one finalized automatic Candidate.
@@ -175,6 +336,16 @@ pub struct CandidateReviewRecord {
     pub result_context_id: Option<sctx_domain::ContextId>,
 }
 
+/// Installation-wide read-only Pending Review counts observed by periodic maintenance.
+///
+/// `expiring_soon_count` is a subset of `pending_count`, and includes rows already past their
+/// expiry that the lazy sweep has not retired yet.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateReviewSurvey {
+    pub pending_count: u64,
+    pub expiring_soon_count: u64,
+}
+
 /// Bounded stable page of Review records owned by one exact `ActiveTask`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateReviewPage {
@@ -191,6 +362,9 @@ pub struct CandidateReviewDiscard {
     pub candidate_id: CandidateId,
     pub expected_review_version: u64,
     pub reason: String,
+    /// Who decided this discard. A discard writes no Git fact, so this is the only place it is
+    /// recorded at all.
+    pub decision_source: DecisionSource,
 }
 
 /// Exact idempotent result of one discard command.
@@ -205,6 +379,44 @@ pub enum CandidateReviewDiscardStatus {
 pub struct CandidateReviewDiscardOutcome {
     pub record: CandidateReviewRecord,
     pub status: CandidateReviewDiscardStatus,
+}
+
+/// Local disposition totals for one decision source.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DispositionCounts {
+    pub confirmed: usize,
+    pub discarded: usize,
+}
+
+/// Local disposition totals, grouped by who decided them.
+///
+/// These are Runtime counts of this installation's own decisions, not knowledge facts: a fresh
+/// checkout of the same repository reports zero.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CandidateDispositionStats {
+    /// Includes expired discarded tombstones; legacy live-status totals below stay unchanged.
+    pub relation_decisions: Vec<RelationDispositionCounts>,
+    pub human: DispositionCounts,
+    pub agent_policy: DispositionCounts,
+    /// Automatic confirmations the server refused with `auto_confirm_not_permitted`.
+    pub auto_confirm_not_permitted: usize,
+}
+
+/// Durable relation at disposition time; `None` means collection had not begun.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationDispositionCounts {
+    pub top_relation: Option<String>,
+    pub decision_source: DecisionSource,
+    pub counts: DispositionCounts,
+}
+
+/// One confirmed Candidate, with the provenance a batch revocation selects on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfirmedDisposition {
+    pub candidate_id: CandidateId,
+    pub result_context_id: ContextId,
+    pub decision_source: DecisionSource,
+    pub external_session_id: ExternalSessionId,
 }
 
 /// Runtime-only expiration report; Git knowledge is never changed.
@@ -238,6 +450,18 @@ pub struct CandidateConfirmationReservation {
     pub created: bool,
 }
 
+/// One Git-committed Candidate Confirmation to record in the Runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationFinalize {
+    pub candidate_id: CandidateId,
+    pub operation_hash: String,
+    pub confirmation_id: ConfirmationId,
+    pub result_context_id: ContextId,
+    /// Who decided this confirmation. Recorded beside the Review so a batch revocation can find
+    /// every automatically accepted Context later; it changes no Confirmation identity.
+    pub decision_source: DecisionSource,
+}
+
 /// Result of finalizing Runtime after the Git fact closure is committed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateConfirmationFinalizeOutcome {
@@ -267,6 +491,7 @@ impl CandidateBuildStatus {
 /// Durable state of one Claim-scoped Candidate creation operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CandidateBuildItemStatus {
+    Queued,
     Prepared,
     NeedsEvidence,
     Created,
@@ -277,6 +502,7 @@ pub enum CandidateBuildItemStatus {
 impl CandidateBuildItemStatus {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Prepared => "prepared",
             Self::NeedsEvidence => "needs_evidence",
             Self::Created => "created",
@@ -314,6 +540,27 @@ pub struct CandidateBuildItemView {
     pub error_code: Option<String>,
 }
 
+/// Builder decision that one Claim restates an existing Task-owned Candidate.
+///
+/// A deduplicated Claim never reserves a `SubmissionId` and never reaches Git, so equal content
+/// under different `SubmissionIds` still cannot converge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateBuildDuplicatePreparation {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub duplicate_of_candidate_id: CandidateId,
+    pub similarity_basis_points: u16,
+}
+
+/// One durable Claim-scoped deduplication decision of a Candidate Build.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CandidateBuildDuplicateView {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub duplicate_of_candidate_id: CandidateId,
+    pub similarity_basis_points: u16,
+}
+
 /// Durable deterministic build state for one exact closed Episode.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateBuildView {
@@ -322,6 +569,14 @@ pub struct CandidateBuildView {
     pub final_checkpoint_id: AgentCheckpointId,
     pub status: CandidateBuildStatus,
     pub items: Vec<CandidateBuildItemView>,
+    pub duplicates: Vec<CandidateBuildDuplicateView>,
+}
+
+/// Non-sensitive aggregate state of one `ActiveTask`'s durable Build recovery queue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CandidateBuildRecoveryStatus {
+    pub pending: usize,
+    pub incomplete: usize,
 }
 
 /// Result of explicitly opening at most one Episode for an `ActiveTask`.
@@ -344,42 +599,6 @@ pub struct AdvanceWorkEpisodeOutcome {
 pub struct AppendWorkObservationOutcome {
     pub episode: WorkEpisodeView,
     pub observation_id: WorkObservationId,
-}
-
-/// Safe diagnostic category stored with an Episode.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum WorkEpisodeDiagnosticKind {
-    CaptureRepositoryNotConfigured,
-    CaptureUnsafeArtifactPath,
-}
-
-/// One persisted safe Episode diagnostic; it never contains source payload text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct WorkEpisodeDiagnostic {
-    pub capture_id: CaptureId,
-    pub kind: WorkEpisodeDiagnosticKind,
-}
-
-/// Normalized, already-redacted Capture ingestion request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CaptureIngestion {
-    pub capture_id: CaptureId,
-    pub episode_id: WorkEpisodeId,
-    pub expected_episode_version: u64,
-    pub task_session_id: TaskSessionId,
-    pub task_id: TaskId,
-    pub intent_revision_id: TaskIntentRevisionId,
-    pub additional_sources: Vec<WorkSourceRef>,
-    pub observation: NormalizedWorkObservation,
-    pub diagnostics: Vec<WorkEpisodeDiagnosticKind>,
-}
-
-/// Idempotent Capture-to-Observation commit result.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IngestCaptureOutcome {
-    pub episode: WorkEpisodeView,
-    pub observation_id: WorkObservationId,
-    pub inserted: bool,
 }
 
 /// Prepared close boundary consumed later by Checkpoint persistence (#157).
@@ -420,12 +639,173 @@ pub struct SourceEpisodeVerification {
     pub observation_count: usize,
 }
 
+/// Retrieval entry point that returned one injected Context item to an Agent.
+///
+/// The three public read entry points are recorded separately so a later usage signal can be read
+/// back to the exact retrieval surface that produced it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ContextInjectionSource {
+    IntentUpdate,
+    TaskContext,
+    ArtifactFocus,
+}
+
+impl ContextInjectionSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IntentUpdate => "intent_update",
+            Self::TaskContext => "task_context",
+            Self::ArtifactFocus => "artifact_focus",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "intent_update" => Ok(Self::IntentUpdate),
+            "task_context" => Ok(Self::TaskContext),
+            "artifact_focus" => Ok(Self::ArtifactFocus),
+            other => Err(invariant(format!("unknown injection source {other}"))),
+        }
+    }
+}
+
+/// One immutable Context revision handed to an Agent by a retrieval entry point.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InjectedContext {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+}
+
+/// One recorded injection of a Context into a Task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskInjectionRecord {
+    pub task_id: TaskId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    /// When this Context first reached this Task. It never moves.
+    ///
+    /// Re-injection used to overwrite it, which put the audit trail out of order: a verdict
+    /// recorded at the Checkpoint appeared to precede the injection it judged, because a later
+    /// push of the same Context rewrote the injection's timestamp past it. Observed on a real
+    /// 21-hour Session: `ctx_98e9c226` was judged `ignored` at 04:53:22 and read back as injected
+    /// at 05:34:56.
+    pub injected_at_unix_seconds: u64,
+    /// When this Context last reached this Task, which equals
+    /// [`injected_at_unix_seconds`](Self::injected_at_unix_seconds) until it is pushed again.
+    ///
+    /// Re-exposure is a fact worth keeping — it is how often a Task was shown the same Context —
+    /// and it is a different fact from first exposure. Neither one is a verdict: what the Task
+    /// did with the Context lives in `context_usage` and a re-push never disturbs it.
+    pub last_injected_at_unix_seconds: u64,
+    pub source: ContextInjectionSource,
+}
+
+/// What one Task did with a Context that was injected into it.
+///
+/// The outcomes are monotonic within one `(context, task)` pair: `Ignored` is the absence of
+/// evidence, `Reused` is proof the Task built on the Context, and `Refuted` is proof it
+/// contradicted it. Evidence never expires, so a later write may only move a pair upwards. Reuse
+/// is proven by several independent signals derived at different moments of one Task — a Claim
+/// naming the Context, a Claim landing on its coordinate, the Candidate analysis assessing a
+/// relation to it, an Intent revision quoting it — and the ones that arrive last must not be
+/// erased by a re-derivation of the ones that arrive first.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ContextUsageOutcome {
+    Ignored,
+    Reused,
+    Refuted,
+}
+
+impl ContextUsageOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ignored => "ignored",
+            Self::Reused => "reused",
+            Self::Refuted => "refuted",
+        }
+    }
+
+    /// Higher wins when two writes disagree about the same `(context, task)` pair.
+    const fn priority(self) -> u8 {
+        match self {
+            Self::Ignored => 0,
+            Self::Reused => 1,
+            Self::Refuted => 2,
+        }
+    }
+
+    /// The SQL expression that reads one stored outcome's priority, for the upsert guard.
+    ///
+    /// It mirrors [`Self::priority`] and must stay in step with it.
+    const PRIORITY_SQL: &'static str =
+        "CASE context_usage.outcome WHEN 'refuted' THEN 2 WHEN 'reused' THEN 1 ELSE 0 END";
+}
+
+/// One `(context, task)` usage decision derived by the server from a Checkpoint or Confirmation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContextUsageRecord {
+    pub context_id: ContextId,
+    pub task_id: TaskId,
+    pub outcome: ContextUsageOutcome,
+}
+
+/// Per-Context usage totals across every Task that ever had it injected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ContextUsageTotals {
+    pub reused: u32,
+    pub ignored: u32,
+    pub refuted: u32,
+}
+
+impl ContextUsageTotals {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.reused == 0 && self.ignored == 0 && self.refuted == 0
+    }
+}
+
+/// Disposition of one Hook-path decision, translated into the collector telemetry outcome.
+///
+/// `Enabled`/`Disabled` mirror the resolved activation for that decision point; `Neutral`
+/// records a degraded-but-still-successful outcome (for example a dropped attribution); and
+/// `FailOpen` records a fault that forced the safe no-op path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HookEventDecision {
+    Enabled,
+    Disabled,
+    Neutral,
+    FailOpen,
+}
+
+impl HookEventDecision {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Disabled => "disabled",
+            Self::Neutral => "neutral",
+            Self::FailOpen => "fail_open",
+        }
+    }
+}
+
+impl std::fmt::Display for HookEventDecision {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Owner of the installation-local `state/runtime.sqlite` database.
 #[derive(Clone, Debug)]
 pub struct TaskRuntime {
     root: PathBuf,
     state: PathBuf,
     database: PathBuf,
+    busy_timeout: Duration,
+    configure_schema_on_open: bool,
 }
 
 impl TaskRuntime {
@@ -444,15 +824,37 @@ impl TaskRuntime {
     ///
     /// Returns typed filesystem, `SQLite`, or schema-version errors.
     pub fn initialize(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
+        Self::initialize_with_busy_timeout(root.into(), BUSY_TIMEOUT, true)
+    }
+
+    /// Initializes Runtime state with the short fail-open timeout used only by Agent Hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed filesystem, `SQLite`, or schema-version errors without waiting through the
+    /// normal interactive-operation busy window.
+    pub fn initialize_for_hook(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::initialize_with_busy_timeout(root.into(), HOOK_BUSY_TIMEOUT, false)
+    }
+
+    fn initialize_with_busy_timeout(
+        root: PathBuf,
+        busy_timeout: Duration,
+        configure_existing_schema: bool,
+    ) -> Result<Self> {
         let state = root.join("state");
         fs::create_dir_all(&state).map_err(io_error("create task runtime state directory"))?;
-        let runtime = Self {
-            database: state.join("runtime.sqlite"),
+        let database = state.join("runtime.sqlite");
+        let configure_schema_on_open = configure_existing_schema || !database.is_file();
+        let mut runtime = Self {
             root,
             state,
+            database,
+            busy_timeout,
+            configure_schema_on_open,
         };
         let _connection = runtime.open_connection()?;
+        runtime.configure_schema_on_open = false;
         Ok(runtime)
     }
 
@@ -514,6 +916,7 @@ impl TaskRuntime {
         }
 
         let external_session_id = ExternalSessionId::new();
+        let signals = with_backfilled_prompts(&transaction, &locator, signals)?;
         let snapshot =
             TaskSessionSnapshot::from_initial(locator, task_id, initial_intent, signals)?;
         insert_external_session(
@@ -556,6 +959,7 @@ impl TaskRuntime {
         require_expected_active(external.active_task_id, expected_active_task_id)?;
 
         let task_id = TaskId::new();
+        let signals = with_backfilled_prompts(&transaction, locator, signals)?;
         let snapshot = TaskSessionSnapshot::from_initial(
             locator.clone(),
             task_id,
@@ -676,33 +1080,128 @@ impl TaskRuntime {
                 status: IntentRevisionWriteStatus::AlreadyCurrent,
             });
         }
-        let revision = TaskIntentRevision::successor(&current, working_intent)?;
-        let ordinal = read_revision_ordinal(&transaction, current_revision_id)?
-            .checked_add(1)
-            .ok_or_else(|| invariant("Task Intent revision ordinal overflow"))?;
-        insert_intent_revision(&transaction, task_session_id, ordinal, &revision)?;
-        let changed = transaction
-            .execute(
-                "UPDATE task_session SET current_intent_revision_id = ?1
-                 WHERE task_session_id = ?2 AND current_intent_revision_id = ?3",
-                params![
-                    revision.revision_id.to_string(),
-                    task_session_id.to_string(),
-                    parent_revision_id.to_string(),
-                ],
-            )
-            .map_err(sql_error("advance Task Intent Head"))?;
-        if changed != 1 {
-            return Err(invariant(
-                "Task Intent Head changed inside write transaction",
-            ));
-        }
+        let revision = append_revision_in_transaction(
+            &transaction,
+            task_session_id,
+            &current,
+            working_intent,
+        )?;
         transaction
             .commit()
             .map_err(sql_error("commit Intent append transaction"))?;
         Ok(AppendIntentRevisionOutcome {
             revision,
             status: IntentRevisionWriteStatus::Created,
+        })
+    }
+
+    /// Continues one Working Intent lineage owned by this `ExternalSession`.
+    ///
+    /// Unlike [`Self::append_intent_revision`], the CAS parent selects the lineage instead of the
+    /// current `ActiveTask`: a parent that is still the Head of any retained Task appends there and
+    /// re-selects that Task, and a superseded parent whose replacement Head states a different
+    /// normalized goal forks a parallel `TaskSession`. Concurrent Agents that an Agent host
+    /// cannot distinguish keep separate Intent chains instead of overwriting one Head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for a missing Session or cross-Session parent, and a stale-state
+    /// error when the parent is unknown or superseded by the same normalized goal.
+    pub fn continue_working_intent(
+        &self,
+        locator: &ExternalSessionLocator,
+        parent_revision_id: TaskIntentRevisionId,
+        working_intent: WorkingIntentSnapshot,
+    ) -> Result<ContinueWorkingIntentOutcome> {
+        locator.validate()?;
+        working_intent.validate()?;
+        let semantic_hash = working_intent.canonical_semantic_hash()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Working Intent continue transaction")?;
+        let external = read_external_identity(&transaction, locator)?
+            .ok_or_else(|| invalid("ExternalSessionLocator does not identify a runtime Session"))?;
+        let owner = read_intent_revision_owner(&transaction, parent_revision_id)?
+            .ok_or_else(|| stale("Intent parent is stale: unknown or no longer retained"))?;
+        if owner.external_session != external.external_session_id {
+            return Err(invalid("Intent parent belongs to another Task Session"));
+        }
+        let head = read_intent_revision(&transaction, owner.head_revision)?;
+        let (task_session_id, task_id, revision, status) =
+            if owner.head_revision == parent_revision_id {
+                if head.semantic_hash == semantic_hash {
+                    (
+                        owner.task_session,
+                        owner.task,
+                        head,
+                        IntentRevisionWriteStatus::AlreadyCurrent,
+                    )
+                } else {
+                    let revision = append_revision_in_transaction(
+                        &transaction,
+                        owner.task_session,
+                        &head,
+                        working_intent,
+                    )?;
+                    (
+                        owner.task_session,
+                        owner.task,
+                        revision,
+                        IntentRevisionWriteStatus::Created,
+                    )
+                }
+            } else if head.parent_revision_id == Some(parent_revision_id)
+                && head.semantic_hash == semantic_hash
+            {
+                (
+                    owner.task_session,
+                    owner.task,
+                    head,
+                    IntentRevisionWriteStatus::AlreadyCurrent,
+                )
+            } else if normalized_goal(&working_intent.goal)
+                == normalized_goal(&head.working_intent.goal)
+            {
+                return Err(stale(
+                    "Intent parent is no longer the current Head of its Task lineage",
+                ));
+            } else {
+                let task_id = TaskId::new();
+                let forked = TaskSessionSnapshot::from_initial(
+                    locator.clone(),
+                    task_id,
+                    working_intent,
+                    Vec::new(),
+                )?;
+                let ordinal = next_task_ordinal(&transaction, external.external_session_id)?;
+                insert_task(&transaction, external.external_session_id, ordinal, &forked)?;
+                let revision = forked
+                    .current_intent_revision()
+                    .ok_or_else(|| invariant("forked TaskSession has no Working Intent Head"))?
+                    .clone();
+                (
+                    forked.task_session_id,
+                    task_id,
+                    revision,
+                    IntentRevisionWriteStatus::Forked,
+                )
+            };
+        let active_task_switched = external.active_task_id != task_id;
+        compare_and_switch(
+            &transaction,
+            external.external_session_id,
+            external.active_task_id,
+            task_session_id,
+            task_id,
+        )?;
+        let snapshot = require_snapshot(&transaction, task_session_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Working Intent continue transaction"))?;
+        Ok(ContinueWorkingIntentOutcome {
+            snapshot,
+            revision,
+            status,
+            active_task_switched,
         })
     }
 
@@ -746,20 +1245,58 @@ impl TaskRuntime {
         let signals = normalize_signals(signals)?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin locator Signal merge transaction")?;
-        let Some(task_session_id) = find_active_task_by_locator(&transaction, locator)? else {
+        let Some((task_session_id, task_id)) = locate_active_task(&transaction, locator)? else {
             transaction
                 .commit()
                 .map_err(sql_error("commit missing locator transaction"))?;
             return Ok(None);
         };
-        let (task_id, _) = read_active_task_head(&transaction, task_session_id)?
-            .ok_or_else(|| invariant("located ActiveTask is not active"))?;
         let outcome =
             merge_signals_in_transaction(&transaction, task_session_id, task_id, &signals)?;
         transaction
             .commit()
             .map_err(sql_error("commit locator Signal merge transaction"))?;
         Ok(Some(outcome))
+    }
+
+    /// Merges Signals into one `ExternalSession`'s `ActiveTask` and trims the result to
+    /// the supplied per-kind-group Active budgets, in one write transaction.
+    ///
+    /// This is the automatic Hook path's entry point: it appends Signals nobody reviewed,
+    /// so an unbounded Task would accumulate them for the whole life of a Session. Trimming
+    /// supersedes the oldest Active Signals of the affected kinds instead of deleting them,
+    /// which is exactly what an explicit `task_signal_supersede` does. A missing locator
+    /// returns `None` and never creates a Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed input or storage errors.
+    pub fn merge_hook_signals_by_locator(
+        &self,
+        locator: &ExternalSessionLocator,
+        signals: Vec<TaskSignal>,
+        retention: &[SignalRetentionRule],
+    ) -> Result<Option<HookSignalMergeOutcome>> {
+        locator.validate()?;
+        let signals = normalize_signals(signals)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Hook Signal merge transaction")?;
+        let Some((task_session_id, task_id)) = locate_active_task(&transaction, locator)? else {
+            transaction
+                .commit()
+                .map_err(sql_error("commit missing locator transaction"))?;
+            return Ok(None);
+        };
+        let inserted =
+            insert_signals_in_transaction(&transaction, task_session_id, task_id, &signals)?;
+        let retired = enforce_signal_retention(&transaction, task_session_id, retention)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Hook Signal merge transaction"))?;
+        Ok(Some(HookSignalMergeOutcome {
+            inserted: inserted.len(),
+            retired: retired.len(),
+        }))
     }
 
     /// Supersedes stable Signal IDs without deleting history.
@@ -917,14 +1454,11 @@ impl TaskRuntime {
         })
     }
 
-    /// Appends a normalized non-Capture observation under Episode-version CAS.
-    ///
-    /// Capture sources must use [`Self::ingest_capture`] so `CaptureId`
-    /// idempotency cannot be bypassed.
+    /// Appends a normalized Work Observation under Episode-version CAS.
     ///
     /// # Errors
     ///
-    /// Rejects stale/closed ownership, Capture sources, invalid meaning, or storage failures.
+    /// Rejects stale/closed ownership, invalid meaning, or storage failures.
     pub fn append_work_observation(
         &self,
         episode_id: WorkEpisodeId,
@@ -933,14 +1467,6 @@ impl TaskRuntime {
         source_refs: Vec<WorkSourceRef>,
         observation: NormalizedWorkObservation,
     ) -> Result<AppendWorkObservationOutcome> {
-        if source_refs
-            .iter()
-            .any(|source| matches!(source, WorkSourceRef::Capture(_)))
-        {
-            return Err(invalid(
-                "Capture sources require the idempotent ingest_capture API",
-            ));
-        }
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Work Observation append")?;
         let observation_id = append_observation_in_transaction(
@@ -961,133 +1487,14 @@ impl TaskRuntime {
         })
     }
 
-    /// Atomically and idempotently converts one already-claimed redacted Capture
-    /// into one server-identified Work Observation.
-    ///
-    /// # Errors
-    ///
-    /// Rejects stale/closed/cross-Task input or conflicting Capture reuse.
-    #[allow(clippy::too_many_lines)]
-    pub fn ingest_capture(&self, input: &CaptureIngestion) -> Result<IngestCaptureOutcome> {
-        if input
-            .additional_sources
-            .iter()
-            .any(|source| matches!(source, WorkSourceRef::Capture(_)))
-        {
-            return Err(invalid(
-                "Capture ingestion supplies its Capture source server-side",
-            ));
-        }
-        let mut connection = self.open_connection()?;
-        let transaction = immediate(&mut connection, "begin Capture ingestion")?;
-        if let Some((episode_id, observation_id, task_session_id, task_id)) =
-            read_capture_ingestion(&transaction, input.capture_id)?
-        {
-            if episode_id != input.episode_id
-                || task_session_id != input.task_session_id
-                || task_id != input.task_id
-            {
-                return Err(invalid(
-                    "CaptureId is already ingested by another Task/Episode",
-                ));
-            }
-            let episode = require_episode_view(&transaction, episode_id)?;
-            let observation = episode
-                .episode
-                .observations
-                .iter()
-                .find(|observation| observation.observation_id == observation_id)
-                .ok_or_else(|| invariant("Capture ingestion Observation disappeared"))?;
-            let mut expected_sources = Vec::with_capacity(input.additional_sources.len() + 1);
-            expected_sources.push(WorkSourceRef::Capture(CaptureSourceRef {
-                capture_id: input.capture_id,
-                task_session_id: input.task_session_id,
-                task_id: input.task_id,
-            }));
-            expected_sources.extend(input.additional_sources.clone());
-            let actual_diagnostics = episode
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.capture_id == input.capture_id)
-                .map(|diagnostic| diagnostic.kind)
-                .collect::<BTreeSet<_>>();
-            let expected_diagnostics = input.diagnostics.iter().copied().collect::<BTreeSet<_>>();
-            if observation.intent_revision_id != input.intent_revision_id
-                || observation.source_refs != expected_sources
-                || observation.observation != input.observation
-                || actual_diagnostics != expected_diagnostics
-            {
-                return Err(invalid(
-                    "CaptureId retry content differs from persisted ingestion",
-                ));
-            }
-            transaction
-                .commit()
-                .map_err(sql_error("commit idempotent Capture ingestion"))?;
-            return Ok(IngestCaptureOutcome {
-                episode,
-                observation_id,
-                inserted: false,
-            });
-        }
-        let (task_session_id, task_id, version, status) =
-            require_episode_head(&transaction, input.episode_id)?;
-        require_open_episode_version(version, &status, input.expected_episode_version)?;
-        if task_session_id != input.task_session_id || task_id != input.task_id {
-            return Err(invalid("Capture ingestion owner differs from Work Episode"));
-        }
-        let mut source_refs = Vec::with_capacity(input.additional_sources.len() + 1);
-        source_refs.push(WorkSourceRef::Capture(CaptureSourceRef {
-            capture_id: input.capture_id,
-            task_session_id,
-            task_id,
-        }));
-        source_refs.extend(input.additional_sources.clone());
-        let observation_id = append_observation_in_transaction(
-            &transaction,
-            input.episode_id,
-            input.expected_episode_version,
-            input.intent_revision_id,
-            source_refs,
-            input.observation.clone(),
-        )?;
-        transaction
-            .execute(
-                "INSERT INTO capture_ingestion (
-                    capture_id, episode_id, observation_id, task_session_id, task_id
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    input.capture_id.to_string(),
-                    input.episode_id.to_string(),
-                    observation_id.to_string(),
-                    task_session_id.to_string(),
-                    task_id.to_string(),
-                ],
-            )
-            .map_err(sql_error("record Capture ingestion"))?;
-        insert_episode_diagnostics(
-            &transaction,
-            input.episode_id,
-            input.capture_id,
-            &input.diagnostics,
-        )?;
-        let episode = require_episode_view(&transaction, input.episode_id)?;
-        transaction
-            .commit()
-            .map_err(sql_error("commit Capture ingestion"))?;
-        Ok(IngestCaptureOutcome {
-            episode,
-            observation_id,
-            inserted: true,
-        })
-    }
-
     /// Atomically opens or reuses the `ActiveTask` Episode, advances its typed
     /// references, records inline Validation observations and persists one
     /// server-identified Agent Checkpoint.
     ///
     /// Semantic retries are keyed by Episode and parent version. Identical
-    /// content returns the original Checkpoint; different content conflicts.
+    /// content returns the original Checkpoint. Different content conflicts
+    /// within an open Episode, while version zero starts a new Episode after
+    /// the latest matching closed-Episode parent.
     ///
     /// # Errors
     ///
@@ -1131,22 +1538,25 @@ impl TaskRuntime {
             if let Some((checkpoint, persisted_semantics)) =
                 read_checkpoint_by_parent(&transaction, episode_id, input.expected_episode_version)?
             {
-                if persisted_semantics != semantic_json {
+                if persisted_semantics == semantic_json {
+                    let episode = require_episode_view(&transaction, episode_id)?;
+                    let inline_observation_ids =
+                        inline_observation_ids(&checkpoint, &input.claims)?;
+                    transaction
+                        .commit()
+                        .map_err(sql_error("commit idempotent Agent Checkpoint retry"))?;
+                    return Ok(AgentCheckpointOutcome {
+                        checkpoint,
+                        episode,
+                        created: false,
+                        inline_observation_ids,
+                    });
+                }
+                if open_episode.is_some() {
                     return Err(conflict(
                         "Agent Checkpoint parent version already contains different content",
                     ));
                 }
-                let episode = require_episode_view(&transaction, episode_id)?;
-                let inline_observation_ids = inline_observation_ids(&checkpoint, &input.claims)?;
-                transaction
-                    .commit()
-                    .map_err(sql_error("commit idempotent Agent Checkpoint retry"))?;
-                return Ok(AgentCheckpointOutcome {
-                    checkpoint,
-                    episode,
-                    created: false,
-                    inline_observation_ids,
-                });
             }
         }
 
@@ -1184,7 +1594,7 @@ impl TaskRuntime {
                     },
                 )?;
                 insert_observation_rows(&transaction, episode_id, &observation)?;
-                evidence_refs.push(CaptureEvidenceRef::Observation {
+                evidence_refs.push(CheckpointEvidenceRef::Observation {
                     observation_id: observation.observation_id,
                 });
                 inserted_inline_observations.push(observation.observation_id);
@@ -1195,11 +1605,8 @@ impl TaskRuntime {
                 claim.statement.clone(),
                 claim.rationale.clone(),
                 claim.applicability.clone(),
-                claim.assumptions.clone(),
-                claim.recheck_when.clone(),
                 evidence_refs,
-                claim.artifact_refs.clone(),
-                claim.related_contexts.clone(),
+                claim.engineering_references.clone(),
             )?);
         }
         let episode_with_inline = require_episode_view(&transaction, episode_id)?.episode;
@@ -1234,6 +1641,7 @@ impl TaskRuntime {
                 ],
             )
             .map_err(sql_error("insert Agent Checkpoint"))?;
+        reset_checkpoint_reminder_activity(&transaction, task_session_id)?;
         match input.boundary {
             CheckpointBoundary::Continue => {
                 advance_episode_version(&transaction, episode_id, input.expected_episode_version)?;
@@ -1259,6 +1667,527 @@ impl TaskRuntime {
             created: true,
             inline_observation_ids: inserted_inline_observations,
         })
+    }
+
+    /// Atomically persists or replays one content-addressed, final Checkpoint operation.
+    ///
+    /// Runtime resolves the exact current `ActiveTask`, Intent and Episode, closes the Episode,
+    /// and reserves its Candidate Build outbox in the same transaction. The caller supplies no
+    /// lifecycle CAS or idempotency key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing `ActiveTask`, invalid direct Evidence, task-local reference drift,
+    /// operation hash collision, or storage failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn submit_agent_checkpoint(
+        &self,
+        input: &AgentCheckpointSubmission,
+    ) -> Result<CheckpointOperationOutcome> {
+        input.locator.validate()?;
+        if input.claims.is_empty() && input.unknowns.is_empty() {
+            return Err(invalid(
+                "checkpoint submission must contain at least one Claim or Unknown",
+            ));
+        }
+        let semantic_json = direct_checkpoint_semantic_json(input)?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Checkpoint operation transaction")?;
+        let external = read_external_identity(&transaction, &input.locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Agent Checkpoint"))?;
+        let (task_id, intent_revision_id) =
+            read_active_task_head(&transaction, external.active_task_session_id)?
+                .ok_or_else(|| invariant("located ActiveTask is not active"))?;
+        if task_id != external.active_task_id {
+            return Err(invariant(
+                "ExternalSession ActiveTask identity disagrees with its TaskSession",
+            ));
+        }
+        let intent = read_intent_revision(&transaction, intent_revision_id)?;
+        let claims = materialize_direct_checkpoint_claims(&input.claims, &intent.working_intent)?;
+        let (operation_key, operation_id) = checkpoint_operation_identity(
+            external.active_task_session_id,
+            task_id,
+            intent_revision_id,
+            &semantic_json,
+        );
+
+        if let Some(operation) = read_checkpoint_operation(&transaction, &operation_key)? {
+            if operation.operation_id != operation_id
+                || operation.semantic_json != semantic_json
+                || operation.task_session_id != external.active_task_session_id
+                || operation.task_id != task_id
+                || operation.intent_revision_id != intent_revision_id
+            {
+                return Err(invariant(
+                    "Checkpoint operation key resolved to conflicting persisted content",
+                ));
+            }
+            let episode = require_episode_view(&transaction, operation.episode_id)?;
+            let checkpoint = episode
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.checkpoint_id == operation.checkpoint_id)
+                .cloned()
+                .ok_or_else(|| invariant("Checkpoint operation receipt lost its Checkpoint"))?;
+            let build = require_candidate_build_view(&transaction, operation.build_id)?;
+            let inline_observation_ids = inline_observation_ids(&checkpoint, &claims)?;
+            transaction
+                .commit()
+                .map_err(sql_error("commit replayed Checkpoint operation"))?;
+            return Ok(CheckpointOperationOutcome {
+                operation_id,
+                checkpoint,
+                episode,
+                build,
+                replayed: true,
+                inline_observation_ids,
+            });
+        }
+
+        let episode_id = if let Some(episode_id) =
+            find_open_episode(&transaction, external.active_task_session_id)?
+        {
+            episode_id
+        } else {
+            insert_open_episode(&transaction, external.active_task_session_id, task_id)?
+        };
+        let (task_session_id, episode_task_id, episode_version, status) =
+            require_episode_head(&transaction, episode_id)?;
+        require_open_episode_version(episode_version, &status, episode_version)?;
+        if task_session_id != external.active_task_session_id || episode_task_id != task_id {
+            return Err(invariant("ActiveTask Work Episode ownership changed"));
+        }
+        insert_all_missing_episode_refs(&transaction, episode_id, task_session_id, task_id)?;
+        let episode_before = require_episode_view(&transaction, episode_id)?.episode;
+        validate_checkpoint_task_local_refs(&episode_before, &claims)?;
+
+        let mut persisted_claims = Vec::with_capacity(claims.len());
+        let mut inline_observation_ids = Vec::new();
+        for claim in &claims {
+            let mut evidence_refs = claim.evidence_refs.clone();
+            for evidence in &claim.inline_validations {
+                evidence.validate("checkpoint_submission.evidence")?;
+                let observation = WorkObservation::from_parts(
+                    task_session_id,
+                    task_id,
+                    intent_revision_id,
+                    Vec::new(),
+                    NormalizedWorkObservation::InlineValidation {
+                        evidence: evidence.clone(),
+                    },
+                )?;
+                insert_observation_rows(&transaction, episode_id, &observation)?;
+                evidence_refs.push(CheckpointEvidenceRef::Observation {
+                    observation_id: observation.observation_id,
+                });
+                inline_observation_ids.push(observation.observation_id);
+            }
+            persisted_claims.push(CheckpointClaim::from_parts(
+                claim.context_kind_hint,
+                claim.topic_key_hint.clone(),
+                claim.statement.clone(),
+                claim.rationale.clone(),
+                claim.applicability.clone(),
+                evidence_refs,
+                claim.engineering_references.clone(),
+            )?);
+        }
+        let episode_with_inline = require_episode_view(&transaction, episode_id)?.episode;
+        let checkpoint = AgentCheckpoint::from_parts(
+            &episode_with_inline,
+            intent_revision_id,
+            persisted_claims,
+            input.unknowns.clone(),
+        )?;
+        let checkpoint_json =
+            serde_json::to_string(&checkpoint).map_err(json_error("serialize Agent Checkpoint"))?;
+        let checkpoint_ordinal = next_checkpoint_ordinal(&transaction, episode_id)?;
+        transaction
+            .execute(
+                "INSERT INTO agent_checkpoint (
+                    checkpoint_id, episode_id, task_session_id, task_id,
+                    intent_revision_id, parent_episode_version, boundary,
+                    semantic_json, checkpoint_json, checkpoint_ordinal
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'close', ?7, ?8, ?9)",
+                params![
+                    checkpoint.checkpoint_id.to_string(),
+                    episode_id.to_string(),
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    intent_revision_id.to_string(),
+                    i64::try_from(episode_version)
+                        .map_err(|_| invalid("Work Episode version exceeds SQLite range"))?,
+                    semantic_json,
+                    checkpoint_json,
+                    checkpoint_ordinal,
+                ],
+            )
+            .map_err(sql_error("insert content-addressed Agent Checkpoint"))?;
+        reset_checkpoint_reminder_activity(&transaction, task_session_id)?;
+        let mut validation_episode = episode_with_inline;
+        validation_episode.close(&checkpoint)?;
+        close_episode_version(
+            &transaction,
+            episode_id,
+            episode_version,
+            checkpoint.checkpoint_id,
+        )?;
+
+        let build_id = CandidateBuildId::new();
+        transaction
+            .execute(
+                "INSERT INTO candidate_build (
+                    build_id, episode_id, task_session_id, task_id,
+                    final_checkpoint_id, status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+                params![
+                    build_id.to_string(),
+                    episode_id.to_string(),
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    checkpoint.checkpoint_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("reserve Candidate Build outbox"))?;
+        let closed_episode = require_episode_view(&transaction, episode_id)?;
+        for (item_ordinal, (checkpoint_id, claim_id)) in closed_episode
+            .checkpoints
+            .iter()
+            .flat_map(|checkpoint| {
+                checkpoint
+                    .claims
+                    .iter()
+                    .map(move |claim| (checkpoint.checkpoint_id, claim.claim_id))
+            })
+            .enumerate()
+        {
+            transaction
+                .execute(
+                    "INSERT INTO candidate_build_item (
+                        build_id, item_ordinal, checkpoint_id, claim_id, submission_id,
+                        content_hash, status, candidate_id, event_id, error_code
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, 'queued', NULL, NULL, NULL)",
+                    params![
+                        build_id.to_string(),
+                        i64::try_from(item_ordinal).map_err(|_| {
+                            invalid("Candidate Build item ordinal exceeds SQLite range")
+                        })?,
+                        checkpoint_id.to_string(),
+                        claim_id.to_string(),
+                        SubmissionId::new().to_string(),
+                    ],
+                )
+                .map_err(sql_error("reserve Candidate Build outbox item"))?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO checkpoint_operation (
+                    operation_key, operation_id, semantic_json, task_session_id, task_id,
+                    intent_revision_id, checkpoint_id, episode_id, build_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    operation_key,
+                    operation_id,
+                    semantic_json,
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    intent_revision_id.to_string(),
+                    checkpoint.checkpoint_id.to_string(),
+                    episode_id.to_string(),
+                    build_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("persist Checkpoint operation receipt"))?;
+        let episode = closed_episode;
+        let build = require_candidate_build_view(&transaction, build_id)?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit Checkpoint operation"))?;
+        Ok(CheckpointOperationOutcome {
+            operation_id,
+            checkpoint,
+            episode,
+            build,
+            replayed: false,
+            inline_observation_ids,
+        })
+    }
+
+    /// Spellings one Episode's Claims still need placed, or `None` when nothing is open.
+    ///
+    /// Candidate Build asks this first so a rebuilt Episode normally never spawns `git` again. The
+    /// answer stays `Some` in exactly two cases after the first derivation: the record carries an
+    /// ambiguity, whose answer a changed checkout can settle, or an operator explicitly reopened
+    /// it. An Episode whose derivation was clean — everything placed, or nothing to place — is
+    /// closed for good and costs no lookup.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors.
+    pub fn pending_claim_reference_candidates(
+        &self,
+        episode_id: WorkEpisodeId,
+    ) -> Result<Option<EpisodeClaimMentions>> {
+        let connection = self.open_connection()?;
+        if let Some(record) = read_reference_derivation(&connection, episode_id)?
+            && !record.reopened
+            && record.ambiguous.is_empty()
+        {
+            return Ok(None);
+        }
+        let Some(episode) = read_episode_view(&connection, episode_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(episode_claim_mentions(&episode)))
+    }
+
+    /// Holds one Prompt that arrived before its Session had an `ActiveTask` to attach it to.
+    ///
+    /// The Prompt that states what a Session is for is, by construction, the one that cannot be
+    /// recorded: `task_intent_update` is what creates the Task, and it happens after the user has
+    /// already said what they want. Measured on the replay corpus this is not an edge case — it is
+    /// every Session's most informative sentence, plus five more in `01a060a1` alone.
+    ///
+    /// The stash is deliberately small. [`MAX_PENDING_PROMPT_SIGNALS`] per Session is enough for
+    /// the prompt that defines the work and one correction of it, and keeping the *first* ones
+    /// rather than the most recent is the point: a Session that keeps talking before declaring a
+    /// Task is elaborating, not restating. [`MAX_PENDING_PROMPT_ROWS`] bounds the whole table, so
+    /// Sessions that never declare a Task cannot accumulate without limit.
+    ///
+    /// This never creates Task state. It writes one row in a table with no foreign key, which is
+    /// what makes it safe to call for a Session that may never have a Task at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn stash_pending_prompt(
+        &self,
+        locator: &ExternalSessionLocator,
+        content: &str,
+    ) -> Result<PendingPromptOutcome> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin pending Prompt stash")?;
+        let now = i64::try_from(unix_seconds(SystemTime::now())?).unwrap_or(i64::MAX);
+        // Held text is text on disk that no Task ever claimed, so it expires. Two days is longer
+        // than the longest Session in the replay corpus (21.8 hours) and far shorter than "until
+        // someone notices": a Session that has not declared a Task by then never will.
+        transaction
+            .execute(
+                "DELETE FROM pending_prompt_signal WHERE recorded_at_unix_seconds < ?1",
+                params![now.saturating_sub(PENDING_PROMPT_MAX_AGE_SECONDS)],
+            )
+            .map_err(sql_error("expire stale pending Prompts"))?;
+        let pending = read_pending_prompts(&transaction, locator)?;
+        if pending.iter().any(|prompt| prompt == content) {
+            return Ok(PendingPromptOutcome::AlreadyPending);
+        }
+        if pending.len() >= MAX_PENDING_PROMPT_SIGNALS {
+            return Ok(PendingPromptOutcome::Full);
+        }
+        let ordinal: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(prompt_ordinal), -1) + 1 FROM pending_prompt_signal
+                 WHERE agent_kind = ?1 AND external_session_key = ?2",
+                params![locator.agent_kind, locator.external_session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("read the next pending Prompt ordinal"))?;
+        transaction
+            .execute(
+                "INSERT INTO pending_prompt_signal (
+                    agent_kind, external_session_key, prompt_ordinal, content,
+                    recorded_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    locator.agent_kind,
+                    locator.external_session_id,
+                    ordinal,
+                    content,
+                    now,
+                ],
+            )
+            .map_err(sql_error("stash pending Prompt"))?;
+        // Oldest first, so a table at its ceiling drops the Session that has waited longest for a
+        // Task it will probably never declare, never the Prompt that just arrived.
+        transaction
+            .execute(
+                "DELETE FROM pending_prompt_signal WHERE rowid IN (
+                    SELECT rowid FROM pending_prompt_signal
+                    ORDER BY recorded_at_unix_seconds ASC, rowid ASC
+                    LIMIT MAX(
+                        (SELECT COUNT(*) FROM pending_prompt_signal) - ?1,
+                        0
+                    )
+                 )",
+                params![i64::try_from(MAX_PENDING_PROMPT_ROWS).unwrap_or(i64::MAX)],
+            )
+            .map_err(sql_error("bound the pending Prompt table"))?;
+        transaction
+            .commit()
+            .map_err(sql_error("commit pending Prompt stash"))?;
+        Ok(PendingPromptOutcome::Stashed {
+            pending: pending.len() + 1,
+        })
+    }
+
+    /// Reads what one Episode's recorded derivation attempt found, if it has run.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors.
+    pub fn reference_derivation_record(
+        &self,
+        episode_id: WorkEpisodeId,
+    ) -> Result<Option<ReferenceDerivationRecord>> {
+        read_reference_derivation(&self.open_connection()?, episode_id)
+    }
+
+    /// Asks for every Episode whose derivation left an ambiguity to be looked at again.
+    ///
+    /// Returns how many Episodes were reopened. This is the operator's lever, and it is
+    /// deliberately no stronger than the automatic one: reopening does not itself re-derive
+    /// anything, it only makes the next Candidate Build for that Episode ask the checkout again
+    /// even when the checkout's answer has not changed. Claim derivation is Build work by
+    /// construction, and an Episode nobody builds again keeps the answer it has.
+    ///
+    /// An Episode whose derivation recorded no ambiguity is never reopened: there is no question
+    /// to re-ask, and re-deriving a clean answer could only burn a Git query.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn reopen_ambiguous_reference_derivations(&self) -> Result<usize> {
+        let connection = self.open_connection()?;
+        let reopened = connection
+            .execute(
+                "UPDATE checkpoint_reference_derivation SET reopened = 1
+                 WHERE reopened = 0
+                   AND ambiguity_json IS NOT NULL
+                   AND json_array_length(ambiguity_json) > 0",
+                [],
+            )
+            .map_err(sql_error("reopen ambiguous Claim reference derivations"))?;
+        Ok(reopened)
+    }
+
+    /// Derives every Claim's engineering coordinates for one Episode.
+    ///
+    /// This is Candidate Build work, never Checkpoint ACK work. The first call resolves each
+    /// spelling through `resolver` — path spellings first, and type names only for a Claim no path
+    /// could place — writes the resulting References and topic hint back onto the persisted
+    /// Claims, and records what it found.
+    ///
+    /// A later call normally replays that recorded answer and calls `resolver` for nothing, so a
+    /// Build rerun after the checkout moved on cannot change a Candidate that already reached
+    /// review. It re-derives in exactly two cases, and only for what was left open:
+    ///
+    /// * the record carries an ambiguity whose current answer differs from the recorded one — the
+    ///   checkout gained or lost a file, so the question has a new answer; or
+    /// * [`TaskRuntime::reopen_ambiguous_reference_derivations`] reopened the Episode.
+    ///
+    /// A re-derivation is additive and never retracts: the persisted References become the union
+    /// of what was recorded and what was just found, deduplicated by coordinate, and a
+    /// `topic_key_hint` that already exists is never overruled. That keeps the operation
+    /// idempotent against an unchanged checkout and keeps a reviewer's already-seen facts intact
+    /// while an ambiguity that has since resolved is allowed to become one.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage or invariant errors. A resolver that places nothing is not an error:
+    /// the spellings stay retrieval hints.
+    pub fn derive_episode_claim_references(
+        &self,
+        episode_id: WorkEpisodeId,
+        resolver: &ClaimResolver<'_>,
+    ) -> Result<Vec<DerivedClaimReferences>> {
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Claim derivation transaction")?;
+        let episode = require_episode_view(&transaction, episode_id)?;
+        let recorded = read_reference_derivation(&transaction, episode_id)?;
+        let derive = match &recorded {
+            None => true,
+            Some(record) => {
+                record.reopened || ambiguity_answer_changed(&record.ambiguous, resolver)
+            }
+        };
+        let mut derivations = Vec::new();
+        for checkpoint in &episode.checkpoints {
+            let mut updated = checkpoint.clone();
+            for claim in &mut updated.claims {
+                let summaries = claim_evidence_summaries(&episode.episode, claim);
+                let borrowed = summaries.iter().map(String::as_str).collect::<Vec<_>>();
+                let derivation = if derive {
+                    let derived = derive_claim_references(
+                        claim.context_kind_hint.unwrap_or(ContextKind::Discovery),
+                        &claim.statement,
+                        &claim.rationale,
+                        &borrowed,
+                        resolver,
+                    );
+                    merge_engineering_references(
+                        &mut claim.engineering_references,
+                        &derived.engineering_references,
+                    );
+                    // A Claim that carried its own `topic_key_hint` keeps it: derivation fills a
+                    // gap the Agent left, it does not overrule a coordinate the Agent named — and
+                    // that holds for a re-derivation against the Claim's first answer too.
+                    if claim.topic_key_hint.is_none() {
+                        claim.topic_key_hint.clone_from(&derived.topic_key_hint);
+                    }
+                    ClaimReferenceDerivation {
+                        engineering_references: claim.engineering_references.clone(),
+                        ..derived
+                    }
+                } else {
+                    ClaimReferenceDerivation {
+                        engineering_references: claim.engineering_references.clone(),
+                        topic_key_hint: claim.topic_key_hint.clone(),
+                        unresolved_hints: reference_derivation::claim_hints(
+                            &claim.statement,
+                            &claim.rationale,
+                            &borrowed,
+                            &claim.engineering_references,
+                        ),
+                        // The ambiguity belongs to the lookup, and a replay performs none; the
+                        // durable answer is the record, which the caller can read directly.
+                        ambiguous_mentions: Vec::new(),
+                    }
+                };
+                derivations.push(DerivedClaimReferences {
+                    checkpoint_id: updated.checkpoint_id,
+                    claim_id: claim.claim_id,
+                    engineering_references: derivation.engineering_references,
+                    // Always the persisted answer, so the first derivation and every later replay
+                    // of it report the same topic hint.
+                    topic_key_hint: claim.topic_key_hint.clone(),
+                    unresolved_hints: derivation.unresolved_hints,
+                    ambiguous_mentions: derivation.ambiguous_mentions,
+                    applicability_inherited: true,
+                });
+            }
+            if !derive {
+                continue;
+            }
+            updated.validate_against_episode(&episode.episode)?;
+            let checkpoint_json = serde_json::to_string(&updated)
+                .map_err(json_error("serialize derived Agent Checkpoint"))?;
+            transaction
+                .execute(
+                    "UPDATE agent_checkpoint SET checkpoint_json = ?1 WHERE checkpoint_id = ?2",
+                    params![checkpoint_json, updated.checkpoint_id.to_string()],
+                )
+                .map_err(sql_error("persist derived Claim references"))?;
+        }
+        if derive {
+            let mut record = ReferenceDerivationRecord::from_derivations(&derivations);
+            record.derived_at_unix_seconds = Some(unix_seconds(SystemTime::now())?);
+            write_reference_derivation(&transaction, episode_id, &record)?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Claim derivation transaction"))?;
+        Ok(derivations)
     }
 
     /// Reads one persisted Work Episode by server-owned ID.
@@ -1381,6 +2310,160 @@ impl TaskRuntime {
                 expected_episode_version,
             )),
         )
+    }
+
+    /// Decides whether one more automated `TurnStop` checkpoint reminder should reach the model,
+    /// and records that decision (WP-V6 fix 3).
+    ///
+    /// Every `TurnStop` with a checkpoint still missing used to repeat the identical
+    /// `call task_checkpoint` reminder, which is noise across a long Session that keeps working
+    /// through several turns before checkpointing. This caps it at
+    /// [`CHECKPOINT_REMINDER_LIMIT`] reminders per external Session, and only spends one of them
+    /// on a turn that saw real tool activity since the last reminder
+    /// ([`record_checkpoint_reminder_activity`](Self::record_checkpoint_reminder_activity)): an
+    /// idle turn cannot yet have acted on advice it was just given, so repeating the reminder would
+    /// only restate the same nag with nothing new to react to, and it does not spend part of the
+    /// budget either.
+    ///
+    /// The counters live on the `external_session` row rather than in process memory because a
+    /// Hook is a short-lived process that exits before the next `TurnStop` fires -- state that does
+    /// not survive the process is not state at all here.
+    ///
+    /// Fails open: a missing `ExternalSession` row or any read/write error returns `true` (show the
+    /// reminder), exactly the behaviour before this method existed. An extra reminder is a mild
+    /// annoyance; a silently suppressed one hides a real missing Checkpoint.
+    #[must_use]
+    pub fn gate_turn_stop_checkpoint_reminder(&self, locator: &ExternalSessionLocator) -> bool {
+        self.gate_turn_stop_checkpoint_reminder_inner(locator)
+            .unwrap_or(true)
+    }
+
+    fn gate_turn_stop_checkpoint_reminder_inner(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<bool> {
+        locator.validate()?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "gate TurnStop checkpoint reminder")?;
+        let Some(external) = read_external_identity(&transaction, locator)? else {
+            transaction.commit().map_err(sql_error(
+                "commit missing ExternalSession for checkpoint reminder gate",
+            ))?;
+            return Ok(true);
+        };
+        let (reminder_count, activity): (i64, i64) = transaction
+            .query_row(
+                "SELECT checkpoint_reminder_count, activity_since_checkpoint_reminder
+                 FROM external_session WHERE external_session_id = ?1",
+                params![external.external_session_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error("read checkpoint reminder counters"))?;
+        // The first reminder always fires: there is no prior reminder for an idle turn to be
+        // compared against yet, and a checkpoint that is genuinely missing deserves to be said
+        // once unconditionally. From the second reminder on, silence since the last one means nothing
+        // has changed since the Agent was already told, so showing it again would add nothing.
+        let allow =
+            reminder_count < CHECKPOINT_REMINDER_LIMIT && (reminder_count == 0 || activity > 0);
+        if allow {
+            transaction
+                .execute(
+                    "UPDATE external_session
+                     SET checkpoint_reminder_count = checkpoint_reminder_count + 1,
+                         activity_since_checkpoint_reminder = 0
+                     WHERE external_session_id = ?1",
+                    params![external.external_session_id.to_string()],
+                )
+                .map_err(sql_error("record checkpoint reminder"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit checkpoint reminder gate"))?;
+        Ok(allow)
+    }
+
+    /// Reads how much real tool activity this Session has recorded since its last checkpoint
+    /// reminder or Checkpoint, without spending any part of the reminder budget.
+    ///
+    /// [`gate_turn_stop_checkpoint_reminder`](Self::gate_turn_stop_checkpoint_reminder) both reads
+    /// and consumes, which is right for a caller that has already decided a reminder is warranted.
+    /// The closed-Episode boundary has to decide that first --- an Episode that closed and then
+    /// saw nothing happen is a finished piece of work, not an unrecorded one --- so it asks here
+    /// before asking the gate.
+    ///
+    /// Fails *closed*, unlike the gate: zero on a missing row or any error. The gate fails open
+    /// because suppressing a reminder hides a Checkpoint that is genuinely missing; this answer is
+    /// the evidence for the claim "this Session kept working", and a counter that could not be
+    /// read is not evidence of anything.
+    #[must_use]
+    pub fn checkpoint_reminder_activity(&self, locator: &ExternalSessionLocator) -> u64 {
+        self.checkpoint_reminder_activity_inner(locator)
+            .unwrap_or(0)
+    }
+
+    fn checkpoint_reminder_activity_inner(&self, locator: &ExternalSessionLocator) -> Result<u64> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        let activity: i64 = connection
+            .query_row(
+                "SELECT activity_since_checkpoint_reminder FROM external_session
+                 WHERE agent_kind = ?1 AND external_session_key = ?2",
+                params![locator.agent_kind, locator.external_session_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("read checkpoint reminder activity"))?;
+        Ok(u64::try_from(activity).unwrap_or(0))
+    }
+
+    /// Records one real PostToolUse-driven Signal event toward the reminder-activity counter
+    /// (WP-V6 fix 3), so the next call to
+    /// [`gate_turn_stop_checkpoint_reminder`](Self::gate_turn_stop_checkpoint_reminder) can tell an
+    /// idle turn from one where the Agent did something after being reminded.
+    ///
+    /// A dedicated connection uses [`CHECKPOINT_REMINDER_ACTIVITY_BUSY_TIMEOUT`]:
+    /// every `PostToolUse` in a Session reaches this, so as many concurrent Hook processes as a
+    /// Session has active tool calls can all touch this one row at once, and retrying each one
+    /// against the interactive [`HOOK_BUSY_TIMEOUT`] would serialize them and could itself blow
+    /// the Hook p99 budget on its own (`crates/cli/tests/hook_hot_path.rs` measures exactly that
+    /// budget under 32-way concurrency). One `UPDATE`, no read first and no explicit transaction:
+    /// losing an occasional increment under contention only makes the gate slightly more
+    /// conservative, never less correct.
+    ///
+    /// A missing `ExternalSession` row (no `ActiveTask` yet, so
+    /// no reminder can fire either) matches zero rows rather than erroring, and a write failure
+    /// just leaves the counter where it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed locator or storage error. Callers on the Hook path are expected to treat
+    /// this the way they treat every other best-effort write there and not fail the Hook over it.
+    pub fn record_checkpoint_reminder_activity(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<()> {
+        locator.validate()?;
+        // `SQLITE_OPEN_READ_WRITE` only, deliberately without `SQLITE_OPEN_CREATE`: creating
+        // a schema-less runtime.sqlite here would make later Hook initialization skip schema
+        // setup. Only normal Runtime initialization may create the database.
+        let connection = Connection::open_with_flags(
+            &self.database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(sql_error("open task runtime database"))?;
+        connection
+            .busy_timeout(CHECKPOINT_REMINDER_ACTIVITY_BUSY_TIMEOUT)
+            .map_err(sql_error(
+                "configure checkpoint reminder activity busy timeout",
+            ))?;
+        connection
+            .execute(
+                "UPDATE external_session
+                 SET activity_since_checkpoint_reminder = activity_since_checkpoint_reminder + 1
+                 WHERE agent_kind = ?1 AND external_session_key = ?2",
+                params![locator.agent_kind, locator.external_session_id],
+            )
+            .map_err(sql_error("record checkpoint reminder activity"))?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1531,6 +2614,26 @@ impl TaskRuntime {
         episode_id: WorkEpisodeId,
         items: &[CandidateBuildItemPreparation],
     ) -> Result<CandidateBuildView> {
+        self.prepare_candidate_build_with_duplicates(episode_id, items, &[])
+    }
+
+    /// Prepares one Candidate Build whose Claims are split into submittable drafts and durable
+    /// deduplication decisions.
+    ///
+    /// Every persisted Claim must appear exactly once across `items` and `duplicates`. A Claim that
+    /// a previous preparation already classified keeps that first durable decision, so recovering
+    /// or replaying the same closed Episode never produces a second Candidate for one fact.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an open Episode, incomplete readiness metadata, a Claim classified twice and a
+    /// duplicate target that is not an already-created Candidate of another Claim.
+    pub fn prepare_candidate_build_with_duplicates(
+        &self,
+        episode_id: WorkEpisodeId,
+        items: &[CandidateBuildItemPreparation],
+        duplicates: &[CandidateBuildDuplicatePreparation],
+    ) -> Result<CandidateBuildView> {
         validate_build_preparations(items)?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Candidate Build preparation")?;
@@ -1543,7 +2646,7 @@ impl TaskRuntime {
                 "Candidate Builder requires an exact closed Work Episode",
             ));
         };
-        validate_build_claim_coverage(&episode, items)?;
+        validate_build_claim_coverage(&episode, items, duplicates)?;
         let build_id = if let Some(build_id) = read_candidate_build_id(&transaction, episode_id)? {
             build_id
         } else {
@@ -1566,7 +2669,40 @@ impl TaskRuntime {
                 .map_err(sql_error("insert Candidate Build"))?;
             build_id
         };
-        upsert_candidate_build_items(&transaction, build_id, items)?;
+        // A Claim that already reached Git keeps its Candidate, and a Claim already recorded as a
+        // duplicate keeps that decision, so recovery and replay cannot fork one fact into two.
+        let submitted_claims = read_candidate_build_items(&transaction, build_id)?
+            .into_iter()
+            .filter(|item| item.status.is_finalized())
+            .map(|item| item.claim_id)
+            .collect::<BTreeSet<_>>();
+        let persisted_duplicates = read_candidate_build_duplicates(&transaction, build_id)?
+            .into_iter()
+            .map(|duplicate| duplicate.claim_id)
+            .collect::<BTreeSet<_>>();
+        let items = items
+            .iter()
+            .filter(|item| !persisted_duplicates.contains(&item.claim_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let duplicates = duplicates
+            .iter()
+            .filter(|duplicate| !submitted_claims.contains(&duplicate.claim_id))
+            .copied()
+            .collect::<Vec<_>>();
+        for duplicate in &duplicates {
+            transaction
+                .execute(
+                    "DELETE FROM candidate_build_item
+                     WHERE build_id = ?1 AND claim_id = ?2 AND candidate_id IS NULL",
+                    params![build_id.to_string(), duplicate.claim_id.to_string()],
+                )
+                .map_err(sql_error(
+                    "release deduplicated Candidate Build outbox item",
+                ))?;
+        }
+        upsert_candidate_build_items(&transaction, build_id, &items)?;
+        insert_candidate_build_duplicates(&transaction, build_id, &duplicates)?;
         refresh_candidate_build_status(&transaction, build_id)?;
         let view = require_candidate_build_view(&transaction, build_id)?;
         transaction
@@ -1707,6 +2843,171 @@ impl TaskRuntime {
             .transpose()
     }
 
+    /// Lists a bounded set of pending or incomplete Build outboxes for the exact `ActiveTask`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing Session, an invalid bound, or storage failure.
+    pub fn list_recoverable_candidate_build_episodes(
+        &self,
+        locator: &ExternalSessionLocator,
+        limit: usize,
+    ) -> Result<Vec<WorkEpisodeId>> {
+        locator.validate()?;
+        if limit == 0 || limit > 64 {
+            return Err(invalid(
+                "Candidate Build recovery limit must be between 1 and 64",
+            ));
+        }
+        let connection = self.open_connection()?;
+        let external = read_external_identity(&connection, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Candidate recovery"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT build.episode_id
+                 FROM candidate_build AS build
+                 JOIN work_episode AS episode ON episode.episode_id = build.episode_id
+                 WHERE build.task_session_id = ?1 AND build.task_id = ?2
+                   AND (
+                       build.status IN ('pending', 'incomplete') OR EXISTS (
+                           SELECT 1
+                           FROM candidate_build_item AS item
+                           LEFT JOIN candidate_analysis AS analysis
+                             ON analysis.candidate_id = item.candidate_id
+                           WHERE item.build_id = build.build_id
+                             AND item.status IN ('created', 'already_exists')
+                             AND (analysis.candidate_id IS NULL
+                                  OR analysis.analysis_status != 'complete')
+                       )
+                   )
+                 ORDER BY build.recovery_attempt_generation ASC,
+                          CASE build.status WHEN 'pending' THEN 0 ELSE 1 END,
+                          episode.episode_ordinal ASC LIMIT ?3",
+            )
+            .map_err(sql_error("prepare recoverable Candidate Build list"))?;
+        let limit = i64::try_from(limit)
+            .map_err(|_| invalid("Candidate Build recovery limit overflows SQLite"))?;
+        statement
+            .query_map(
+                params![
+                    external.active_task_session_id.to_string(),
+                    external.active_task_id.to_string(),
+                    limit,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(sql_error("query recoverable Candidate Builds"))?
+            .map(|row| {
+                row.map_err(sql_error("read recoverable Candidate Build row"))
+                    .and_then(|value| parse_id(&value, "candidate_build.episode_id"))
+            })
+            .collect()
+    }
+
+    /// Persists one safe recovery attempt outcome and advances fair queue ordering.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown Build, unsafe error code, or storage failure.
+    pub fn record_candidate_build_recovery_attempt(
+        &self,
+        episode_id: WorkEpisodeId,
+        error_code: Option<&str>,
+    ) -> Result<()> {
+        if error_code.is_some_and(|code| !valid_error_code(code)) {
+            return Err(invalid("Candidate Build recovery error code is invalid"));
+        }
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Build recovery attempt")?;
+        let changed = transaction
+            .execute(
+                "UPDATE candidate_build
+                 SET recovery_attempt_generation = recovery_attempt_generation + 1,
+                     last_recovery_status = ?1, last_recovery_error_code = ?2
+                 WHERE episode_id = ?3",
+                params![
+                    if error_code.is_some() {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    },
+                    error_code,
+                    episode_id.to_string(),
+                ],
+            )
+            .map_err(sql_error("record Candidate Build recovery attempt"))?;
+        if changed != 1 {
+            return Err(invalid("Candidate Build recovery Episode does not exist"));
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Candidate Build recovery attempt"))
+    }
+
+    /// Returns non-sensitive pending/incomplete counts for one exact `ActiveTask`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing Session or storage failure.
+    pub fn candidate_build_recovery_status(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<CandidateBuildRecoveryStatus> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        let external = read_external_identity(&connection, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Candidate recovery"))?;
+        let (pending, incomplete) = connection
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'incomplete' THEN 1 ELSE 0 END)
+                 FROM candidate_build WHERE task_session_id = ?1 AND task_id = ?2",
+                params![
+                    external.active_task_session_id.to_string(),
+                    external.active_task_id.to_string(),
+                ],
+                |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .map_err(sql_error("read Candidate Build recovery status"))?;
+        Ok(CandidateBuildRecoveryStatus {
+            pending: usize::try_from(pending.unwrap_or(0))
+                .map_err(|_| invariant("pending Candidate Build count is invalid"))?,
+            incomplete: usize::try_from(incomplete.unwrap_or(0))
+                .map_err(|_| invariant("incomplete Candidate Build count is invalid"))?,
+        })
+    }
+
+    /// Checks exact `ActiveTask` ownership before target-aware Candidate recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns only locator/storage errors; missing or cross-owner Episodes are `false`.
+    pub fn owns_candidate_recovery_episode(
+        &self,
+        locator: &ExternalSessionLocator,
+        episode_id: WorkEpisodeId,
+    ) -> Result<bool> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        let external = read_external_identity(&connection, locator)?
+            .ok_or_else(|| invalid("ExternalSession has no ActiveTask for Candidate recovery"))?;
+        connection
+            .query_row(
+                "SELECT 1 FROM work_episode
+                 WHERE episode_id = ?1 AND task_session_id = ?2 AND task_id = ?3",
+                params![
+                    episode_id.to_string(),
+                    external.active_task_session_id.to_string(),
+                    external.active_task_id.to_string(),
+                ],
+                |_row| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(sql_error("check Candidate recovery Episode ownership"))
+    }
+
     /// Atomically replaces the current rebuildable review analysis for one persisted Candidate.
     ///
     /// # Errors
@@ -1781,6 +3082,26 @@ impl TaskRuntime {
                 ],
             )
             .map_err(sql_error("replace Candidate analysis"))?;
+        if candidate.analysis.status == sctx_domain::CandidateAnalysisStatus::Complete {
+            let top_relation = candidate
+                .analysis
+                .assessments
+                .iter()
+                .max_by_key(|assessment| assessment.confidence.basis_points)
+                .map(|assessment| serde_json::to_value(assessment.relation))
+                .transpose()
+                .map_err(json_error("serialize audit relation"))?;
+            transaction
+                .execute(
+                    "UPDATE candidate_review SET top_relation = ?2
+                 WHERE candidate_id = ?1 AND status = 'pending'",
+                    params![
+                        candidate.candidate_id.to_string(),
+                        top_relation.as_ref().and_then(serde_json::Value::as_str)
+                    ],
+                )
+                .map_err(sql_error("record completed analysis relation"))?;
+        }
         transaction
             .commit()
             .map_err(sql_error("commit Candidate analysis replacement"))?;
@@ -1820,6 +3141,18 @@ impl TaskRuntime {
             .transpose()
     }
 
+    /// Reads the current reservation or committed mapping for one proposed Space group.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures; absence remains `None`.
+    pub fn read_proposed_space_group(
+        &self,
+        proposed_space_group_key: ProposedSpaceGroupKey,
+    ) -> Result<Option<ProposedSpaceGroupMapping>> {
+        read_proposed_space_group_mapping(&self.open_connection()?, proposed_space_group_key)
+    }
+
     /// Lists one stable bounded page of Reviews owned by the locator's exact `ActiveTask`.
     ///
     /// # Errors
@@ -1828,6 +3161,31 @@ impl TaskRuntime {
     pub fn list_candidate_reviews(
         &self,
         locator: &ExternalSessionLocator,
+        status: CandidateReviewStatus,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<CandidateReviewPage> {
+        self.list_candidate_reviews_in_scope(
+            locator,
+            CandidateReviewScope::Task,
+            status,
+            limit,
+            cursor,
+        )
+    }
+
+    /// Lists one stable bounded page of Reviews at the requested scope.
+    ///
+    /// The page is ordered and cursored identically at both scopes, so a caller widening the scope
+    /// keeps its pagination contract and simply sees more rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed locator, cursor, bound, parse, or storage failures.
+    pub fn list_candidate_reviews_in_scope(
+        &self,
+        locator: &ExternalSessionLocator,
+        scope: CandidateReviewScope,
         status: CandidateReviewStatus,
         limit: usize,
         cursor: Option<&str>,
@@ -1861,11 +3219,19 @@ impl TaskRuntime {
                         review_version, status, discard_reason, created_at_unix_seconds,
                         expires_at_unix_seconds, discarded_at_unix_seconds,
                         expired_at_unix_seconds, confirmation_id, result_context_id
-                 FROM candidate_review
-                 WHERE task_session_id = ?1 AND task_id = ?2 AND status = ?3
-                   AND (created_at_unix_seconds > ?4 OR
-                        (created_at_unix_seconds = ?4 AND candidate_id > ?5))
-                 ORDER BY created_at_unix_seconds ASC, candidate_id ASC
+                 FROM candidate_review AS review
+                 WHERE ((?7 = 'task'
+                         AND review.task_session_id = ?1 AND review.task_id = ?2)
+                     OR (?7 = 'session'
+                         AND review.task_session_id IN (
+                             SELECT sibling.task_session_id FROM task_session AS sibling
+                             WHERE sibling.external_session_id = (
+                                 SELECT owner.external_session_id FROM task_session AS owner
+                                 WHERE owner.task_session_id = ?1))))
+                   AND review.status = ?3
+                   AND (review.created_at_unix_seconds > ?4 OR
+                        (review.created_at_unix_seconds = ?4 AND review.candidate_id > ?5))
+                 ORDER BY review.created_at_unix_seconds ASC, review.candidate_id ASC
                  LIMIT ?6",
             )
             .map_err(sql_error("prepare Candidate Review page"))?;
@@ -1880,6 +3246,7 @@ impl TaskRuntime {
                         .map_err(|_| invalid("Candidate Review cursor exceeds SQLite range"))?,
                     cursor_candidate,
                     query_limit,
+                    candidate_review_scope_name(scope),
                 ],
                 candidate_review_row,
             )
@@ -1905,6 +3272,147 @@ impl TaskRuntime {
             records,
             next_cursor,
         })
+    }
+
+    /// Counts Pending Candidate Reviews this Task's `ExternalSession` holds outside this Task.
+    ///
+    /// It is a bare count and nothing else. A sibling Task's Candidate is untrusted Agent-authored
+    /// content the current Task never asked for, so its statement stays out of this Task's Pack;
+    /// the number alone is enough to tell a reviewer that `candidate_list` with `scope: "session"`
+    /// has something to show.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage failures.
+    pub fn count_pending_candidates_in_other_tasks(
+        &self,
+        task_session_id: TaskSessionId,
+        task_id: TaskId,
+    ) -> Result<u32> {
+        let connection = self.open_connection()?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM candidate_review AS review
+                 WHERE review.status = 'pending'
+                   AND review.task_id <> ?2
+                   AND review.task_session_id IN (
+                       SELECT sibling.task_session_id FROM task_session AS sibling
+                       WHERE sibling.external_session_id = (
+                           SELECT owner.external_session_id FROM task_session AS owner
+                           WHERE owner.task_session_id = ?1))",
+                params![task_session_id.to_string(), task_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("count sibling Candidate Reviews"))?;
+        Ok(u32::try_from(count).unwrap_or(u32::MAX))
+    }
+
+    /// Counts installation-wide Pending Candidate Reviews for periodic maintenance.
+    ///
+    /// This is the one Review reader that is not scoped to an `ExternalSession` or an `ActiveTask`,
+    /// because periodic maintenance has neither: it observes the whole installation. It is also
+    /// strictly read-only — deliberately *not* running the lazy expiry sweep
+    /// [`cleanup_expired_candidate_reviews`](Self::cleanup_expired_candidate_reviews) that the
+    /// scoped list readers run first. Maintenance observes and reports; disposition is a separate
+    /// decision that ADR-0005 keeps behind an explicit act, so a survey must never change state.
+    ///
+    /// Because expiry is swept lazily, `pending_count` includes rows whose `expires_at` has already
+    /// passed but that no scoped read has retired yet; those rows are also counted in
+    /// `expiring_soon_count`, which is exactly the "needs a human soon" number a digest wants.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock or storage failures.
+    pub fn survey_candidate_reviews(
+        &self,
+        expiring_within_seconds: u64,
+    ) -> Result<CandidateReviewSurvey> {
+        self.survey_candidate_reviews_at(unix_seconds(SystemTime::now())?, expiring_within_seconds)
+    }
+
+    /// Deterministic survey boundary used by tests and maintenance orchestration.
+    ///
+    /// # Errors
+    ///
+    /// Returns bound or storage failures.
+    pub fn survey_candidate_reviews_at(
+        &self,
+        now_unix_seconds: u64,
+        expiring_within_seconds: u64,
+    ) -> Result<CandidateReviewSurvey> {
+        let horizon = i64::try_from(now_unix_seconds.saturating_add(expiring_within_seconds))
+            .map_err(|_| invalid("Candidate Review survey horizon exceeds SQLite range"))?;
+        let connection = self.open_connection()?;
+        let (pending, expiring): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(*) FILTER (WHERE expires_at_unix_seconds <= ?1)
+                 FROM candidate_review WHERE status = 'pending'",
+                [horizon],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error("survey Candidate Reviews"))?;
+        Ok(CandidateReviewSurvey {
+            pending_count: u64::try_from(pending).unwrap_or(0),
+            expiring_soon_count: u64::try_from(expiring).unwrap_or(0),
+        })
+    }
+
+    /// Lists Pending and Confirmed Candidate Reviews owned by every Task of one `ExternalSession`.
+    ///
+    /// Candidate Build uses it as the deduplication corpus: concurrent Agents that share one
+    /// `external_session_id` may hold parallel Tasks, so Task-local scope alone would miss the
+    /// restatements this exists to collapse.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown Task Session, an invalid bound, or storage failure.
+    pub fn list_session_candidate_reviews(
+        &self,
+        task_session_id: TaskSessionId,
+        limit: usize,
+    ) -> Result<Vec<CandidateReviewRecord>> {
+        if limit == 0 || limit > MAX_SESSION_CANDIDATE_REVIEW_SCAN {
+            return Err(invalid(
+                "Candidate Review session scan limit is outside the safe bound",
+            ));
+        }
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT review.candidate_id, review.submission_id, review.episode_id,
+                        review.task_session_id, review.task_id, review.build_id,
+                        review.final_checkpoint_id, review.checkpoint_id, review.claim_id,
+                        review.review_version, review.status, review.discard_reason,
+                        review.created_at_unix_seconds, review.expires_at_unix_seconds,
+                        review.discarded_at_unix_seconds, review.expired_at_unix_seconds,
+                        review.confirmation_id, review.result_context_id
+                 FROM candidate_review AS review
+                 JOIN task_session AS task ON task.task_session_id = review.task_session_id
+                 WHERE review.status IN ('pending', 'confirmed')
+                   AND task.external_session_id = (
+                       SELECT external_session_id FROM task_session WHERE task_session_id = ?1
+                   )
+                 ORDER BY review.created_at_unix_seconds ASC, review.candidate_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(sql_error("prepare ExternalSession Candidate Review scan"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    task_session_id.to_string(),
+                    i64::try_from(limit).map_err(|_| invalid(
+                        "Candidate Review session scan limit exceeds SQLite range"
+                    ))?,
+                ],
+                candidate_review_row,
+            )
+            .map_err(sql_error("query ExternalSession Candidate Reviews"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read ExternalSession Candidate Reviews"))?;
+        rows.into_iter()
+            .map(parse_candidate_review_record)
+            .collect()
     }
 
     /// Reads one complete Review identity only when it belongs to the locator's `ActiveTask`.
@@ -1954,106 +3462,79 @@ impl TaskRuntime {
         &self,
         request: &CandidateReviewDiscard,
     ) -> Result<CandidateReviewDiscardOutcome> {
-        request.locator.validate()?;
-        let reason = request.reason.trim();
-        if reason.is_empty() || reason.len() > 512 || request.expected_review_version == 0 {
-            return Err(invalid(
-                "Candidate discard requires a non-empty bounded reason and positive review version",
-            ));
+        self.discard_candidate_reviews(std::slice::from_ref(request))?
+            .pop()
+            .ok_or_else(|| invariant("Candidate Review discard produced no outcome"))
+    }
+
+    /// Applies several CAS-guarded discards inside one transaction.
+    ///
+    /// Every request must name the same `ExternalSession` and the same Task/Intent CAS. Any
+    /// rejected member rolls the whole batch back and names the failing `CandidateId`, so a batch
+    /// Review decision never leaves a partially discarded Task.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an empty or cross-Session batch, a stale-state error for a stale
+    /// Task/Intent/Review CAS, and a conflict for an already decided Review.
+    pub fn discard_candidate_reviews(
+        &self,
+        requests: &[CandidateReviewDiscard],
+    ) -> Result<Vec<CandidateReviewDiscardOutcome>> {
+        let Some(first) = requests.first() else {
+            return Err(invalid("Candidate discard requires at least one Candidate"));
+        };
+        first.locator.validate()?;
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if request.locator != first.locator
+                || request.expected_task_id != first.expected_task_id
+                || request.expected_intent_revision_id != first.expected_intent_revision_id
+            {
+                return Err(invalid(
+                    "Candidate discard batch must share one ExternalSession and Task/Intent CAS",
+                ));
+            }
+            if !seen.insert(request.candidate_id) {
+                return Err(invalid(
+                    "Candidate discard batch must not repeat a Candidate",
+                ));
+            }
+            let reason = request.reason.trim();
+            if reason.is_empty() || reason.len() > 512 || request.expected_review_version == 0 {
+                return Err(invalid(
+                    "Candidate discard requires a non-empty bounded reason and positive review version",
+                ));
+            }
         }
         self.cleanup_expired_candidate_reviews()?;
         let now = unix_seconds(SystemTime::now())?;
         let mut connection = self.open_connection()?;
         let transaction = immediate(&mut connection, "begin Candidate Review discard")?;
-        let task_session_id = find_active_task_by_locator(&transaction, &request.locator)?
+        let task_session_id = find_active_task_by_locator(&transaction, &first.locator)?
             .ok_or_else(|| invalid("ExternalSession has no ActiveTask"))?;
         let task = require_snapshot(&transaction, task_session_id)?;
-        if task.task_id != request.expected_task_id
+        if task.task_id != first.expected_task_id
             || task
                 .current_intent_revision()
-                .is_none_or(|revision| revision.revision_id != request.expected_intent_revision_id)
+                .is_none_or(|revision| revision.revision_id != first.expected_intent_revision_id)
         {
             return Err(Error::new(
                 ErrorKind::StaleState,
                 "Candidate discard Task/Intent ownership CAS is stale",
             ));
         }
-        let mut record = read_candidate_review_record(&transaction, request.candidate_id)?
-            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
-        if record.source_episode.task_session_id != task.task_session_id
-            || record.source_episode.task_id != task.task_id
-        {
-            return Err(invalid(
-                "Candidate Review does not belong to the ExternalSession ActiveTask",
-            ));
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                discard_one_candidate_review(&transaction, &task, request, now)
+                    .map_err(candidate_scoped_error(request.candidate_id))?,
+            );
         }
-        match record.status {
-            CandidateReviewStatus::Discarded => {
-                if record.discard_reason.as_deref() != Some(reason) {
-                    return Err(Error::new(
-                        ErrorKind::Conflict,
-                        "Candidate Review was already discarded with a different reason",
-                    ));
-                }
-                transaction
-                    .commit()
-                    .map_err(sql_error("commit idempotent Candidate Review discard"))?;
-                return Ok(CandidateReviewDiscardOutcome {
-                    record,
-                    status: CandidateReviewDiscardStatus::AlreadyDiscarded,
-                });
-            }
-            CandidateReviewStatus::Expired => {
-                return Err(Error::new(
-                    ErrorKind::Conflict,
-                    "Expired Candidate Review cannot be discarded",
-                ));
-            }
-            CandidateReviewStatus::Confirmed => {
-                return Err(Error::new(
-                    ErrorKind::Conflict,
-                    "Confirmed Candidate Review cannot be discarded",
-                ));
-            }
-            CandidateReviewStatus::Pending => {}
-        }
-        if record.review_version != request.expected_review_version {
-            return Err(Error::new(
-                ErrorKind::StaleState,
-                "Candidate Review version is stale",
-            ));
-        }
-        let changed = transaction
-            .execute(
-                "UPDATE candidate_review
-                 SET status = 'discarded', review_version = review_version + 1,
-                     discard_reason = ?1, discarded_at_unix_seconds = ?2
-                 WHERE candidate_id = ?3 AND review_version = ?4 AND status = 'pending'",
-                params![
-                    reason,
-                    i64::try_from(now)
-                        .map_err(|_| invalid("Candidate discard timestamp exceeds SQLite range"))?,
-                    request.candidate_id.to_string(),
-                    i64::try_from(request.expected_review_version)
-                        .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
-                ],
-            )
-            .map_err(sql_error("discard Candidate Review"))?;
-        if changed != 1 {
-            return Err(Error::new(
-                ErrorKind::StaleState,
-                "Candidate Review changed during discard",
-            ));
-        }
-        record = read_candidate_review_record(&transaction, request.candidate_id)?
-            .ok_or_else(|| invariant("discarded Candidate Review disappeared"))?;
         transaction
             .commit()
             .map_err(sql_error("commit Candidate Review discard"))?;
-        Ok(CandidateReviewDiscardOutcome {
-            record,
-            status: CandidateReviewDiscardStatus::Discarded,
-        })
+        Ok(outcomes)
     }
 
     /// Reserves one complete server-owned Confirmation plan before any Git write.
@@ -2068,6 +3549,7 @@ impl TaskRuntime {
         expected_task_id: TaskId,
         expected_intent_revision_id: TaskIntentRevisionId,
         plan: &CandidateConfirmationPlan,
+        proposed_space_group_key: Option<ProposedSpaceGroupKey>,
     ) -> Result<CandidateConfirmationReservation> {
         locator.validate()?;
         plan.validate()?;
@@ -2105,6 +3587,15 @@ impl TaskRuntime {
                     "Candidate Confirmation operation already has different semantics",
                 ));
             }
+            if let Some(proposed_space_group_key) = proposed_space_group_key {
+                reserve_proposed_space_group(
+                    &transaction,
+                    proposed_space_group_key,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    &existing.plan,
+                )?;
+            }
             transaction.commit().map_err(sql_error(
                 "commit existing Candidate Confirmation reservation",
             ))?;
@@ -2112,6 +3603,15 @@ impl TaskRuntime {
                 operation: existing,
                 created: false,
             });
+        }
+        if let Some(proposed_space_group_key) = proposed_space_group_key {
+            reserve_proposed_space_group(
+                &transaction,
+                proposed_space_group_key,
+                expected_task_id,
+                expected_intent_revision_id,
+                plan,
+            )?;
         }
         if review.status != CandidateReviewStatus::Pending {
             return Err(Error::new(
@@ -2187,81 +3687,256 @@ impl TaskRuntime {
         operation_hash: &str,
         confirmation_id: ConfirmationId,
         result_context_id: ContextId,
+        decision_source: DecisionSource,
     ) -> Result<CandidateConfirmationFinalizeOutcome> {
-        let mut connection = self.open_connection()?;
-        let transaction = immediate(&mut connection, "begin Candidate Confirmation finalize")?;
-        let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
-            .ok_or_else(|| invalid("Candidate Confirmation operation is not reserved"))?;
-        if operation.operation_hash != operation_hash
-            || operation.plan.confirmation.confirmation_id != confirmation_id
-            || operation.plan.result_context_id != result_context_id
-        {
-            return Err(Error::new(
-                ErrorKind::Conflict,
-                "Committed Candidate Confirmation does not match the reserved operation",
+        self.finalize_candidate_confirmations(&[CandidateConfirmationFinalize {
+            candidate_id,
+            operation_hash: operation_hash.to_owned(),
+            confirmation_id,
+            result_context_id,
+            decision_source,
+        }])?
+        .pop()
+        .ok_or_else(|| invariant("Candidate Confirmation finalize produced no outcome"))
+    }
+
+    /// Marks several Git-committed Confirmations terminal inside one transaction.
+    ///
+    /// The Git batch that committed these Confirmations was atomic, so the Runtime side is too:
+    /// a rejected member rolls every Review and operation status back and names the failing
+    /// `CandidateId`. Retrying the same batch replays the Git write and finalizes again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error for an empty or repeating batch, and typed operation-hash,
+    /// plan-identity, Review CAS, or storage errors for any member.
+    pub fn finalize_candidate_confirmations(
+        &self,
+        requests: &[CandidateConfirmationFinalize],
+    ) -> Result<Vec<CandidateConfirmationFinalizeOutcome>> {
+        if requests.is_empty() {
+            return Err(invalid(
+                "Candidate Confirmation finalize requires at least one Candidate",
             ));
         }
-        if operation.status == CandidateConfirmationOperationStatus::Committed {
-            let review = read_candidate_review_record(&transaction, candidate_id)?
-                .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
-            if review.status != CandidateReviewStatus::Confirmed
-                || review.confirmation_id != Some(confirmation_id)
-                || review.result_context_id != Some(result_context_id)
-            {
-                return Err(invariant(
-                    "committed Candidate Confirmation and Review audit disagree",
+        let mut seen = BTreeSet::new();
+        for request in requests {
+            if !seen.insert(request.candidate_id) {
+                return Err(invalid(
+                    "Candidate Confirmation finalize batch must not repeat a Candidate",
                 ));
             }
-            transaction.commit().map_err(sql_error(
-                "commit idempotent Candidate Confirmation finalize",
-            ))?;
-            return Ok(CandidateConfirmationFinalizeOutcome {
-                operation,
-                review,
-                already_confirmed: true,
-            });
         }
-        let changed = transaction
-            .execute(
-                "UPDATE candidate_review
-                 SET status = 'confirmed', review_version = review_version + 1,
-                     confirmation_id = ?1, result_context_id = ?2
-                 WHERE candidate_id = ?3 AND status = 'pending' AND review_version = ?4",
-                params![
-                    confirmation_id.to_string(),
-                    result_context_id.to_string(),
-                    candidate_id.to_string(),
-                    i64::try_from(operation.review_parent_version).map_err(|_| invalid(
-                        "Candidate Review parent version exceeds SQLite range"
-                    ))?,
-                ],
-            )
-            .map_err(sql_error("confirm Candidate Review"))?;
-        if changed != 1 {
-            return Err(Error::new(
-                ErrorKind::StaleState,
-                "Candidate Review changed before Confirmation finalized",
-            ));
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Candidate Confirmation finalize")?;
+        let mut outcomes = Vec::with_capacity(requests.len());
+        for request in requests {
+            outcomes.push(
+                finalize_one_candidate_confirmation(&transaction, request)
+                    .map_err(confirmation_scoped_error(request.candidate_id))?,
+            );
         }
-        transaction
-            .execute(
-                "UPDATE candidate_confirmation_operation SET status = 'committed'
-                 WHERE candidate_id = ?1 AND status = 'reserved'",
-                [candidate_id.to_string()],
-            )
-            .map_err(sql_error("commit Candidate Confirmation operation status"))?;
-        let operation = read_candidate_confirmation_operation(&transaction, candidate_id)?
-            .ok_or_else(|| invariant("committed Candidate Confirmation operation disappeared"))?;
-        let review = read_candidate_review_record(&transaction, candidate_id)?
-            .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
         transaction
             .commit()
             .map_err(sql_error("commit Candidate Confirmation finalize"))?;
-        Ok(CandidateConfirmationFinalizeOutcome {
-            operation,
-            review,
-            already_confirmed: false,
-        })
+        Ok(outcomes)
+    }
+
+    /// Resolves this system's opaque `ExternalSession` identifier for one Agent locator.
+    ///
+    /// The `xss_` identifier is what disposition provenance records, not the Agent's own session
+    /// key: it is this system's own opaque id, it is stable across the Session, and it is the
+    /// selector `sctx context withdraw --external-session` accepts.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed validation, parse, or storage failures.
+    pub fn resolve_external_session_id(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<Option<ExternalSessionId>> {
+        locator.validate()?;
+        let connection = self.open_connection()?;
+        Ok(read_external_identity(&connection, locator)?
+            .map(|identity| identity.external_session_id))
+    }
+
+    /// Counts one automatic confirmation the server refused.
+    ///
+    /// The human reversal rate of automatic confirmations, and the rate at which the permission
+    /// surface refuses them, are the only inputs for widening or narrowing that surface, so the
+    /// refusal is counted rather than only returned. Best effort by construction: a failure to
+    /// record a refusal must never turn into a second failure on top of the refusal itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed clock or storage failures.
+    pub fn record_auto_confirm_rejection(
+        &self,
+        candidate_id: CandidateId,
+        external_session_id: Option<ExternalSessionId>,
+        error_code: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let now = i64::try_from(unix_seconds(SystemTime::now())?)
+            .map_err(|_| invalid("rejection timestamp exceeds SQLite range"))?;
+        let connection = self.open_connection()?;
+        connection
+            .execute(
+                "INSERT INTO auto_confirm_rejection (
+                    recorded_at_unix_seconds, candidate_id, external_session_id,
+                    error_code, reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    now,
+                    candidate_id.to_string(),
+                    external_session_id.map(|value| value.to_string()),
+                    error_code,
+                    bounded_rejection_reason(reason),
+                ],
+            )
+            .map_err(sql_error("record automatic confirmation rejection"))?;
+        Ok(())
+    }
+
+    /// Reports local disposition totals grouped by who decided them.
+    ///
+    /// Every Review decided before `decision_source` existed reads back as `human`: that is what
+    /// it was, since no other disposition could produce it.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures.
+    pub fn candidate_disposition_stats(&self) -> Result<CandidateDispositionStats> {
+        let connection = self.open_connection()?;
+        let mut stats = CandidateDispositionStats::default();
+        let mut statement = connection
+            .prepare(
+                "SELECT status, COALESCE(decision_source, 'human'), COUNT(*), top_relation
+                 FROM candidate_review
+                 WHERE status IN ('confirmed', 'discarded')
+                    OR (status = 'expired' AND discarded_at_unix_seconds IS NOT NULL)
+                 GROUP BY status, COALESCE(decision_source, 'human'), top_relation
+                 ORDER BY top_relation, COALESCE(decision_source, 'human'), status",
+            )
+            .map_err(sql_error("prepare disposition totals"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(sql_error("query disposition totals"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read disposition totals"))?;
+        let mut groups = BTreeMap::<(Option<String>, String), DispositionCounts>::new();
+        for (status, decision_source, count, relation) in rows {
+            let count = usize::try_from(count).unwrap_or(0);
+            let bucket = match DecisionSource::parse(&decision_source)? {
+                DecisionSource::Human => &mut stats.human,
+                DecisionSource::AgentPolicy => &mut stats.agent_policy,
+            };
+            let group = groups.entry((relation, decision_source)).or_default();
+            match status.as_str() {
+                "confirmed" => group.confirmed = group.confirmed.saturating_add(count),
+                "discarded" | "expired" => group.discarded = group.discarded.saturating_add(count),
+                _ => {}
+            }
+            match status.as_str() {
+                "confirmed" => bucket.confirmed = bucket.confirmed.saturating_add(count),
+                "discarded" => bucket.discarded = bucket.discarded.saturating_add(count),
+                _ => {}
+            }
+        }
+        stats.relation_decisions = groups
+            .into_iter()
+            .map(|((top_relation, source), counts)| {
+                Ok(RelationDispositionCounts {
+                    top_relation,
+                    decision_source: DecisionSource::parse(&source)?,
+                    counts,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        stats.auto_confirm_not_permitted = connection
+            .query_row(
+                "SELECT COUNT(*) FROM auto_confirm_rejection
+                 WHERE error_code = 'auto_confirm_not_permitted'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sql_error("read automatic confirmation rejections"))
+            .map(|count| usize::try_from(count).unwrap_or(0))?;
+        Ok(stats)
+    }
+
+    /// Lists every confirmed Candidate this installation decided under the given selector.
+    ///
+    /// It answers exactly the question batch revocation asks — "which accepted Contexts came out
+    /// of automatic confirmations, optionally from this one session" — and returns nothing else.
+    /// A `None` selector field is not a filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed parse or storage failures.
+    pub fn list_confirmed_dispositions(
+        &self,
+        decision_source: Option<DecisionSource>,
+        external_session_id: Option<ExternalSessionId>,
+    ) -> Result<Vec<ConfirmedDisposition>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT review.candidate_id, review.result_context_id,
+                        COALESCE(review.decision_source, 'human'), task.external_session_id
+                 FROM candidate_review AS review
+                 JOIN task_session AS task ON task.task_id = review.task_id
+                 WHERE review.status = 'confirmed'
+                   AND review.result_context_id IS NOT NULL
+                   AND (?1 IS NULL OR COALESCE(review.decision_source, 'human') = ?1)
+                   AND (?2 IS NULL OR task.external_session_id = ?2)
+                 ORDER BY review.created_at_unix_seconds ASC, review.candidate_id ASC",
+            )
+            .map_err(sql_error("prepare confirmed disposition selector"))?;
+        let rows = statement
+            .query_map(
+                params![
+                    decision_source.map(DecisionSource::as_str),
+                    external_session_id.map(|value| value.to_string()),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(sql_error("query confirmed dispositions"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error("read confirmed dispositions"))?;
+        rows.into_iter()
+            .map(
+                |(candidate_id, context_id, decision_source, external_session_id)| {
+                    Ok(ConfirmedDisposition {
+                        candidate_id: parse_id(&candidate_id, "candidate_review.candidate_id")?,
+                        result_context_id: parse_id(
+                            &context_id,
+                            "candidate_review.result_context_id",
+                        )?,
+                        decision_source: DecisionSource::parse(&decision_source)?,
+                        external_session_id: parse_id(
+                            &external_session_id,
+                            "task_session.external_session_id",
+                        )?,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Expires retained Pending/Discarded Reviews and removes only heavy Runtime analysis.
@@ -2409,22 +4084,307 @@ impl TaskRuntime {
         read_signal_records(&self.open_connection()?, task_session_id)
     }
 
+    /// Records the Contexts one retrieval entry point just injected into a Task.
+    ///
+    /// `(task_id, context_id)` is unique: re-injecting the same Context into the same Task only
+    /// advances `last_injected_at_unix_seconds`, so the first Intent revision, revision, entry
+    /// point **and moment** that produced the injection stay the recorded provenance. Refreshing
+    /// `injected_at_unix_seconds` instead is what used to invert the audit trail against
+    /// `context_usage`, whose verdicts this write never touches either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors. Callers treat them as advisory: a failed injection record
+    /// must never change the retrieval response.
+    pub fn record_task_injections(
+        &self,
+        task_id: TaskId,
+        intent_revision_id: TaskIntentRevisionId,
+        source: ContextInjectionSource,
+        contexts: &[InjectedContext],
+    ) -> Result<usize> {
+        self.record_task_injections_at(
+            task_id,
+            intent_revision_id,
+            source,
+            contexts,
+            unix_seconds(SystemTime::now())?,
+        )
+    }
+
+    /// Records injections against an explicit clock reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn record_task_injections_at(
+        &self,
+        task_id: TaskId,
+        intent_revision_id: TaskIntentRevisionId,
+        source: ContextInjectionSource,
+        contexts: &[InjectedContext],
+        now_unix_seconds: u64,
+    ) -> Result<usize> {
+        if contexts.is_empty() {
+            return Ok(0);
+        }
+        let injected_at = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("injection timestamp exceeds the supported range"))?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Task injection record")?;
+        let mut written = 0;
+        for context in contexts.iter().collect::<BTreeSet<_>>() {
+            written += transaction
+                .execute(
+                    "INSERT INTO task_injection (
+                        task_id, context_id, intent_revision_id, revision_id,
+                        injected_at_unix_seconds, last_injected_at_unix_seconds, source
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)
+                     ON CONFLICT (task_id, context_id) DO UPDATE SET
+                        last_injected_at_unix_seconds =
+                            excluded.last_injected_at_unix_seconds",
+                    params![
+                        task_id.to_string(),
+                        context.context_id.to_string(),
+                        intent_revision_id.to_string(),
+                        context.revision_id.to_string(),
+                        injected_at,
+                        source.as_str(),
+                    ],
+                )
+                .map_err(sql_error("record Task injection"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Task injection record"))?;
+        Ok(written)
+    }
+
+    /// Reads every Context injected into one Task, ordered by Context identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn read_task_injections(&self, task_id: TaskId) -> Result<Vec<TaskInjectionRecord>> {
+        let connection = self.open_connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT context_id, intent_revision_id, revision_id,
+                        injected_at_unix_seconds, last_injected_at_unix_seconds, source
+                 FROM task_injection WHERE task_id = ?1 ORDER BY context_id ASC",
+            )
+            .map_err(sql_error("prepare Task injection read"))?;
+        let rows = statement
+            .query_map(params![task_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(sql_error("read Task injections"))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let row = row.map_err(sql_error("read Task injection row"))?;
+            records.push(TaskInjectionRecord {
+                task_id,
+                context_id: parse_id(&row.0, "task_injection.context_id")?,
+                intent_revision_id: parse_id(&row.1, "task_injection.intent_revision_id")?,
+                revision_id: parse_id(&row.2, "task_injection.revision_id")?,
+                injected_at_unix_seconds: u64::try_from(row.3).map_err(|_| {
+                    invariant("task_injection.injected_at_unix_seconds is negative")
+                })?,
+                last_injected_at_unix_seconds: u64::try_from(row.4).map_err(|_| {
+                    invariant("task_injection.last_injected_at_unix_seconds is negative")
+                })?,
+                source: ContextInjectionSource::parse(&row.5)?,
+            });
+        }
+        Ok(records)
+    }
+
+    /// Conservatively fills missing verdicts for every Task owned by this exact Session.
+    ///
+    /// Existing verdicts, including their evidence basis and timestamps, are never changed.
+    /// Hook callers use their short busy timeout and treat failures as advisory.
+    ///
+    /// # Errors
+    /// Returns typed identity, clock, or storage errors.
+    pub fn record_session_close_usage(&self, locator: &ExternalSessionLocator) -> Result<usize> {
+        self.record_session_close_usage_at(locator, unix_seconds(SystemTime::now())?)
+    }
+
+    /// Records conservative Session-close verdicts against an explicit clock reading.
+    ///
+    /// # Errors
+    /// Returns typed identity, timestamp, or storage errors.
+    pub fn record_session_close_usage_at(
+        &self,
+        locator: &ExternalSessionLocator,
+        now_unix_seconds: u64,
+    ) -> Result<usize> {
+        locator.validate()?;
+        let recorded_at = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("Session close usage timestamp exceeds the supported range"))?;
+        self.open_connection()?.execute(
+            "INSERT INTO context_usage (context_id, task_id, outcome, recorded_at_unix_seconds, basis)
+             SELECT injection.context_id, injection.task_id, 'ignored', ?3, 'session_close'
+             FROM task_injection AS injection
+             JOIN task_session AS task ON task.task_id = injection.task_id
+             JOIN external_session AS session ON session.external_session_id = task.external_session_id
+             WHERE session.agent_kind = ?1 AND session.external_session_key = ?2
+               AND NOT EXISTS (SELECT 1 FROM context_usage AS usage
+                 WHERE usage.context_id = injection.context_id AND usage.task_id = injection.task_id)
+             ON CONFLICT(context_id, task_id) DO NOTHING",
+            params![locator.agent_kind, locator.external_session_id, recorded_at],
+        ).map_err(sql_error("record conservative Session close usage"))
+    }
+
+    /// Records what one Task did with the Contexts injected into it.
+    ///
+    /// A write only ever raises a `(context, task)` pair: `ignored` never overwrites `reused` or
+    /// `refuted`, and `reused` never overwrites `refuted`. Re-deriving the same outcomes writes
+    /// the same rows, so a same-content Checkpoint replay leaves the table unchanged, and a
+    /// Candidate Build rerun cannot erase reuse a later signal already proved.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn record_context_usage(&self, records: &[ContextUsageRecord]) -> Result<usize> {
+        self.record_context_usage_at(records, unix_seconds(SystemTime::now())?)
+    }
+
+    /// Records usage outcomes against an explicit clock reading.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn record_context_usage_at(
+        &self,
+        records: &[ContextUsageRecord],
+        now_unix_seconds: u64,
+    ) -> Result<usize> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let recorded_at = i64::try_from(now_unix_seconds)
+            .map_err(|_| invalid("Context usage timestamp exceeds the supported range"))?;
+        let mut connection = self.open_connection()?;
+        let transaction = immediate(&mut connection, "begin Context usage record")?;
+        let statement = format!(
+            "INSERT INTO context_usage (
+                context_id, task_id, outcome, recorded_at_unix_seconds, basis
+             ) VALUES (?1, ?2, ?3, ?4, 'checkpoint_derived')
+             ON CONFLICT (context_id, task_id) DO UPDATE SET
+                outcome = excluded.outcome,
+                basis = excluded.basis,
+                recorded_at_unix_seconds = excluded.recorded_at_unix_seconds
+             WHERE ?5 >= ({})",
+            ContextUsageOutcome::PRIORITY_SQL
+        );
+        let mut written = 0;
+        for record in records {
+            written += transaction
+                .execute(
+                    &statement,
+                    params![
+                        record.context_id.to_string(),
+                        record.task_id.to_string(),
+                        record.outcome.as_str(),
+                        recorded_at,
+                        i64::from(record.outcome.priority()),
+                    ],
+                )
+                .map_err(sql_error("record Context usage"))?;
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit Context usage record"))?;
+        Ok(written)
+    }
+
+    /// Aggregates checkpoint-derived usage outcomes of the requested Contexts.
+    /// Weak Session-close omissions are excluded from strong evidence calibration.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed storage errors.
+    pub fn context_usage_totals(
+        &self,
+        context_ids: &[ContextId],
+    ) -> Result<BTreeMap<ContextId, ContextUsageTotals>> {
+        let mut totals = BTreeMap::new();
+        let requested = context_ids.iter().copied().collect::<BTreeSet<_>>();
+        if requested.is_empty() {
+            return Ok(totals);
+        }
+        let connection = self.open_connection()?;
+        for chunk in requested
+            .into_iter()
+            .collect::<Vec<_>>()
+            .chunks(USAGE_TOTALS_QUERY_CHUNK)
+        {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT context_id, outcome, COUNT(*) FROM context_usage
+                     WHERE context_id IN ({placeholders}) AND basis = 'checkpoint_derived'
+                     GROUP BY context_id, outcome"
+                ))
+                .map_err(sql_error("prepare Context usage totals"))?;
+            let parameters = chunk.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(parameters.iter()), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(sql_error("read Context usage totals"))?;
+            for row in rows {
+                let row = row.map_err(sql_error("read Context usage totals row"))?;
+                let context_id = parse_id::<ContextId>(&row.0, "context_usage.context_id")?;
+                let count = u32::try_from(row.2).unwrap_or(u32::MAX);
+                let entry = totals
+                    .entry(context_id)
+                    .or_insert_with(ContextUsageTotals::default);
+                match row.1.as_str() {
+                    "reused" => entry.reused = count,
+                    "ignored" => entry.ignored = count,
+                    "refuted" => entry.refuted = count,
+                    other => return Err(invariant(format!("unknown usage outcome {other}"))),
+                }
+            }
+        }
+        Ok(totals)
+    }
+
     fn open_connection(&self) -> Result<Connection> {
         let connection =
             Connection::open(&self.database).map_err(sql_error("open task runtime database"))?;
         connection
-            .busy_timeout(BUSY_TIMEOUT)
+            .busy_timeout(self.busy_timeout)
             .map_err(sql_error("configure task runtime busy timeout"))?;
-        connection
-            .pragma_update(None, "journal_mode", "WAL")
-            .map_err(sql_error("configure task runtime journal mode"))?;
-        connection
-            .pragma_update(None, "synchronous", "NORMAL")
-            .map_err(sql_error("configure task runtime synchronous mode"))?;
+        if self.configure_schema_on_open {
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .map_err(sql_error("configure task runtime journal mode"))?;
+            connection
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(sql_error("configure task runtime synchronous mode"))?;
+        }
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(sql_error("enable task runtime foreign keys"))?;
-        ensure_schema(&connection)?;
+        if self.configure_schema_on_open {
+            ensure_schema(&connection)?;
+        }
         Ok(connection)
     }
 }
@@ -2448,6 +4408,44 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
     let version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(sql_error("read task runtime schema version"))?;
+    // The in-place upgrades chain, so an installation two versions behind reaches the current
+    // schema in one open instead of being told its database is unsupported.
+    let mut version = version;
+    if version == 13 {
+        migrate_schema_13_to_14(connection)?;
+        version = 14;
+    }
+    if version == 14 {
+        migrate_schema_14_to_15(connection)?;
+        version = 15;
+    }
+    if version == 15 {
+        migrate_schema_15_to_16(connection)?;
+        version = 16;
+    }
+    if version == 16 {
+        migrate_schema_16_to_17(connection)?;
+        version = 17;
+    }
+    if version == 17 {
+        migrate_schema_17_to_18(connection)?;
+        version = 18;
+    }
+    if version == 18 {
+        migrate_schema_18_to_19(connection)?;
+        version = 19;
+    }
+    if version == 19 {
+        migrate_schema_19_to_20(connection)?;
+        version = 20;
+    }
+    if version == 20 {
+        migrate_schema_20_to_21(connection)?;
+        version = 21;
+    }
+    if version == 21 {
+        return migrate_schema_21_to_22(connection);
+    }
     if version != 0 && version != SCHEMA_VERSION {
         return Err(invariant(format!(
             "unsupported task runtime schema version {version}; expected {SCHEMA_VERSION}"
@@ -2461,6 +4459,10 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 external_session_key TEXT NOT NULL,
                 active_task_session_id TEXT NOT NULL,
                 active_task_id TEXT NOT NULL,
+                checkpoint_reminder_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (checkpoint_reminder_count >= 0),
+                activity_since_checkpoint_reminder INTEGER NOT NULL DEFAULT 0
+                    CHECK (activity_since_checkpoint_reminder >= 0),
                 UNIQUE (agent_kind, external_session_key),
                 FOREIGN KEY (external_session_id, active_task_session_id, active_task_id)
                     REFERENCES task_session (external_session_id, task_session_id, task_id)
@@ -2569,17 +4571,6 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 PRIMARY KEY (observation_id, source_ordinal),
                 FOREIGN KEY (observation_id) REFERENCES work_observation (observation_id)
             ) STRICT;
-            CREATE TABLE IF NOT EXISTS capture_ingestion (
-                capture_id TEXT PRIMARY KEY,
-                episode_id TEXT NOT NULL,
-                observation_id TEXT NOT NULL UNIQUE,
-                task_session_id TEXT NOT NULL,
-                task_id TEXT NOT NULL,
-                FOREIGN KEY (observation_id, episode_id)
-                    REFERENCES work_observation (observation_id, episode_id),
-                FOREIGN KEY (episode_id, task_session_id, task_id)
-                    REFERENCES work_episode (episode_id, task_session_id, task_id)
-            ) STRICT;
             CREATE TABLE IF NOT EXISTS agent_checkpoint (
                 checkpoint_id TEXT PRIMARY KEY,
                 episode_id TEXT NOT NULL,
@@ -2606,10 +4597,39 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 task_id TEXT NOT NULL,
                 final_checkpoint_id TEXT NOT NULL,
                 status TEXT NOT NULL CHECK (status IN ('pending', 'complete', 'incomplete')),
+                recovery_attempt_generation INTEGER NOT NULL DEFAULT 0
+                    CHECK (recovery_attempt_generation >= 0),
+                last_recovery_status TEXT CHECK (
+                    last_recovery_status IS NULL OR last_recovery_status IN ('succeeded', 'failed')
+                ),
+                last_recovery_error_code TEXT,
+                CHECK (
+                    (last_recovery_status = 'failed' AND last_recovery_error_code IS NOT NULL) OR
+                    (last_recovery_status IS NULL AND last_recovery_error_code IS NULL) OR
+                    (last_recovery_status = 'succeeded' AND last_recovery_error_code IS NULL)
+                ),
                 FOREIGN KEY (episode_id, task_session_id, task_id)
                     REFERENCES work_episode (episode_id, task_session_id, task_id),
                 FOREIGN KEY (final_checkpoint_id, episode_id)
                     REFERENCES agent_checkpoint (checkpoint_id, episode_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS checkpoint_operation (
+                operation_key TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL UNIQUE,
+                semantic_json TEXT NOT NULL CHECK (json_valid(semantic_json)),
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL UNIQUE,
+                episode_id TEXT NOT NULL UNIQUE,
+                build_id TEXT NOT NULL UNIQUE,
+                FOREIGN KEY (task_session_id) REFERENCES task_session (task_session_id),
+                FOREIGN KEY (task_id) REFERENCES task_session (task_id),
+                FOREIGN KEY (intent_revision_id)
+                    REFERENCES task_intent_revision (revision_id),
+                FOREIGN KEY (checkpoint_id, episode_id)
+                    REFERENCES agent_checkpoint (checkpoint_id, episode_id),
+                FOREIGN KEY (build_id) REFERENCES candidate_build (build_id)
             ) STRICT;
             CREATE TABLE IF NOT EXISTS candidate_build_item (
                 build_id TEXT NOT NULL,
@@ -2619,7 +4639,7 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 submission_id TEXT NOT NULL UNIQUE,
                 content_hash TEXT,
                 status TEXT NOT NULL CHECK (status IN (
-                    'prepared', 'needs_evidence', 'created', 'already_exists', 'failed'
+                    'queued', 'prepared', 'needs_evidence', 'created', 'already_exists', 'failed'
                 )),
                 candidate_id TEXT,
                 event_id TEXT,
@@ -2627,6 +4647,8 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 PRIMARY KEY (build_id, claim_id),
                 UNIQUE (build_id, item_ordinal),
                 CHECK (
+                    (status = 'queued' AND content_hash IS NULL
+                        AND candidate_id IS NULL AND event_id IS NULL AND error_code IS NULL) OR
                     (status = 'prepared' AND content_hash IS NOT NULL
                         AND candidate_id IS NULL AND event_id IS NULL AND error_code IS NULL) OR
                     (status = 'needs_evidence' AND content_hash IS NULL
@@ -2637,6 +4659,20 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                     (status = 'failed' AND candidate_id IS NULL AND event_id IS NULL
                         AND error_code IS NOT NULL)
                 ),
+                FOREIGN KEY (build_id) REFERENCES candidate_build (build_id),
+                FOREIGN KEY (checkpoint_id) REFERENCES agent_checkpoint (checkpoint_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS candidate_build_duplicate (
+                build_id TEXT NOT NULL,
+                duplicate_ordinal INTEGER NOT NULL CHECK (duplicate_ordinal >= 0),
+                checkpoint_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL,
+                duplicate_of_candidate_id TEXT NOT NULL,
+                similarity_basis_points INTEGER NOT NULL CHECK (
+                    similarity_basis_points BETWEEN 0 AND 10000
+                ),
+                PRIMARY KEY (build_id, claim_id),
+                UNIQUE (build_id, duplicate_ordinal),
                 FOREIGN KEY (build_id) REFERENCES candidate_build (build_id),
                 FOREIGN KEY (checkpoint_id) REFERENCES agent_checkpoint (checkpoint_id)
             ) STRICT;
@@ -2677,6 +4713,10 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 expired_at_unix_seconds INTEGER,
                 confirmation_id TEXT,
                 result_context_id TEXT,
+                decision_source TEXT CHECK (
+                    decision_source IS NULL OR decision_source IN ('human', 'agent_policy')
+                ),
+                top_relation TEXT,
                 UNIQUE (build_id, claim_id),
                 CHECK (
                     (status = 'pending' AND discard_reason IS NULL
@@ -2718,21 +4758,472 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
                 UNIQUE (candidate_id, review_parent_version),
                 FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id)
             ) STRICT;
-            CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
-                episode_id TEXT NOT NULL,
-                diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
-                capture_id TEXT NOT NULL,
-                kind TEXT NOT NULL CHECK (kind IN (
-                    'capture_repository_not_configured',
-                    'capture_unsafe_artifact_path'
-                )),
-                PRIMARY KEY (episode_id, diagnostic_ordinal),
-                UNIQUE (episode_id, capture_id, kind),
+            CREATE TABLE IF NOT EXISTS proposed_space_group (
+                proposed_space_group_key TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL UNIQUE,
+                space_id TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('reserved', 'committed')),
+                UNIQUE (task_id, intent_revision_id),
+                FOREIGN KEY (candidate_id) REFERENCES candidate_review (candidate_id),
+                FOREIGN KEY (intent_revision_id) REFERENCES task_intent_revision (revision_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS task_injection (
+                task_id TEXT NOT NULL,
+                context_id TEXT NOT NULL,
+                intent_revision_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                injected_at_unix_seconds INTEGER NOT NULL CHECK (
+                    injected_at_unix_seconds >= 0
+                ),
+                last_injected_at_unix_seconds INTEGER NOT NULL CHECK (
+                    last_injected_at_unix_seconds >= 0
+                ),
+                source TEXT NOT NULL CHECK (
+                    source IN ('intent_update', 'task_context', 'artifact_focus')
+                ),
+                PRIMARY KEY (task_id, context_id),
+                FOREIGN KEY (task_id) REFERENCES task_session (task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS context_usage (
+                context_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                outcome TEXT NOT NULL CHECK (
+                    outcome IN ('reused', 'ignored', 'refuted')
+                ),
+                basis TEXT NOT NULL DEFAULT 'checkpoint_derived'
+                    CHECK (basis IN ('checkpoint_derived', 'session_close')),
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                PRIMARY KEY (context_id, task_id),
+                FOREIGN KEY (task_id) REFERENCES task_session (task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS checkpoint_reference_derivation (
+                episode_id TEXT PRIMARY KEY,
+                derived_at_unix_seconds INTEGER CHECK (
+                    derived_at_unix_seconds IS NULL OR derived_at_unix_seconds >= 0
+                ),
+                placed_count INTEGER NOT NULL DEFAULT 0 CHECK (placed_count >= 0),
+                unresolved_count INTEGER NOT NULL DEFAULT 0 CHECK (unresolved_count >= 0),
+                ambiguity_json TEXT CHECK (
+                    ambiguity_json IS NULL OR json_valid(ambiguity_json)
+                ),
+                unresolved_sample_json TEXT CHECK (
+                    unresolved_sample_json IS NULL OR json_valid(unresolved_sample_json)
+                ),
+                reopened INTEGER NOT NULL DEFAULT 0 CHECK (reopened IN (0, 1)),
                 FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
             ) STRICT;
-            PRAGMA user_version = 11;",
+            CREATE TABLE IF NOT EXISTS pending_prompt_signal (
+                agent_kind TEXT NOT NULL,
+                external_session_key TEXT NOT NULL,
+                prompt_ordinal INTEGER NOT NULL CHECK (prompt_ordinal >= 0),
+                content TEXT NOT NULL,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                PRIMARY KEY (agent_kind, external_session_key, prompt_ordinal)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS hook_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
+                agent_kind TEXT NOT NULL,
+                external_session_id TEXT,
+                event_kind TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('enabled', 'disabled', 'neutral', 'fail_open')
+                ),
+                reason TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+                detail TEXT CHECK (detail IS NULL OR length(detail) <= 256)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS hook_event_recorded_at
+                ON hook_event (recorded_at_unix_ms);
+            CREATE TABLE IF NOT EXISTS auto_confirm_rejection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                candidate_id TEXT NOT NULL,
+                external_session_id TEXT,
+                error_code TEXT NOT NULL,
+                reason TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
+                ON auto_confirm_rejection (recorded_at_unix_seconds);
+            PRAGMA user_version = 22;",
         )
         .map_err(sql_error("initialize task runtime schema"))
+}
+
+/// Adds the additive `hook_event` table (and its index) to an existing schema version 13
+/// installation and advances `user_version` to 14, in one transaction. Every prior table and
+/// its data is left untouched. [`ensure_schema`] chains this into the next upgrade rather than
+/// returning here; every version below 13 still hard-fails.
+fn migrate_schema_13_to_14(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS hook_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_ms INTEGER NOT NULL CHECK (recorded_at_unix_ms >= 0),
+                agent_kind TEXT NOT NULL,
+                external_session_id TEXT,
+                event_kind TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK (
+                    decision IN ('enabled', 'disabled', 'neutral', 'fail_open')
+                ),
+                reason TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+                detail TEXT CHECK (detail IS NULL OR length(detail) <= 256)
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS hook_event_recorded_at
+                ON hook_event (recorded_at_unix_ms);
+            PRAGMA user_version = 14;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 13 to 14",
+        ))
+}
+
+/// Discards every recorded injection outcome on an existing schema version 14 installation and
+/// advances `user_version` to 15, in one transaction.
+///
+/// Every row in `context_usage` written before this version was decided by statement token
+/// similarity, which credited restatement and recorded real reuse as an omission. The counts are
+/// advisory local ranking state with no Event behind them and no way to re-derive them — the
+/// Claims that produced them are long since built — so the only honest repair is to stop counting
+/// the wrong answers. `task_injection` is untouched: what was injected into which Task is a fact,
+/// only the verdict on it was wrong.
+fn migrate_schema_14_to_15(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            DELETE FROM context_usage;
+            PRAGMA user_version = 15;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 14 to 15",
+        ))
+}
+
+/// Discards every recorded *omission* on an existing schema version 15 installation and advances
+/// `user_version` to 16, in one transaction.
+///
+/// Version 15 decided reuse from two signals only: a Claim naming the `ContextId`, or a Claim's
+/// server-derived Engineering References intersecting the Context's own. Three real sessions
+/// showed both missing a reuse that had plainly happened — a Context quoted into the Working
+/// Intent and acted on, a Context the Candidate analysis itself assessed as `supports` — and every
+/// one of those was written down as `ignored`, so the usage prior penalized exactly the Contexts
+/// that worked. Two further signals now decide reuse, which makes every stored `ignored` row a
+/// verdict this version would no longer reach on the same input, and none of them can be
+/// re-derived: the Claims and analyses behind them are already built.
+///
+/// Only `ignored` is discarded. `reused` and `refuted` are proofs, not absences: no signal was
+/// removed in this version, so both still hold under the wider rule. `task_injection` is untouched
+/// here as it was in 14 -> 15: what was injected into which Task is a fact.
+fn migrate_schema_15_to_16(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            DELETE FROM context_usage WHERE outcome = 'ignored';
+            PRAGMA user_version = 16;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 15 to 16",
+        ))
+}
+
+/// Adds disposition provenance to an existing schema version 16 installation and advances
+/// `user_version` to 17, in one transaction.
+///
+/// Two additive changes, no data rewritten: `candidate_review.decision_source` records who decided
+/// each confirmation or discard, and `auto_confirm_rejection` counts the automatic confirmations
+/// the server refused. Every row written before this version keeps `decision_source IS NULL`,
+/// which reads back as `human` — the only disposition that existed then.
+fn migrate_schema_16_to_17(connection: &Connection) -> Result<()> {
+    // `ADD COLUMN` has no `IF NOT EXISTS`, and every other statement in this chain is re-runnable.
+    // A database that already carries the column — a stamp rewound by hand, or a run interrupted
+    // between the two statements — must migrate, not hard-fail on a column it already has.
+    let add_column = if candidate_review_has_decision_source(connection)? {
+        ""
+    } else {
+        "ALTER TABLE candidate_review ADD COLUMN decision_source TEXT CHECK (
+            decision_source IS NULL OR decision_source IN ('human', 'agent_policy')
+        );"
+    };
+    connection
+        .execute_batch(&format!(
+            "BEGIN IMMEDIATE;
+            {add_column}
+            CREATE TABLE IF NOT EXISTS auto_confirm_rejection (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                candidate_id TEXT NOT NULL,
+                external_session_id TEXT,
+                error_code TEXT NOT NULL,
+                reason TEXT NOT NULL
+            ) STRICT;
+            CREATE INDEX IF NOT EXISTS auto_confirm_rejection_recorded_at
+                ON auto_confirm_rejection (recorded_at_unix_seconds);
+            PRAGMA user_version = 17;
+            COMMIT;"
+        ))
+        .map_err(sql_error(
+            "migrate task runtime schema from version 16 to 17",
+        ))
+}
+
+/// Adds the two additive counters `TaskRuntime::gate_turn_stop_checkpoint_reminder` and
+/// `TaskRuntime::record_checkpoint_reminder_activity` use (WP-V6 fix 3) to `external_session` on
+/// an existing schema version 17 installation, and advances `user_version` to 18.
+///
+/// Both counters start at zero on every existing row, the same value a brand-new row gets. That
+/// resets the reminder budget for every Session already in flight at the moment of the upgrade,
+/// which is the conservative direction: at most three reminders more than a Session that had run
+/// under this schema the whole time, never fewer, so no operator loses the escape hatch the
+/// throttle exists to provide.
+///
+/// Checks for the column before adding it, the way [`sctx_search`'s cache schema does][1] for the
+/// same reason: an installation exercised through this crate's own test harness reaches a "version
+/// 16" fixture by writing rows through the *current* schema (which already carries these columns)
+/// and only rewinding `user_version`, so the column can already be present even though the stamp
+/// says 16. A real pre-upgrade installation never has it, and `ADD COLUMN` still runs there exactly
+/// once, same as always.
+///
+/// [1]: ../../search/src/embedding.rs
+fn migrate_schema_17_to_18(connection: &Connection) -> Result<()> {
+    let has_reminder_columns = connection
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('external_session')
+             WHERE name = 'checkpoint_reminder_count'",
+        )
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(sql_error("inspect external_session columns"))?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(sql_error(
+            "begin task runtime schema migration from version 17 to 18",
+        ))?;
+    if !has_reminder_columns {
+        connection
+            .execute_batch(
+                "ALTER TABLE external_session
+                    ADD COLUMN checkpoint_reminder_count INTEGER NOT NULL DEFAULT 0
+                        CHECK (checkpoint_reminder_count >= 0);
+                 ALTER TABLE external_session
+                    ADD COLUMN activity_since_checkpoint_reminder INTEGER NOT NULL DEFAULT 0
+                        CHECK (activity_since_checkpoint_reminder >= 0);",
+            )
+            .map_err(sql_error(
+                "add checkpoint reminder columns to external_session",
+            ))?;
+    }
+    connection
+        .execute_batch("PRAGMA user_version = 18; COMMIT;")
+        .map_err(sql_error(
+            "migrate task runtime schema from version 17 to 18",
+        ))
+}
+
+/// Adds audit columns without rewriting or discarding any prior business record.
+fn migrate_schema_18_to_19(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(sql_error("begin task runtime audit migration"))?;
+    for (table, column, alteration) in [
+        (
+            "candidate_review",
+            "top_relation",
+            "ALTER TABLE candidate_review ADD COLUMN top_relation TEXT",
+        ),
+        (
+            "context_usage",
+            "basis",
+            "ALTER TABLE context_usage ADD COLUMN basis TEXT NOT NULL DEFAULT 'checkpoint_derived'
+          CHECK (basis IN ('checkpoint_derived', 'session_close'))",
+        ),
+    ] {
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("inspect audit migration columns"))?;
+        if !exists {
+            transaction
+                .execute_batch(alteration)
+                .map_err(sql_error("add runtime audit column"))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 19")
+        .map_err(sql_error("advance runtime audit schema"))?;
+    transaction
+        .commit()
+        .map_err(sql_error("commit runtime audit migration"))
+}
+
+/// Turns the one-column derivation marker into a record of what the derivation found.
+///
+/// Six additive columns, no data rewritten, following the `decision_source` precedent: a row
+/// written before this version keeps `derived_at_unix_seconds IS NULL` and
+/// `ambiguity_json IS NULL`, which reads back as "derived, and nothing is known about how" — the
+/// only thing the marker ever said. A row like that is never re-derived, because a re-derivation
+/// is decided by comparing a recorded ambiguity against the checkout's current answer and there
+/// is no recorded ambiguity to compare. That is the conservative direction: an installation is
+/// upgraded without any Candidate silently changing underneath a reviewer.
+///
+/// The columns are added rather than the table replaced because `episode_id` is a `PRIMARY KEY`
+/// other rows do not reference and nothing about its meaning changed: the row still means "this
+/// Episode has been derived". Only its payload grew.
+fn migrate_schema_19_to_20(connection: &Connection) -> Result<()> {
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .map_err(sql_error("begin reference derivation record migration"))?;
+    for (column, alteration) in [
+        (
+            "derived_at_unix_seconds",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN derived_at_unix_seconds INTEGER CHECK (
+                    derived_at_unix_seconds IS NULL OR derived_at_unix_seconds >= 0
+                )",
+        ),
+        (
+            "placed_count",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN placed_count INTEGER NOT NULL DEFAULT 0 CHECK (placed_count >= 0)",
+        ),
+        (
+            "unresolved_count",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN unresolved_count INTEGER NOT NULL DEFAULT 0
+                    CHECK (unresolved_count >= 0)",
+        ),
+        (
+            "ambiguity_json",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN ambiguity_json TEXT CHECK (
+                    ambiguity_json IS NULL OR json_valid(ambiguity_json)
+                )",
+        ),
+        (
+            "unresolved_sample_json",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN unresolved_sample_json TEXT CHECK (
+                    unresolved_sample_json IS NULL OR json_valid(unresolved_sample_json)
+                )",
+        ),
+        (
+            "reopened",
+            "ALTER TABLE checkpoint_reference_derivation
+                ADD COLUMN reopened INTEGER NOT NULL DEFAULT 0 CHECK (reopened IN (0, 1))",
+        ),
+    ] {
+        // `ADD COLUMN` has no `IF NOT EXISTS`, and a "version 19" fixture reached by rewinding
+        // `user_version` through this crate's own harness already carries the current columns.
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('checkpoint_reference_derivation')
+                    WHERE name = ?1
+                 )",
+                params![column],
+                |row| row.get(0),
+            )
+            .map_err(sql_error("inspect reference derivation columns"))?;
+        if !exists {
+            transaction
+                .execute_batch(alteration)
+                .map_err(sql_error("add reference derivation record column"))?;
+        }
+    }
+    transaction
+        .execute_batch("PRAGMA user_version = 20")
+        .map_err(sql_error("advance reference derivation schema"))?;
+    transaction
+        .commit()
+        .map_err(sql_error("commit reference derivation record migration"))
+}
+
+/// Adds the one table that lets a Prompt outlive the moment it arrived too early.
+///
+/// Purely additive and carries no foreign key, which is the whole point: a pending Prompt exists
+/// precisely when no `external_session` row does yet.
+fn migrate_schema_20_to_21(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            "BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS pending_prompt_signal (
+                agent_kind TEXT NOT NULL,
+                external_session_key TEXT NOT NULL,
+                prompt_ordinal INTEGER NOT NULL CHECK (prompt_ordinal >= 0),
+                content TEXT NOT NULL,
+                recorded_at_unix_seconds INTEGER NOT NULL CHECK (
+                    recorded_at_unix_seconds >= 0
+                ),
+                PRIMARY KEY (agent_kind, external_session_key, prompt_ordinal)
+            ) STRICT;
+            PRAGMA user_version = 21;
+            COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 20 to 21",
+        ))
+}
+
+/// Separates first exposure from latest exposure on `task_injection`.
+///
+/// Purely additive, following the `decision_source` precedent: one column with a constant default,
+/// then one backfill statement. The backfill copies `injected_at_unix_seconds`, which is the only
+/// honest value available -- on an installation that upgrades, that column already holds the
+/// *latest* push for every Context that was injected more than once, and the first push it
+/// overwrote is not recoverable. So an upgraded row reads as "these two moments are the same",
+/// exactly as a row injected once does, and only injections recorded from here on can tell the
+/// difference. Nothing in `context_usage` is touched: a re-push was never a verdict.
+///
+/// Checks for the column before adding it, for the reason [`migrate_schema_17_to_18`] documents:
+/// a fixture in this crate's own harness reaches "version 21" by writing rows through the current
+/// schema and rewinding the stamp, so the column can already be there. The backfill then runs
+/// either way and is idempotent on a row it already filled.
+fn migrate_schema_21_to_22(connection: &Connection) -> Result<()> {
+    let has_last_injected_at = connection
+        .prepare(
+            "SELECT 1 FROM pragma_table_info('task_injection')
+             WHERE name = 'last_injected_at_unix_seconds'",
+        )
+        .and_then(|mut statement| statement.exists([]))
+        .map_err(sql_error("inspect task_injection columns"))?;
+    connection
+        .execute_batch("BEGIN IMMEDIATE;")
+        .map_err(sql_error(
+            "begin task runtime schema migration from version 21 to 22",
+        ))?;
+    if !has_last_injected_at {
+        connection
+            .execute_batch(
+                "ALTER TABLE task_injection ADD COLUMN last_injected_at_unix_seconds
+                    INTEGER NOT NULL DEFAULT 0 CHECK (last_injected_at_unix_seconds >= 0);",
+            )
+            .map_err(sql_error("add latest exposure column to task_injection"))?;
+    }
+    connection
+        .execute_batch(
+            "UPDATE task_injection
+                SET last_injected_at_unix_seconds = injected_at_unix_seconds
+              WHERE last_injected_at_unix_seconds = 0;
+             PRAGMA user_version = 22;
+             COMMIT;",
+        )
+        .map_err(sql_error(
+            "migrate task runtime schema from version 21 to 22",
+        ))
 }
 
 fn insert_external_session(
@@ -2821,12 +5312,40 @@ fn insert_intent_revision(
     Ok(())
 }
 
+fn locate_active_task(
+    transaction: &Transaction<'_>,
+    locator: &ExternalSessionLocator,
+) -> Result<Option<(TaskSessionId, TaskId)>> {
+    let Some(task_session_id) = find_active_task_by_locator(transaction, locator)? else {
+        return Ok(None);
+    };
+    let (task_id, _) = read_active_task_head(transaction, task_session_id)?
+        .ok_or_else(|| invariant("located ActiveTask is not active"))?;
+    Ok(Some((task_session_id, task_id)))
+}
+
 fn merge_signals_in_transaction(
     transaction: &Transaction<'_>,
     task_session_id: TaskSessionId,
     task_id: TaskId,
     signals: &[TaskSignal],
 ) -> Result<MergeSignalsOutcome> {
+    let inserted_signal_ids =
+        insert_signals_in_transaction(transaction, task_session_id, task_id, signals)?;
+    let snapshot = require_snapshot(transaction, task_session_id)?;
+    Ok(MergeSignalsOutcome {
+        snapshot,
+        inserted: inserted_signal_ids.len(),
+        inserted_signal_ids,
+    })
+}
+
+fn insert_signals_in_transaction(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+    signals: &[TaskSignal],
+) -> Result<Vec<SignalId>> {
     let mut inserted_signal_ids = Vec::new();
     let mut next_ordinal = next_signal_ordinal(transaction, task_session_id)?;
     for signal in signals {
@@ -2855,12 +5374,69 @@ fn merge_signals_in_transaction(
             .checked_add(1)
             .ok_or_else(|| invariant("Task Signal ordinal overflow"))?;
     }
-    let snapshot = require_snapshot(transaction, task_session_id)?;
-    Ok(MergeSignalsOutcome {
-        snapshot,
-        inserted: inserted_signal_ids.len(),
-        inserted_signal_ids,
-    })
+    Ok(inserted_signal_ids)
+}
+
+/// Supersedes the oldest Active Signals of each rule's kinds until the rule's budget holds.
+///
+/// Ordering is by `signal_ordinal`, the same monotonic append order the merge above assigns,
+/// so "oldest" means "inserted first" and never depends on wall-clock time.
+fn enforce_signal_retention(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    retention: &[SignalRetentionRule],
+) -> Result<Vec<SignalId>> {
+    let mut retired = Vec::new();
+    for rule in retention {
+        if rule.kinds.is_empty() {
+            continue;
+        }
+        let placeholders = (2..2 + rule.kinds.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut statement = transaction
+            .prepare(&format!(
+                "SELECT signal_id FROM task_signal
+                 WHERE task_session_id = ?1 AND lifecycle = 'active' AND kind IN ({placeholders})
+                 ORDER BY signal_ordinal ASC"
+            ))
+            .map_err(sql_error("prepare Signal retention scan"))?;
+        let mut parameters = vec![task_session_id.to_string()];
+        parameters.extend(
+            rule.kinds
+                .iter()
+                .map(|kind| signal_kind_name(*kind).to_owned()),
+        );
+        let active = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(sql_error("scan Active Signals for retention"))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sql_error("read Active Signals for retention"))?;
+        drop(statement);
+        let Some(excess) = active.len().checked_sub(rule.max_active) else {
+            continue;
+        };
+        for value in active.into_iter().take(excess) {
+            let signal_id: SignalId = parse_id(&value, "task_signal.signal_id")?;
+            let changed = transaction
+                .execute(
+                    "UPDATE task_signal SET lifecycle = 'superseded'
+                     WHERE signal_id = ?1 AND lifecycle = 'active'",
+                    [signal_id.to_string()],
+                )
+                .map_err(sql_error("supersede retained Task Signal"))?;
+            if changed != 1 {
+                return Err(invariant(
+                    "Signal lifecycle changed inside write transaction",
+                ));
+            }
+            retired.push(signal_id);
+        }
+    }
+    Ok(retired)
 }
 
 fn find_open_episode(
@@ -2936,6 +5512,7 @@ fn find_latest_checkpoint_episode(
              FROM agent_checkpoint AS checkpoint
              JOIN work_episode AS episode ON episode.episode_id = checkpoint.episode_id
              WHERE episode.task_session_id = ?1
+               AND episode.status = 'closed'
                AND checkpoint.parent_episode_version = ?2
              ORDER BY episode.episode_ordinal DESC LIMIT 1",
             params![task_session_id.to_string(), parent_version],
@@ -2948,6 +5525,7 @@ fn find_latest_checkpoint_episode(
 }
 
 fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
+    // Retired empty keys preserve exact retry equality with checkpoints written by older binaries.
     let claims = input
         .claims
         .iter()
@@ -2958,12 +5536,14 @@ fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
                 "statement": claim.statement,
                 "rationale": claim.rationale,
                 "applicability": claim.applicability,
-                "assumptions": claim.assumptions,
-                "recheck_when": claim.recheck_when,
+                "assumptions": [],
+                "recheck_when": [],
                 "evidence_refs": claim.evidence_refs,
                 "inline_validations": claim.inline_validations,
-                "artifact_refs": claim.artifact_refs,
-                "related_contexts": claim.related_contexts,
+                "artifact_refs": [],
+                "relations": [],
+                "engineering_references": claim.engineering_references,
+                "related_contexts": [],
             })
         })
         .collect::<Vec<_>>();
@@ -2975,6 +5555,160 @@ fn checkpoint_semantic_json(input: &AgentCheckpointWrite) -> Result<String> {
         "unknowns": input.unknowns,
     }))
     .map_err(json_error("serialize Agent Checkpoint semantics"))
+}
+
+fn direct_checkpoint_semantic_json(input: &AgentCheckpointSubmission) -> Result<String> {
+    let claims = input
+        .claims
+        .iter()
+        .map(|claim| {
+            let evidence = claim
+                .evidence
+                .iter()
+                .map(|evidence| {
+                    serde_json::json!({
+                        "evidence_type": evidence.evidence_type,
+                        "summary": evidence.summary,
+                        "limitations": evidence.limitations,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "context_kind": claim.context_kind,
+                "statement": claim.statement,
+                "rationale": claim.rationale,
+                "conditions": claim.conditions,
+                "evidence": evidence,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "claims": claims,
+        "unknowns": input.unknowns,
+    }))
+    .map_err(json_error("serialize direct Checkpoint semantics"))
+}
+
+fn materialize_direct_checkpoint_claims(
+    claims: &[DirectCheckpointClaimDraft],
+    intent: &WorkingIntentSnapshot,
+) -> Result<Vec<CheckpointClaimDraft>> {
+    claims
+        .iter()
+        .map(|claim| materialize_direct_checkpoint_claim(claim, intent))
+        .collect()
+}
+
+/// Turns one direct Claim into its persisted shape without consulting any checkout.
+///
+/// The durable ACK is receipt plus outbox: it validates Evidence, inherits applicability from the
+/// Working Intent, and stops there. Engineering coordinates and the topic hint stay empty until
+/// Candidate Build derives them once through [`TaskRuntime::derive_episode_claim_references`].
+fn materialize_direct_checkpoint_claim(
+    claim: &DirectCheckpointClaimDraft,
+    intent: &WorkingIntentSnapshot,
+) -> Result<CheckpointClaimDraft> {
+    if claim.evidence.is_empty() {
+        return Err(invalid("Checkpoint Claim Evidence must not be empty"));
+    }
+    let applicability = Applicability {
+        domains: intent.domains.clone(),
+        platforms: intent.platforms.clone(),
+        conditions: claim.conditions.clone(),
+    };
+    applicability.validate("checkpoint_submission.claim.applicability")?;
+    let inline_validations = claim
+        .evidence
+        .iter()
+        .map(|evidence| {
+            if evidence.summary.trim().is_empty() {
+                return Err(invalid(
+                    "checkpoint_submission.claim.evidence.summary must not be empty",
+                ));
+            }
+            let draft = EvidenceSnapshotDraft {
+                kind: evidence.evidence_type,
+                supports: claim.statement.clone(),
+                content: serde_json::json!({"summary": evidence.summary}),
+                interpretation: claim.rationale.clone(),
+                limitations: evidence.limitations.clone(),
+            };
+            draft.validate("checkpoint_submission.claim.evidence")?;
+            Ok(draft)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(CheckpointClaimDraft {
+        context_kind_hint: Some(claim.context_kind),
+        topic_key_hint: None,
+        statement: claim.statement.clone(),
+        rationale: claim.rationale.clone(),
+        applicability,
+        evidence_refs: Vec::new(),
+        inline_validations,
+        engineering_references: Vec::new(),
+    })
+}
+
+fn checkpoint_operation_identity(
+    task_session_id: TaskSessionId,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    semantic_json: &str,
+) -> (String, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"shared-context-checkpoint-operation-v1");
+    for value in [
+        task_session_id.to_string(),
+        task_id.to_string(),
+        intent_revision_id.to_string(),
+        semantic_json.to_owned(),
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    let operation_key = format!("sha256:{digest}");
+    (operation_key.clone(), operation_key)
+}
+
+fn read_checkpoint_operation(
+    connection: &Connection,
+    operation_key: &str,
+) -> Result<Option<CheckpointOperationRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT operation_id, semantic_json, task_session_id, task_id,
+                    intent_revision_id, checkpoint_id, episode_id, build_id
+             FROM checkpoint_operation WHERE operation_key = ?1",
+            [operation_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Checkpoint operation"))?;
+    row.map(|row| {
+        Ok(CheckpointOperationRecord {
+            operation_id: row.0,
+            semantic_json: row.1,
+            task_session_id: parse_id(&row.2, "checkpoint_operation.task_session_id")?,
+            task_id: parse_id(&row.3, "checkpoint_operation.task_id")?,
+            intent_revision_id: parse_id(&row.4, "checkpoint_operation.intent_revision_id")?,
+            checkpoint_id: parse_id(&row.5, "checkpoint_operation.checkpoint_id")?,
+            episode_id: parse_id(&row.6, "checkpoint_operation.episode_id")?,
+            build_id: parse_id(&row.7, "checkpoint_operation.build_id")?,
+        })
+    })
+    .transpose()
 }
 
 fn validate_checkpoint_task_local_refs(
@@ -2993,21 +5727,21 @@ fn validate_checkpoint_task_local_refs(
         .collect::<HashSet<_>>();
     for evidence in claims.iter().flat_map(|claim| &claim.evidence_refs) {
         match evidence {
-            CaptureEvidenceRef::Observation { observation_id }
+            CheckpointEvidenceRef::Observation { observation_id }
                 if !observations.contains(observation_id) =>
             {
                 return Err(invalid(
                     "Checkpoint Observation evidence does not belong to its Work Episode",
                 ));
             }
-            CaptureEvidenceRef::TaskSignal { signal_id } if !signals.contains(signal_id) => {
+            CheckpointEvidenceRef::TaskSignal { signal_id } if !signals.contains(signal_id) => {
                 return Err(invalid(
                     "Checkpoint TaskSignal evidence does not belong to its Task",
                 ));
             }
-            CaptureEvidenceRef::Observation { .. }
-            | CaptureEvidenceRef::TaskSignal { .. }
-            | CaptureEvidenceRef::ContextEvidence { .. } => {}
+            CheckpointEvidenceRef::Observation { .. }
+            | CheckpointEvidenceRef::TaskSignal { .. }
+            | CheckpointEvidenceRef::ContextEvidence { .. } => {}
         }
     }
     Ok(())
@@ -3058,7 +5792,7 @@ fn inline_observation_ids(
             ));
         }
         for evidence in claim.evidence_refs.iter().skip(draft.evidence_refs.len()) {
-            let CaptureEvidenceRef::Observation { observation_id } = evidence else {
+            let CheckpointEvidenceRef::Observation { observation_id } = evidence else {
                 return Err(invariant(
                     "persisted inline Validation does not reference an Observation",
                 ));
@@ -3092,7 +5826,8 @@ fn validate_build_preparations(items: &[CandidateBuildItemPreparation]) -> Resul
                     "Candidate Build preparation readiness metadata is incomplete",
                 ));
             }
-            CandidateBuildItemStatus::Created
+            CandidateBuildItemStatus::Queued
+            | CandidateBuildItemStatus::Created
             | CandidateBuildItemStatus::AlreadyExists
             | CandidateBuildItemStatus::Failed => {
                 return Err(invalid(
@@ -3115,6 +5850,7 @@ fn valid_error_code(value: &str) -> bool {
 fn validate_build_claim_coverage(
     episode: &WorkEpisodeView,
     items: &[CandidateBuildItemPreparation],
+    duplicates: &[CandidateBuildDuplicatePreparation],
 ) -> Result<()> {
     let persisted = episode
         .checkpoints
@@ -3129,11 +5865,49 @@ fn validate_build_claim_coverage(
     let supplied = items
         .iter()
         .map(|item| (item.checkpoint_id, item.claim_id))
+        .chain(
+            duplicates
+                .iter()
+                .map(|duplicate| (duplicate.checkpoint_id, duplicate.claim_id)),
+        )
         .collect::<BTreeSet<_>>();
-    if persisted.len() != items.len() || persisted != supplied {
+    if persisted.len() != items.len() + duplicates.len() || persisted != supplied {
         return Err(invalid(
-            "Candidate Build must prepare every persisted Checkpoint Claim exactly once",
+            "Candidate Build must classify every persisted Checkpoint Claim exactly once",
         ));
+    }
+    Ok(())
+}
+
+fn insert_candidate_build_duplicates(
+    transaction: &Transaction<'_>,
+    build_id: CandidateBuildId,
+    duplicates: &[CandidateBuildDuplicatePreparation],
+) -> Result<()> {
+    for duplicate in duplicates {
+        let ordinal = next_ordinal(
+            transaction,
+            "SELECT COALESCE(MAX(duplicate_ordinal), -1) + 1
+             FROM candidate_build_duplicate WHERE build_id = ?1",
+            build_id.to_string(),
+            "read next Candidate Build duplicate ordinal",
+        )?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO candidate_build_duplicate (
+                    build_id, duplicate_ordinal, checkpoint_id, claim_id,
+                    duplicate_of_candidate_id, similarity_basis_points
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    build_id.to_string(),
+                    ordinal,
+                    duplicate.checkpoint_id.to_string(),
+                    duplicate.claim_id.to_string(),
+                    duplicate.duplicate_of_candidate_id.to_string(),
+                    i64::from(duplicate.similarity_basis_points),
+                ],
+            )
+            .map_err(sql_error("record Candidate Build duplicate"))?;
     }
     Ok(())
 }
@@ -3162,9 +5936,11 @@ fn validate_build_item_result(
         | CandidateBuildItemStatus::Failed => Err(invalid(
             "Candidate Build result identity or safe error code is incomplete",
         )),
-        CandidateBuildItemStatus::Prepared | CandidateBuildItemStatus::NeedsEvidence => Err(
-            invalid("Candidate Build result requires a terminal submission status"),
-        ),
+        CandidateBuildItemStatus::Queued
+        | CandidateBuildItemStatus::Prepared
+        | CandidateBuildItemStatus::NeedsEvidence => Err(invalid(
+            "Candidate Build result requires a terminal submission status",
+        )),
     }
 }
 
@@ -3263,10 +6039,12 @@ fn refresh_candidate_build_status(
     build_id: CandidateBuildId,
 ) -> Result<()> {
     let items = read_candidate_build_items(transaction, build_id)?;
-    let status = if items
-        .iter()
-        .any(|item| item.status == CandidateBuildItemStatus::Prepared)
-    {
+    let status = if items.iter().any(|item| {
+        matches!(
+            item.status,
+            CandidateBuildItemStatus::Queued | CandidateBuildItemStatus::Prepared
+        )
+    }) {
         CandidateBuildStatus::Pending
     } else if items.iter().any(|item| {
         matches!(
@@ -3319,7 +6097,45 @@ fn require_candidate_build_view(
         final_checkpoint_id: parse_id(&row.3, "candidate_build.final_checkpoint_id")?,
         status: parse_candidate_build_status(&row.4)?,
         items: read_candidate_build_items(connection, build_id)?,
+        duplicates: read_candidate_build_duplicates(connection, build_id)?,
     })
+}
+
+fn read_candidate_build_duplicates(
+    connection: &Connection,
+    build_id: CandidateBuildId,
+) -> Result<Vec<CandidateBuildDuplicateView>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT checkpoint_id, claim_id, duplicate_of_candidate_id, similarity_basis_points
+             FROM candidate_build_duplicate WHERE build_id = ?1 ORDER BY duplicate_ordinal ASC",
+        )
+        .map_err(sql_error("prepare Candidate Build duplicates"))?;
+    let rows = statement
+        .query_map([build_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(sql_error("query Candidate Build duplicates"))?;
+    rows.map(|row| {
+        let row = row.map_err(sql_error("read Candidate Build duplicate row"))?;
+        Ok(CandidateBuildDuplicateView {
+            checkpoint_id: parse_id(&row.0, "candidate_build_duplicate.checkpoint_id")?,
+            claim_id: parse_id(&row.1, "candidate_build_duplicate.claim_id")?,
+            duplicate_of_candidate_id: parse_id(
+                &row.2,
+                "candidate_build_duplicate.duplicate_of_candidate_id",
+            )?,
+            similarity_basis_points: u16::try_from(row.3).map_err(|_| {
+                invariant("Candidate Build duplicate similarity is outside the safe bound")
+            })?,
+        })
+    })
+    .collect()
 }
 
 fn read_candidate_build_items(
@@ -3392,6 +6208,7 @@ fn parse_candidate_build_status(value: &str) -> Result<CandidateBuildStatus> {
 
 fn parse_candidate_build_item_status(value: &str) -> Result<CandidateBuildItemStatus> {
     match value {
+        "queued" => Ok(CandidateBuildItemStatus::Queued),
         "prepared" => Ok(CandidateBuildItemStatus::Prepared),
         "needs_evidence" => Ok(CandidateBuildItemStatus::NeedsEvidence),
         "created" => Ok(CandidateBuildItemStatus::Created),
@@ -3502,6 +6319,153 @@ fn parse_candidate_review_record(row: CandidateReviewRow) -> Result<CandidateRev
     })
 }
 
+type ProposedSpaceGroupRow = (String, String, String, String, String, String);
+
+fn parse_proposed_space_group_mapping(
+    row: &ProposedSpaceGroupRow,
+) -> Result<ProposedSpaceGroupMapping> {
+    let mapping = ProposedSpaceGroupMapping {
+        proposed_space_group_key: parse_id(
+            &row.0,
+            "proposed_space_group.proposed_space_group_key",
+        )?,
+        task_id: parse_id(&row.1, "proposed_space_group.task_id")?,
+        intent_revision_id: parse_id(&row.2, "proposed_space_group.intent_revision_id")?,
+        candidate_id: parse_id(&row.3, "proposed_space_group.candidate_id")?,
+        space_id: parse_id(&row.4, "proposed_space_group.space_id")?,
+        status: match row.5.as_str() {
+            "reserved" => ProposedSpaceGroupMappingStatus::Reserved,
+            "committed" => ProposedSpaceGroupMappingStatus::Committed,
+            _ => {
+                return Err(invariant(
+                    "persisted proposed Space group status is invalid",
+                ));
+            }
+        },
+    };
+    if mapping.proposed_space_group_key != ProposedSpaceGroupKey::from_task(mapping.task_id) {
+        return Err(invariant(
+            "persisted proposed Space group key disagrees with Task ownership",
+        ));
+    }
+    Ok(mapping)
+}
+
+fn read_proposed_space_group_mapping(
+    connection: &Connection,
+    proposed_space_group_key: ProposedSpaceGroupKey,
+) -> Result<Option<ProposedSpaceGroupMapping>> {
+    connection
+        .query_row(
+            "SELECT proposed_space_group_key, task_id, intent_revision_id,
+                    candidate_id, space_id, status
+             FROM proposed_space_group WHERE proposed_space_group_key = ?1",
+            [proposed_space_group_key.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read proposed Space group mapping"))?
+        .map(|row| parse_proposed_space_group_mapping(&row))
+        .transpose()
+}
+
+fn read_proposed_space_group_mapping_for_candidate(
+    connection: &Connection,
+    candidate_id: CandidateId,
+) -> Result<Option<ProposedSpaceGroupMapping>> {
+    connection
+        .query_row(
+            "SELECT proposed_space_group_key, task_id, intent_revision_id,
+                    candidate_id, space_id, status
+             FROM proposed_space_group WHERE candidate_id = ?1",
+            [candidate_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Candidate proposed Space group mapping"))?
+        .map(|row| parse_proposed_space_group_mapping(&row))
+        .transpose()
+}
+
+/// Recovery guidance for every proposed Space group rejection a caller can actually repair.
+const PROPOSED_SPACE_GROUP_RECOVERY: &str = "proposed Space group does not belong to this Task: use candidate_get to refresh \
+     recommendations, or confirm into an existing Space with primary.existing_space_id";
+
+fn reserve_proposed_space_group(
+    transaction: &Transaction<'_>,
+    proposed_space_group_key: ProposedSpaceGroupKey,
+    task_id: TaskId,
+    intent_revision_id: TaskIntentRevisionId,
+    plan: &CandidateConfirmationPlan,
+) -> Result<()> {
+    // The group is bound to the Task, never to the current Intent head: governance turns
+    // legitimately advance the Intent between the recommendation being generated and being
+    // confirmed. `expected_intent_revision_id` still guards the head through the caller's CAS.
+    if proposed_space_group_key != ProposedSpaceGroupKey::from_task(task_id) {
+        return Err(invalid(PROPOSED_SPACE_GROUP_RECOVERY));
+    }
+    let space_id = plan
+        .confirmation
+        .created_space_id
+        .ok_or_else(|| invalid("proposed Space group requires a new Primary Space plan"))?;
+    if space_id != plan.confirmation.primary_space_id {
+        return Err(invariant(
+            "proposed Space group plan does not create its Primary Space",
+        ));
+    }
+    if let Some(existing) =
+        read_proposed_space_group_mapping(transaction, proposed_space_group_key)?
+    {
+        if existing.task_id == task_id
+            && existing.intent_revision_id == intent_revision_id
+            && existing.candidate_id == plan.operation.candidate_id
+            && existing.space_id == space_id
+        {
+            return Ok(());
+        }
+        return Err(Error::new(
+            ErrorKind::Conflict,
+            "proposed Space group is already reserved by another Candidate of this Task: \
+             use candidate_get to refresh recommendations, or confirm into an existing Space \
+             with primary.existing_space_id",
+        ));
+    }
+    transaction
+        .execute(
+            "INSERT INTO proposed_space_group (
+                proposed_space_group_key, task_id, intent_revision_id,
+                candidate_id, space_id, status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'reserved')",
+            params![
+                proposed_space_group_key.to_string(),
+                task_id.to_string(),
+                intent_revision_id.to_string(),
+                plan.operation.candidate_id.to_string(),
+                space_id.to_string(),
+            ],
+        )
+        .map_err(sql_error("reserve proposed Space group"))?;
+    Ok(())
+}
+
 fn read_candidate_review_record(
     connection: &Connection,
     candidate_id: CandidateId,
@@ -3521,6 +6485,14 @@ fn read_candidate_review_record(
         .map_err(sql_error("read Candidate Review"))?
         .map(parse_candidate_review_record)
         .transpose()
+}
+
+/// The scope discriminator bound into the Candidate Review page query.
+const fn candidate_review_scope_name(scope: CandidateReviewScope) -> &'static str {
+    match scope {
+        CandidateReviewScope::Task => "task",
+        CandidateReviewScope::Session => "session",
+    }
 }
 
 const fn candidate_review_status_name(status: CandidateReviewStatus) -> &'static str {
@@ -3817,6 +6789,34 @@ fn require_task_is_active(
     Ok(())
 }
 
+/// Restarts the checkpoint-reminder activity counter for every Session driving this `TaskSession`.
+///
+/// The counter answers exactly one question --- has this Session done real work since it was last
+/// told to checkpoint? --- and a Checkpoint settles that question as completely as a reminder
+/// does: the work before it is recorded, so it can no longer be the reason to ask for another one.
+/// Without this reset, the first boundary after a Checkpoint would inherit the whole Session's
+/// tool history and read as fresh uncheckpointed activity, which is what
+/// [`TaskRuntime::gate_turn_stop_checkpoint_reminder`] and the closed-Episode reminder both key
+/// off.
+///
+/// Every boundary resets it, not only a closing one: the reminder asks for a Checkpoint, and a
+/// `Continue` Checkpoint is one.
+fn reset_checkpoint_reminder_activity(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+) -> Result<()> {
+    transaction
+        .execute(
+            "UPDATE external_session SET activity_since_checkpoint_reminder = 0
+             WHERE active_task_session_id = ?1",
+            params![task_session_id.to_string()],
+        )
+        .map_err(sql_error(
+            "reset checkpoint reminder activity at a Checkpoint",
+        ))?;
+    Ok(())
+}
+
 fn advance_episode_version(
     transaction: &Transaction<'_>,
     episode_id: WorkEpisodeId,
@@ -3956,78 +6956,6 @@ fn next_checkpoint_ordinal(
     )
 }
 
-fn read_capture_ingestion(
-    connection: &Connection,
-    capture_id: CaptureId,
-) -> Result<Option<(WorkEpisodeId, WorkObservationId, TaskSessionId, TaskId)>> {
-    connection
-        .query_row(
-            "SELECT episode_id, observation_id, task_session_id, task_id
-             FROM capture_ingestion WHERE capture_id = ?1",
-            [capture_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(sql_error("read Capture ingestion"))?
-        .map(|(episode_id, observation_id, task_session_id, task_id)| {
-            Ok((
-                parse_id(&episode_id, "capture_ingestion.episode_id")?,
-                parse_id(&observation_id, "capture_ingestion.observation_id")?,
-                parse_id(&task_session_id, "capture_ingestion.task_session_id")?,
-                parse_id(&task_id, "capture_ingestion.task_id")?,
-            ))
-        })
-        .transpose()
-}
-
-fn insert_episode_diagnostics(
-    transaction: &Transaction<'_>,
-    episode_id: WorkEpisodeId,
-    capture_id: CaptureId,
-    diagnostics: &[WorkEpisodeDiagnosticKind],
-) -> Result<()> {
-    let mut next_ordinal: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(diagnostic_ordinal), -1) + 1
-             FROM work_episode_diagnostic WHERE episode_id = ?1",
-            [episode_id.to_string()],
-            |row| row.get(0),
-        )
-        .map_err(sql_error("read next Episode diagnostic ordinal"))?;
-    let mut unique = HashSet::new();
-    for diagnostic in diagnostics.iter().copied() {
-        if !unique.insert(diagnostic) {
-            continue;
-        }
-        let changed = transaction
-            .execute(
-                "INSERT OR IGNORE INTO work_episode_diagnostic (
-                    episode_id, diagnostic_ordinal, capture_id, kind
-                 ) VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    episode_id.to_string(),
-                    next_ordinal,
-                    capture_id.to_string(),
-                    episode_diagnostic_kind_name(diagnostic),
-                ],
-            )
-            .map_err(sql_error("insert Work Episode diagnostic"))?;
-        if changed == 1 {
-            next_ordinal = next_ordinal
-                .checked_add(1)
-                .ok_or_else(|| invariant("Episode diagnostic ordinal overflow"))?;
-        }
-    }
-    Ok(())
-}
-
 fn read_episode_view(
     connection: &Connection,
     episode_id: WorkEpisodeId,
@@ -4109,8 +7037,309 @@ fn read_episode_view(
     Ok(Some(WorkEpisodeView {
         episode,
         checkpoints,
-        diagnostics: read_episode_diagnostics(connection, episode_id)?,
     }))
+}
+
+/// Puts the Prompts that arrived before this Task in front of the Signals it was created with.
+///
+/// Order is the only fidelity this can offer and it is faithful: `task_signal` records no time by
+/// design, and position in `signal_ordinal` is what "earlier" means there. A backfilled Prompt was
+/// written before anything the Task itself carries, so it takes the lower ordinals.
+fn with_backfilled_prompts(
+    transaction: &Transaction<'_>,
+    locator: &ExternalSessionLocator,
+    signals: Vec<TaskSignal>,
+) -> Result<Vec<TaskSignal>> {
+    let mut backfilled = drain_pending_prompt_signals(transaction, locator)?;
+    if backfilled.is_empty() {
+        return Ok(signals);
+    }
+    backfilled.extend(signals);
+    normalize_signals(backfilled)
+}
+
+/// Reads one Session's pending Prompts in the order they were written.
+fn read_pending_prompts(
+    connection: &Connection,
+    locator: &ExternalSessionLocator,
+) -> Result<Vec<String>> {
+    connection
+        .prepare(
+            "SELECT content FROM pending_prompt_signal
+             WHERE agent_kind = ?1 AND external_session_key = ?2
+             ORDER BY prompt_ordinal",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map(
+                    params![locator.agent_kind, locator.external_session_id],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(sql_error("read pending Prompts"))
+}
+
+/// Takes one Session's pending Prompts as Signals, leaving the stash empty.
+///
+/// Called from inside the transaction that creates the Task, so a Prompt either becomes a Signal
+/// of that Task or stays pending; it can never be lost between the two.
+fn drain_pending_prompt_signals(
+    transaction: &Transaction<'_>,
+    locator: &ExternalSessionLocator,
+) -> Result<Vec<TaskSignal>> {
+    let pending = read_pending_prompts(transaction, locator)?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    transaction
+        .execute(
+            "DELETE FROM pending_prompt_signal
+             WHERE agent_kind = ?1 AND external_session_key = ?2",
+            params![locator.agent_kind, locator.external_session_id],
+        )
+        .map_err(sql_error("drain pending Prompts"))?;
+    Ok(pending
+        .into_iter()
+        .map(|content| TaskSignal {
+            kind: TaskSignalKind::Prompt,
+            content,
+        })
+        .collect())
+}
+
+/// What Candidate Build recorded when it placed this Episode's Claim spellings, if it has.
+fn read_reference_derivation(
+    connection: &Connection,
+    episode_id: WorkEpisodeId,
+) -> Result<Option<ReferenceDerivationRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT derived_at_unix_seconds, placed_count, unresolved_count,
+                    ambiguity_json, unresolved_sample_json, reopened
+             FROM checkpoint_reference_derivation WHERE episode_id = ?1",
+            [episode_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Claim reference derivation record"))?;
+    let Some((derived_at, placed, unresolved, ambiguity, sample, reopened)) = row else {
+        return Ok(None);
+    };
+    Ok(Some(ReferenceDerivationRecord {
+        placed: usize::try_from(placed).unwrap_or(0),
+        ambiguous: ambiguity
+            .as_deref()
+            .map_or_else(|| Ok(Vec::new()), parse_recorded_ambiguous_mentions)?,
+        unresolved: usize::try_from(unresolved).unwrap_or(0),
+        unresolved_sample: sample
+            .as_deref()
+            .map(|text| {
+                serde_json::from_str::<Vec<String>>(text)
+                    .map_err(json_error("read recorded unresolved spelling sample"))
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        reopened: reopened != 0,
+        derived_at_unix_seconds: derived_at.and_then(|value| u64::try_from(value).ok()),
+    }))
+}
+
+/// Writes or replaces one Episode's derivation record, clearing any reopen request it answers.
+fn write_reference_derivation(
+    transaction: &Transaction<'_>,
+    episode_id: WorkEpisodeId,
+    record: &ReferenceDerivationRecord,
+) -> Result<()> {
+    let ambiguity = serde_json::to_string(
+        &record
+            .ambiguous
+            .iter()
+            .map(|mention| {
+                serde_json::json!({
+                    "spelling": mention.spelling,
+                    "channel": mention.channel.as_str(),
+                    "matches": mention.matches,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(json_error("serialize recorded ambiguous spellings"))?;
+    let sample = serde_json::to_string(&record.unresolved_sample)
+        .map_err(json_error("serialize recorded unresolved spelling sample"))?;
+    transaction
+        .execute(
+            "INSERT INTO checkpoint_reference_derivation (
+                episode_id, derived_at_unix_seconds, placed_count, unresolved_count,
+                ambiguity_json, unresolved_sample_json, reopened
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)
+             ON CONFLICT (episode_id) DO UPDATE SET
+                derived_at_unix_seconds = excluded.derived_at_unix_seconds,
+                placed_count = excluded.placed_count,
+                unresolved_count = excluded.unresolved_count,
+                ambiguity_json = excluded.ambiguity_json,
+                unresolved_sample_json = excluded.unresolved_sample_json,
+                reopened = 0",
+            params![
+                episode_id.to_string(),
+                record
+                    .derived_at_unix_seconds
+                    .and_then(|value| i64::try_from(value).ok()),
+                i64::try_from(record.placed).unwrap_or(i64::MAX),
+                i64::try_from(record.unresolved).unwrap_or(i64::MAX),
+                ambiguity,
+                sample,
+            ],
+        )
+        .map_err(sql_error("record Claim reference derivation"))?;
+    Ok(())
+}
+
+fn parse_recorded_ambiguous_mentions(text: &str) -> Result<Vec<AmbiguousMention>> {
+    let rows = serde_json::from_str::<Vec<serde_json::Value>>(text)
+        .map_err(json_error("read recorded ambiguous spellings"))?;
+    rows.iter()
+        .map(|row| {
+            let spelling = row
+                .get("spelling")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invariant("recorded ambiguous spelling has no spelling"))?;
+            let channel = row
+                .get("channel")
+                .and_then(serde_json::Value::as_str)
+                .and_then(MentionChannel::parse)
+                .ok_or_else(|| invariant("recorded ambiguous spelling has no readable channel"))?;
+            let matches = row
+                .get("matches")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| invariant("recorded ambiguous spelling has no match count"))?;
+            Ok(AmbiguousMention {
+                spelling: spelling.to_owned(),
+                channel,
+                matches: usize::try_from(matches).unwrap_or(usize::MAX),
+            })
+        })
+        .collect()
+}
+
+/// Whether the checkout now answers any recorded ambiguity differently than it did.
+///
+/// This is the whole re-derivation trigger, and it is stated as an equality rather than as
+/// "resolves now": a spelling that still finds the same number of files has the same answer and
+/// must not cost a rewrite, whereas one that finds a different number — one file, none, or a
+/// different several — is a different question and earns another derivation. An Episode recorded
+/// before the record carried counts has no ambiguity to compare and is therefore never re-derived.
+fn ambiguity_answer_changed(recorded: &[AmbiguousMention], resolver: &ClaimResolver<'_>) -> bool {
+    recorded.iter().any(|mention| {
+        let current = match mention.channel {
+            MentionChannel::Symbol => resolver.resolve_symbol(&mention.spelling),
+            MentionChannel::Path => match ReferenceDerivationRecord::relookup(mention) {
+                Some(candidate) => resolver.resolve_path(&candidate),
+                // A recorded path spelling the scanner no longer reads as a path can only mean the
+                // extension list moved under it. Nothing to re-ask; leave the record alone.
+                None => return false,
+            },
+        };
+        current
+            != MentionResolution::Ambiguous {
+                matches: mention.matches,
+            }
+    })
+}
+
+/// Folds newly derived coordinates into the ones already persisted, without retracting any.
+///
+/// Deduplication is by coordinate — Repository plus locator — and the already persisted draft
+/// wins, so a reviewer never sees a fact's provenance or supporting statement change underneath
+/// them. A coordinate that only the new derivation found is appended; ordering stays the
+/// deterministic coordinate order the first derivation produced.
+fn merge_engineering_references(
+    persisted: &mut Vec<EngineeringReferenceDraft>,
+    derived: &[EngineeringReferenceDraft],
+) {
+    for reference in derived {
+        let known = persisted.iter().any(|existing| {
+            existing.repository_id == reference.repository_id
+                && existing.locator == reference.locator
+        });
+        if !known {
+            persisted.push(reference.clone());
+        }
+    }
+    persisted.sort_by(|left, right| {
+        left.repository_id
+            .to_string()
+            .cmp(&right.repository_id.to_string())
+            .then_with(|| {
+                left.locator
+                    .path()
+                    .as_str()
+                    .cmp(right.locator.path().as_str())
+            })
+    });
+}
+
+/// Every spelling in one Episode a checkout could place, so one `git ls-files` answers the Build.
+fn episode_claim_mentions(episode: &WorkEpisodeView) -> EpisodeClaimMentions {
+    let mut paths = Vec::new();
+    let mut symbols = Vec::new();
+    for checkpoint in &episode.checkpoints {
+        for claim in &checkpoint.claims {
+            let summaries = claim_evidence_summaries(&episode.episode, claim);
+            let borrowed = summaries.iter().map(String::as_str).collect::<Vec<_>>();
+            paths.extend(reference_derivation::claim_path_candidates(
+                &claim.statement,
+                &claim.rationale,
+                &borrowed,
+            ));
+            symbols.extend(reference_derivation::claim_symbol_mentions(
+                &claim.statement,
+                &claim.rationale,
+                &borrowed,
+            ));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    symbols.sort();
+    symbols.dedup();
+    EpisodeClaimMentions { paths, symbols }
+}
+
+/// Recovers the Evidence summaries one persisted Claim was submitted with.
+///
+/// Direct Checkpoint Evidence becomes an inline-validation Observation whose content carries the
+/// Agent's own `summary`, so Candidate Build reads back exactly the text the ACK saw.
+fn claim_evidence_summaries(episode: &WorkEpisode, claim: &CheckpointClaim) -> Vec<String> {
+    claim
+        .evidence_refs
+        .iter()
+        .filter_map(|reference| match reference {
+            CheckpointEvidenceRef::Observation { observation_id } => episode
+                .observations
+                .iter()
+                .find(|observation| observation.observation_id == *observation_id),
+            CheckpointEvidenceRef::TaskSignal { .. }
+            | CheckpointEvidenceRef::ContextEvidence { .. } => None,
+        })
+        .filter_map(|observation| match &observation.observation {
+            NormalizedWorkObservation::InlineValidation { evidence } => evidence
+                .content
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect()
 }
 
 fn require_episode_view(
@@ -4260,50 +7489,6 @@ fn read_observation_sources(
     .collect()
 }
 
-fn read_episode_diagnostics(
-    connection: &Connection,
-    episode_id: WorkEpisodeId,
-) -> Result<Vec<WorkEpisodeDiagnostic>> {
-    let mut statement = connection
-        .prepare(
-            "SELECT capture_id, kind FROM work_episode_diagnostic
-             WHERE episode_id = ?1 ORDER BY diagnostic_ordinal ASC",
-        )
-        .map_err(sql_error("prepare Work Episode diagnostics"))?;
-    let rows = statement
-        .query_map([episode_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(sql_error("query Work Episode diagnostics"))?;
-    rows.map(|row| {
-        let (capture_id, kind) = row.map_err(sql_error("read Work Episode diagnostic"))?;
-        Ok(WorkEpisodeDiagnostic {
-            capture_id: parse_id(&capture_id, "work_episode_diagnostic.capture_id")?,
-            kind: parse_episode_diagnostic_kind(&kind)?,
-        })
-    })
-    .collect()
-}
-
-const fn episode_diagnostic_kind_name(kind: WorkEpisodeDiagnosticKind) -> &'static str {
-    match kind {
-        WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured => {
-            "capture_repository_not_configured"
-        }
-        WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath => "capture_unsafe_artifact_path",
-    }
-}
-
-fn parse_episode_diagnostic_kind(value: &str) -> Result<WorkEpisodeDiagnosticKind> {
-    match value {
-        "capture_repository_not_configured" => {
-            Ok(WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured)
-        }
-        "capture_unsafe_artifact_path" => Ok(WorkEpisodeDiagnosticKind::CaptureUnsafeArtifactPath),
-        _ => Err(invariant("unknown persisted Work Episode diagnostic kind")),
-    }
-}
-
 fn find_active_signal(
     transaction: &Transaction<'_>,
     task_session_id: TaskSessionId,
@@ -4327,11 +7512,37 @@ fn find_active_signal(
         .transpose()
 }
 
+/// True when `candidate_review` already carries the version 17 provenance column.
+fn candidate_review_has_decision_source(connection: &Connection) -> Result<bool> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(candidate_review)")
+        .map_err(sql_error("inspect candidate_review columns"))?;
+    let present = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sql_error("query candidate_review columns"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error("read candidate_review columns"))?
+        .iter()
+        .any(|name| name == "decision_source");
+    Ok(present)
+}
+
+/// Upper bound on one stored refusal reason. The reason is a diagnostic, not the refusal itself.
+const MAX_REJECTION_REASON_CHARS: usize = 512;
+
+/// Truncates one refusal reason on a character boundary so the counter row stays bounded.
+fn bounded_rejection_reason(reason: &str) -> String {
+    match reason.char_indices().nth(MAX_REJECTION_REASON_CHARS) {
+        Some((index, _)) => reason[..index].to_owned(),
+        None => reason.to_owned(),
+    }
+}
+
 fn read_external_identity(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     locator: &ExternalSessionLocator,
 ) -> Result<Option<ExternalIdentity>> {
-    transaction
+    connection
         .query_row(
             "SELECT external_session_id, active_task_session_id, active_task_id
              FROM external_session
@@ -4448,6 +7659,312 @@ fn read_active_task_head(
         ))
     })
     .transpose()
+}
+
+/// Owning Task lineage of one persisted Working Intent revision.
+struct IntentRevisionOwner {
+    external_session: ExternalSessionId,
+    task_session: TaskSessionId,
+    task: TaskId,
+    head_revision: TaskIntentRevisionId,
+}
+
+/// Marks one Git-committed Confirmation and its Review terminal inside an open transaction.
+fn finalize_one_candidate_confirmation(
+    transaction: &Transaction<'_>,
+    request: &CandidateConfirmationFinalize,
+) -> Result<CandidateConfirmationFinalizeOutcome> {
+    let CandidateConfirmationFinalize {
+        candidate_id,
+        operation_hash,
+        confirmation_id,
+        result_context_id,
+        decision_source,
+    } = request;
+    let candidate_id = *candidate_id;
+    let confirmation_id = *confirmation_id;
+    let result_context_id = *result_context_id;
+    let operation = read_candidate_confirmation_operation(transaction, candidate_id)?
+        .ok_or_else(|| invalid("Candidate Confirmation operation is not reserved"))?;
+    if operation.operation_hash != *operation_hash
+        || operation.plan.confirmation.confirmation_id != confirmation_id
+        || operation.plan.result_context_id != result_context_id
+    {
+        return Err(Error::new(
+            ErrorKind::Conflict,
+            "Committed Candidate Confirmation does not match the reserved operation",
+        ));
+    }
+    if operation.status == CandidateConfirmationOperationStatus::Committed {
+        let review = read_candidate_review_record(transaction, candidate_id)?
+            .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
+        if review.status != CandidateReviewStatus::Confirmed
+            || review.confirmation_id != Some(confirmation_id)
+            || review.result_context_id != Some(result_context_id)
+        {
+            return Err(invariant(
+                "committed Candidate Confirmation and Review audit disagree",
+            ));
+        }
+        if let Some(mapping) =
+            read_proposed_space_group_mapping_for_candidate(transaction, candidate_id)?
+            && mapping.status != ProposedSpaceGroupMappingStatus::Committed
+        {
+            return Err(invariant(
+                "committed Candidate Confirmation has an uncommitted proposed Space group",
+            ));
+        }
+        return Ok(CandidateConfirmationFinalizeOutcome {
+            operation,
+            review,
+            already_confirmed: true,
+        });
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE candidate_review
+                 SET status = 'confirmed', review_version = review_version + 1,
+                     confirmation_id = ?1, result_context_id = ?2, decision_source = ?5
+                 WHERE candidate_id = ?3 AND status = 'pending' AND review_version = ?4",
+            params![
+                confirmation_id.to_string(),
+                result_context_id.to_string(),
+                candidate_id.to_string(),
+                i64::try_from(operation.review_parent_version)
+                    .map_err(|_| invalid("Candidate Review parent version exceeds SQLite range"))?,
+                decision_source.as_str(),
+            ],
+        )
+        .map_err(sql_error("confirm Candidate Review"))?;
+    if changed != 1 {
+        return Err(Error::new(
+            ErrorKind::StaleState,
+            "Candidate Review changed before Confirmation finalized",
+        ));
+    }
+    transaction
+        .execute(
+            "UPDATE candidate_confirmation_operation SET status = 'committed'
+                 WHERE candidate_id = ?1 AND status = 'reserved'",
+            [candidate_id.to_string()],
+        )
+        .map_err(sql_error("commit Candidate Confirmation operation status"))?;
+    transaction
+        .execute(
+            "UPDATE proposed_space_group SET status = 'committed'
+                 WHERE candidate_id = ?1 AND status = 'reserved'",
+            [candidate_id.to_string()],
+        )
+        .map_err(sql_error("commit proposed Space group mapping"))?;
+    let operation = read_candidate_confirmation_operation(transaction, candidate_id)?
+        .ok_or_else(|| invariant("committed Candidate Confirmation operation disappeared"))?;
+    let review = read_candidate_review_record(transaction, candidate_id)?
+        .ok_or_else(|| invariant("confirmed Candidate Review disappeared"))?;
+    Ok(CandidateConfirmationFinalizeOutcome {
+        operation,
+        review,
+        already_confirmed: false,
+    })
+}
+
+fn discard_one_candidate_review(
+    transaction: &Transaction<'_>,
+    task: &TaskSessionSnapshot,
+    request: &CandidateReviewDiscard,
+    now: u64,
+) -> Result<CandidateReviewDiscardOutcome> {
+    let reason = request.reason.trim();
+    let mut record = read_candidate_review_record(transaction, request.candidate_id)?
+        .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+    if record.source_episode.task_session_id != task.task_session_id
+        || record.source_episode.task_id != task.task_id
+    {
+        return Err(invalid(
+            "Candidate Review does not belong to the ExternalSession ActiveTask",
+        ));
+    }
+    match record.status {
+        CandidateReviewStatus::Discarded => {
+            if record.discard_reason.as_deref() != Some(reason) {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    "Candidate Review was already discarded with a different reason",
+                ));
+            }
+            return Ok(CandidateReviewDiscardOutcome {
+                record,
+                status: CandidateReviewDiscardStatus::AlreadyDiscarded,
+            });
+        }
+        CandidateReviewStatus::Expired => {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Expired Candidate Review cannot be discarded",
+            ));
+        }
+        CandidateReviewStatus::Confirmed => {
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "Confirmed Candidate Review cannot be discarded",
+            ));
+        }
+        CandidateReviewStatus::Pending => {}
+    }
+    if record.review_version != request.expected_review_version {
+        return Err(Error::new(
+            ErrorKind::StaleState,
+            "Candidate Review version is stale",
+        ));
+    }
+    let changed = transaction
+        .execute(
+            "UPDATE candidate_review
+             SET status = 'discarded', review_version = review_version + 1,
+                 discard_reason = ?1, discarded_at_unix_seconds = ?2,
+                 decision_source = ?5
+             WHERE candidate_id = ?3 AND review_version = ?4 AND status = 'pending'",
+            params![
+                reason,
+                i64::try_from(now)
+                    .map_err(|_| invalid("Candidate discard timestamp exceeds SQLite range"))?,
+                request.candidate_id.to_string(),
+                i64::try_from(request.expected_review_version)
+                    .map_err(|_| invalid("Candidate Review version exceeds SQLite range"))?,
+                request.decision_source.as_str(),
+            ],
+        )
+        .map_err(sql_error("discard Candidate Review"))?;
+    if changed != 1 {
+        return Err(Error::new(
+            ErrorKind::StaleState,
+            "Candidate Review changed during discard",
+        ));
+    }
+    record = read_candidate_review_record(transaction, request.candidate_id)?
+        .ok_or_else(|| invariant("discarded Candidate Review disappeared"))?;
+    Ok(CandidateReviewDiscardOutcome {
+        record,
+        status: CandidateReviewDiscardStatus::Discarded,
+    })
+}
+
+/// Names the exact batch member that rolled a Review decision back.
+fn confirmation_scoped_error(candidate_id: CandidateId) -> impl Fn(Error) -> Error {
+    move |error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "{} (candidate {candidate_id}); no Candidate in this batch was finalized",
+                error.message()
+            ),
+        )
+    }
+}
+
+fn candidate_scoped_error(candidate_id: CandidateId) -> impl Fn(Error) -> Error {
+    move |error| {
+        Error::new(
+            error.kind(),
+            format!(
+                "{} (candidate {candidate_id}); no Candidate in this batch was discarded",
+                error.message()
+            ),
+        )
+    }
+}
+
+fn read_intent_revision_owner(
+    transaction: &Transaction<'_>,
+    revision_id: TaskIntentRevisionId,
+) -> Result<Option<IntentRevisionOwner>> {
+    transaction
+        .query_row(
+            "SELECT task.external_session_id, task.task_session_id, task.task_id,
+                    task.current_intent_revision_id
+             FROM task_intent_revision AS revision
+             JOIN task_session AS task ON task.task_session_id = revision.task_session_id
+             WHERE revision.revision_id = ?1",
+            [revision_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error("read Working Intent revision owner"))?
+        .map(
+            |(external_session_id, task_session_id, task_id, current_intent_revision_id)| {
+                Ok(IntentRevisionOwner {
+                    external_session: parse_id(
+                        &external_session_id,
+                        "task_session.external_session_id",
+                    )?,
+                    task_session: parse_id(&task_session_id, "task_session.task_session_id")?,
+                    task: parse_id(&task_id, "task_session.task_id")?,
+                    head_revision: parse_id(
+                        &current_intent_revision_id,
+                        "task_session.current_intent_revision_id",
+                    )?,
+                })
+            },
+        )
+        .transpose()
+}
+
+/// Appends one successor revision and advances the owning Task Head in the same transaction.
+fn append_revision_in_transaction(
+    transaction: &Transaction<'_>,
+    task_session_id: TaskSessionId,
+    current: &TaskIntentRevision,
+    working_intent: WorkingIntentSnapshot,
+) -> Result<TaskIntentRevision> {
+    let revision = TaskIntentRevision::successor(current, working_intent)?;
+    let ordinal = read_revision_ordinal(transaction, current.revision_id)?
+        .checked_add(1)
+        .ok_or_else(|| invariant("Task Intent revision ordinal overflow"))?;
+    insert_intent_revision(transaction, task_session_id, ordinal, &revision)?;
+    let changed = transaction
+        .execute(
+            "UPDATE task_session SET current_intent_revision_id = ?1
+             WHERE task_session_id = ?2 AND current_intent_revision_id = ?3",
+            params![
+                revision.revision_id.to_string(),
+                task_session_id.to_string(),
+                current.revision_id.to_string(),
+            ],
+        )
+        .map_err(sql_error("advance Task Intent Head"))?;
+    if changed != 1 {
+        return Err(invariant(
+            "Task Intent Head changed inside write transaction",
+        ));
+    }
+    Ok(revision)
+}
+
+/// Deterministic goal comparison key used only for the concurrent-Agent fork decision.
+///
+/// It lowercases, keeps alphanumeric runs and collapses every other character into one separator.
+/// It is not a retrieval tokenizer and never leaves this decision.
+fn normalized_goal(goal: &str) -> String {
+    let mut normalized = String::with_capacity(goal.len());
+    let mut pending_separator = false;
+    for character in goal.chars() {
+        if character.is_alphanumeric() {
+            if pending_separator && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            pending_separator = false;
+            normalized.extend(character.to_lowercase());
+        } else {
+            pending_separator = true;
+        }
+    }
+    normalized
 }
 
 fn reject_invalid_parent(
@@ -4896,4 +8413,45 @@ fn sql_error(context: &'static str) -> impl FnOnce(rusqlite::Error) -> Error {
 
 fn json_error(context: &'static str) -> impl FnOnce(serde_json::Error) -> Error {
     move |error| Error::new(ErrorKind::InvariantViolation, format!("{context}: {error}"))
+}
+
+#[cfg(test)]
+mod checkpoint_wire_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn direct_checkpoint_semantics_and_operation_hash_match_the_old_contract() {
+        let input = AgentCheckpointSubmission {
+            locator: ExternalSessionLocator::new("codex", "wire-contract").unwrap(),
+            claims: vec![DirectCheckpointClaimDraft {
+                context_kind: ContextKind::Validation,
+                statement: "Operation A".to_owned(),
+                rationale: "The direct Checkpoint operation is durable".to_owned(),
+                conditions: vec!["content addressed".to_owned()],
+                evidence: vec![DirectEvidenceDraft {
+                    evidence_type: EvidenceType::ExperimentRecord,
+                    summary: "Operation A passed".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        };
+        let semantic = direct_checkpoint_semantic_json(&input).unwrap();
+        assert_eq!(
+            semantic,
+            r#"{"claims":[{"conditions":["content addressed"],"context_kind":"validation","evidence":[{"evidence_type":"experiment_record","limitations":[],"summary":"Operation A passed"}],"rationale":"The direct Checkpoint operation is durable","statement":"Operation A"}],"unknowns":[]}"#
+        );
+        let (operation_id, hash) = checkpoint_operation_identity(
+            "tss_00000000-0000-4000-8000-000000000001".parse().unwrap(),
+            "tsk_00000000-0000-4000-8000-000000000002".parse().unwrap(),
+            "tir_00000000-0000-4000-8000-000000000003".parse().unwrap(),
+            &semantic,
+        );
+        // Independently computed from the frozen v1 length-prefixed SHA-256 input.
+        assert_eq!(
+            hash,
+            "sha256:bcd7f8195ddbfb68d024fd27d6ee7658c7dae6a954344e1b18fe9a7a4e0af7fd"
+        );
+        assert_eq!(operation_id, hash);
+    }
 }

@@ -5,6 +5,7 @@ use std::{
     process::{Command, Stdio},
 };
 
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{
     Applicability, ContextKind, ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType,
     ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, ReviewDraft,
@@ -12,7 +13,7 @@ use sctx_domain::{
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
-use sctx_local_state::{BreadcrumbKind, CaptureStore};
+use sctx_local_state::Policy;
 use sctx_task_runtime::TaskRuntime;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -86,7 +87,7 @@ fn run_hook(home: &Path, payload: &Value) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn mcp_tool(home: &Path, name: &str, arguments: &Value) -> Value {
+fn mcp_tool(home: &Path, session: &str, name: &str, arguments: &Value) -> Value {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
         .args(["mcp", "serve", "--client", "codex"])
         .env("HOME", home)
@@ -105,6 +106,14 @@ fn mcp_tool(home: &Path, name: &str, arguments: &Value) -> Value {
             "clientInfo": {"name": "m4-hook-chain", "version": "1"}
         }
     });
+    let mut arguments = arguments.clone();
+    let arguments_object = arguments.as_object_mut().unwrap();
+    arguments_object
+        .entry("agent_kind".to_owned())
+        .or_insert_with(|| json!("codex"));
+    arguments_object
+        .entry("external_session_id".to_owned())
+        .or_insert_with(|| json!(session));
     let call = json!({
         "jsonrpc": "2.0",
         "id": 2,
@@ -203,6 +212,8 @@ fn seed_accepted_context(store: &GitStore, oracle: &HookOracle) -> SeededContext
     let revision = Event::context_revision_added(
         space_id,
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Contract,
             topic_key: Some("m4/hook-chain".to_owned()),
             statement: oracle.context_statement.clone(),
@@ -285,6 +296,11 @@ fn post_tool_payload(
     tool: &str,
     raw_marker: &str,
 ) -> Value {
+    let command = if tool == "Shell" {
+        "cargo test"
+    } else {
+        raw_marker
+    };
     json!({
         "session_id": oracle.session,
         "transcript_path": format!("/tmp/{raw_marker}.jsonl"),
@@ -295,7 +311,12 @@ fn post_tool_payload(
         "turn_id": format!("turn-{}", oracle.session),
         "tool_name": tool,
         "tool_use_id": format!("tool-{tool}"),
-        "tool_input": {"file_path": file, "command": raw_marker},
+        "tool_input": {
+            "file_path": file,
+            "working_directory": workspace,
+            "command": command,
+            "raw_marker": raw_marker
+        },
         "tool_response": {"output": raw_marker}
     })
 }
@@ -310,13 +331,48 @@ fn one_real_hook_to_confirm_identity_chain() {
     let home = temporary.path().join("中文 M4 home");
     fs::create_dir_all(&home).unwrap();
     let root = home.join(".shared-context");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let source_repository = initialize_source_repository(
         &home.join("工程 repo"),
         &oracle.source_relative_path,
         &oracle.source_text,
     );
     let absolute_source = source_repository.join(&oracle.source_relative_path);
+    let repository = run_json_cli(
+        &home,
+        &[
+            "repository",
+            "add",
+            "--repository-id",
+            "Server",
+            "--path",
+            source_repository.to_str().unwrap(),
+        ],
+    );
+    let repository_id = repository["data"]["catalog"]["repository"]["repository_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let session_start = run_hook(
+        &home,
+        &json!({
+            "session_id": oracle.session,
+            "transcript_path": null,
+            "cwd": source_repository,
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "source": "startup"
+        }),
+    );
+    assert_eq!(
+        session_start,
+        json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": shared_context_activation_marker(AgentKind::Codex, &oracle.session)
+        }})
+    );
 
     let prompt = run_hook(
         &home,
@@ -331,12 +387,11 @@ fn one_real_hook_to_confirm_identity_chain() {
             "prompt": oracle.prompt
         }),
     );
-    let guidance = prompt["systemMessage"].as_str().unwrap();
-    assert!(guidance.contains("task_intent_update"));
-    assert!(!guidance.contains(&oracle.prompt));
+    assert_eq!(prompt, json!({}));
 
     let task = mcp_tool(
         &home,
+        &oracle.session,
         "task_intent_update",
         &json!({
             "agent_kind": "codex",
@@ -354,21 +409,9 @@ fn one_real_hook_to_confirm_identity_chain() {
     assert!(intent_revision_id.starts_with("tir_"));
 
     let seeded = seed_accepted_context(&store, &oracle);
-    let repository = run_json_cli(
-        &home,
-        &[
-            "repository",
-            "add",
-            "--path",
-            source_repository.to_str().unwrap(),
-        ],
-    );
-    let repository_id = repository["data"]["catalog"]["repository"]["repository_id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
     let scan = mcp_tool(
         &home,
+        &oracle.session,
         "repository_scan",
         &json!({
             "checkout_path": source_repository,
@@ -387,6 +430,7 @@ fn one_real_hook_to_confirm_identity_chain() {
         .clone();
     let reference = mcp_tool(
         &home,
+        &oracle.session,
         "engineering_reference_record",
         &json!({
             "context_id": seeded.context,
@@ -407,6 +451,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     );
     let rebuilt = mcp_tool(
         &home,
+        &oracle.session,
         "association_rebuild",
         &json!({"diagnose_only": false}),
     );
@@ -414,6 +459,7 @@ fn one_real_hook_to_confirm_identity_chain() {
 
     let focus = mcp_tool(
         &home,
+        &oracle.session,
         "task_artifact_focus",
         &json!({
             "agent_kind": "codex",
@@ -431,10 +477,15 @@ fn one_real_hook_to_confirm_identity_chain() {
     assert_eq!(focus["resolved_focus"]["repository_id"], repository_id);
     assert_eq!(focus["resolved_focus"]["locator"], file_locator);
     let focus_json = serde_json::to_string(&focus).unwrap();
-    assert!(focus_json.contains("engineering_graph"));
+    // The Focus reaches the Context it seeded, by the file both of them name. It is a `file_anchor`
+    // and not an `engineering_graph` path: ADR-0007's first lane joins the Session's footprint
+    // against the Engineering Reference rows in the index, and never consults the Graph projection.
+    assert!(focus_json.contains("file_anchor"), "{focus_json}");
+    assert!(!focus_json.contains("engineering_graph"));
     assert!(focus_json.contains(&seeded.context));
     let ordinary = mcp_tool(
         &home,
+        &oracle.session,
         "task_context",
         &json!({
             "agent_kind": "codex",
@@ -491,80 +542,28 @@ fn one_real_hook_to_confirm_identity_chain() {
         .into_iter()
         .find(|record| record.signal.kind == TaskSignalKind::TestOutcome)
         .unwrap();
-    assert!(test_signal.signal.content.contains(&oracle.test_tool));
-    let signal_id = test_signal.signal_id;
-    let captures = CaptureStore::initialize(&root).unwrap().list(256).unwrap();
-    let owned_captures = captures
-        .captures
-        .iter()
-        .filter(|capture| capture.record.external_session_locator == locator)
-        .collect::<Vec<_>>();
-    assert_eq!(owned_captures.len(), 2);
-    assert!(
-        owned_captures
-            .iter()
-            .all(|capture| capture.record.kind == BreadcrumbKind::ToolOutcome)
-    );
-    assert!(
-        owned_captures
-            .iter()
-            .any(|capture| capture.record.summary.contains(&oracle.test_tool))
-    );
-    assert!(owned_captures.iter().any(|capture| {
-        capture
-            .record
-            .file_hints
-            .iter()
-            .any(|path| path.ends_with(&oracle.source_relative_path))
-    }));
-    assert_ne!(
-        owned_captures[0].record.capture_id,
-        owned_captures[1].record.capture_id
-    );
-    let capture_records = owned_captures
-        .iter()
-        .map(|capture| &capture.record)
-        .collect::<Vec<_>>();
-    let capture_json = serde_json::to_string(&capture_records).unwrap();
-    for raw in [
-        &oracle.raw_file_marker,
-        &oracle.raw_test_marker,
-        &oracle.prompt,
-    ] {
-        assert!(!capture_json.contains(raw));
+    assert_eq!(test_signal.signal.content, "test runner succeeded");
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!root.join("state").join(removed).exists());
     }
-    assert!(owned_captures.iter().all(|capture| {
-        capture
-            .record
-            .task_owner
-            .is_some_and(|owner| owner.task_id.to_string() == task_id)
-    }));
 
     let checkpoint = mcp_tool(
         &home,
+        &oracle.session,
         "task_checkpoint",
         &json!({
             "agent_kind": "codex",
             "external_session_id": oracle.session,
-            "expected_task_id": task_id,
-            "expected_intent_revision_id": intent_revision_id,
-            "expected_episode_version": 0,
-            "boundary": "continue",
             "claims": [{
-                "context_kind_hint": "validation",
-                "topic_key_hint": "m4/hook-chain-result",
+                "context_kind": "validation",
                 "statement": oracle.claim_statement,
                 "rationale": oracle.claim_rationale,
-                "applicability": {
-                    "domains": ["search"],
-                    "platforms": ["fe", "ios", "android"],
-                    "conditions": []
-                },
-                "assumptions": [],
-                "recheck_when": ["the result path changes"],
-                "evidence": [{"kind": "task_signal", "signal_id": signal_id}],
-                "artifact_refs": [focus["resolved_focus"].clone()],
-                "related_contexts": []
+                "conditions": [],
+                "evidence": [{
+                    "evidence_type": "experiment_record",
+                    "summary": "the Hook-to-confirm workflow passed",
+                    "limitations": ["local acceptance fixture"]
+                }]
             }],
             "unknowns": []
         }),
@@ -573,7 +572,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     let claim_id = checkpoint["claim_ids"][0].as_str().unwrap().to_owned();
     let episode_id = checkpoint["episode_id"].as_str().unwrap().to_owned();
     assert_eq!(checkpoint["episode_version"], 1);
-    assert!(checkpoint.get("candidate_build").is_none());
+    assert_eq!(checkpoint["candidate_build"]["status"], "pending");
     let episode_before = runtime
         .list_work_episodes(active.task_session_id, 10)
         .unwrap()
@@ -582,15 +581,11 @@ fn one_real_hook_to_confirm_identity_chain() {
         .unwrap();
     assert!(matches!(
         episode_before.episode.status,
-        WorkEpisodeStatus::Open
+        WorkEpisodeStatus::Closed { .. }
     ));
     assert_eq!(
-        episode_before.checkpoints[0].claims[0].evidence_refs[0],
-        sctx_domain::CaptureEvidenceRef::TaskSignal { signal_id }
-    );
-    assert_eq!(
-        serde_json::to_value(&episode_before.checkpoints[0].claims[0].artifact_refs[0]).unwrap(),
-        focus["resolved_focus"]
+        serde_json::to_value(&episode_before.checkpoints[0].claims[0]).unwrap()["artifact_refs"],
+        json!([]),
     );
 
     let turn_stop_payload = json!({
@@ -628,25 +623,21 @@ fn one_real_hook_to_confirm_identity_chain() {
         "limit": 10,
         "token_budget": 32768
     });
-    let listed = mcp_tool(&home, "candidate_list", &owner);
+    let listed = mcp_tool(&home, &oracle.session, "candidate_list", &owner);
     assert_eq!(listed["reviews"].as_array().unwrap().len(), 1);
     let candidate_id = listed["reviews"][0]["candidate_id"]
         .as_str()
         .unwrap()
         .to_owned();
     let repeated_stop = run_hook(&home, &turn_stop_payload);
-    assert!(
-        !repeated_stop["systemMessage"]
-            .as_str()
-            .unwrap()
-            .contains(&oracle.raw_stop_marker)
-    );
-    let repeated_list = mcp_tool(&home, "candidate_list", &owner);
+    assert_eq!(repeated_stop, json!({}));
+    let repeated_list = mcp_tool(&home, &oracle.session, "candidate_list", &owner);
     assert_eq!(repeated_list["reviews"].as_array().unwrap().len(), 1);
     assert_eq!(repeated_list["reviews"][0]["candidate_id"], candidate_id);
 
     let review = mcp_tool(
         &home,
+        &oracle.session,
         "candidate_get",
         &json!({
             "agent_kind": "codex",
@@ -675,6 +666,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     }
     let unconfirmed_pack = mcp_tool(
         &home,
+        &oracle.session,
         "task_context",
         &json!({
             "agent_kind": "codex",
@@ -701,7 +693,12 @@ fn one_real_hook_to_confirm_identity_chain() {
         "primary": {"existing_space_id": seeded.space},
         "related_space_ids": []
     });
-    let confirmed = mcp_tool(&home, "candidate_confirm", &confirm_arguments);
+    let confirmed = mcp_tool(
+        &home,
+        &oracle.session,
+        "candidate_confirm",
+        &confirm_arguments,
+    );
     assert_eq!(confirmed["status"], "confirmed");
     assert_eq!(confirmed["created"], true);
     assert_eq!(
@@ -718,7 +715,12 @@ fn one_real_hook_to_confirm_identity_chain() {
         event_count(store.repository()),
         events_before + oracle.expected_confirmation_events
     );
-    let retried = mcp_tool(&home, "candidate_confirm", &confirm_arguments);
+    let retried = mcp_tool(
+        &home,
+        &oracle.session,
+        "candidate_confirm",
+        &confirm_arguments,
+    );
     assert_eq!(retried["status"], "already_confirmed");
     assert_eq!(retried["created"], false);
     assert_eq!(retried["confirmation_id"], confirmed["confirmation_id"]);
@@ -731,6 +733,7 @@ fn one_real_hook_to_confirm_identity_chain() {
     );
     let search = mcp_tool(
         &home,
+        &oracle.session,
         "context_search",
         &json!({
             "query": oracle.claim_statement,
@@ -748,4 +751,16 @@ fn one_real_hook_to_confirm_identity_chain() {
             .unwrap()
             .is_some()
     );
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

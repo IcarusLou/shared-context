@@ -1,0 +1,155 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "cursor_normal_candidate_confirm",
+  "agent": {"vendor": "cursor", "version": "3.13.2", "framing": "newline_delimited_json"},
+  "actors": [
+    {"id": "session", "kind": {"type": "session"}},
+    {"id": "task", "kind": {"type": "task", "session": "session"}}
+  ],
+  "actions": [
+    {
+      "id": "space-create", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "space"},
+        {"type": "string", "value": "create"},
+        {"type": "string", "value": "--title"},
+        {"type": "string", "value": "Cursor synthetic contract"},
+        {"type": "string", "value": "--problem"},
+        {"type": "string", "value": "Cursor synthetic contract needs one governed home"},
+        {"type": "string", "value": "--desired-outcome"},
+        {"type": "string", "value": "Cursor synthetic contract is accepted"},
+        {"type": "string", "value": "--in-scope"},
+        {"type": "string", "value": "cursor-synthetic-contract"},
+        {"type": "string", "value": "--acceptance-condition"},
+        {"type": "string", "value": "the offline validation passes"}
+      ]}
+    },
+    {
+      "id": "repository-add", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--repository-id"},
+        {"type": "string", "value": "FE"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+      ]}
+    },
+    {
+      "id": "session-start", "actor": "session", "after": ["space-create", "repository-add"],
+      "action": {"type": "hook_event", "event": "sessionStart", "payload": {"type": "object", "fields": {
+        "workspace_roots": {"type": "array", "items": [
+          {"type": "builtin", "builtin": {"type": "resource_root", "resource": "focus-repo"}}
+        ]}
+      }}}
+    },
+    {
+      "id": "intent-new", "actor": "task", "after": ["session-start"],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "new"},
+        "expected_revision_id": {"type": "null"},
+        "intent": {"type": "object", "fields": {"goal": {"type": "string", "value": "validate the Cursor synthetic contract"}}}
+      }}}
+    },
+    {
+      "id": "active-observe", "actor": "task", "after": ["intent-new"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "active_task"},
+        "session_key": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "checkpoint", "actor": "task", "after": ["active-observe"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "claims": {"type": "array", "items": [{"type": "object", "fields": {
+          "context_kind": {"type": "string", "value": "contract"},
+          "statement": {"type": "string", "value": "Cursor synthetic contract validation passed"},
+          "rationale": {"type": "string", "value": "The deterministic offline scenario completed"},
+          "conditions": {"type": "array", "items": []},
+          "evidence": {"type": "array", "items": [{"type": "object", "fields": {
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the Cursor path completed"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
+        }}]},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "turn-stop", "actor": "session", "after": ["checkpoint"],
+      "action": {"type": "hook_event", "event": "stop", "payload": {"type": "object", "fields": {}}}
+    },
+    {
+      "id": "candidate-list", "actor": "task", "after": ["turn-stop"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "status": {"type": "string", "value": "pending"},
+        "limit": {"type": "unsigned", "value": 10},
+        "token_budget": {"type": "unsigned", "value": 32768}
+      }}}
+    },
+    {
+      "id": "candidate-get", "actor": "task", "after": ["candidate-list"],
+      "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "candidate_id": {"type": "variable", "name": "listed-candidate-id"}
+      }}}
+    },
+    {
+      "id": "context-before-confirm", "actor": "task", "after": ["candidate-get"],
+      "action": {"type": "mcp_request", "method": "task_context", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "token_budget": {"type": "unsigned", "value": 4000},
+        "max_spaces": {"type": "unsigned", "value": 8}
+      }}}
+    },
+    {
+      "id": "candidate-confirm", "actor": "task", "after": ["context-before-confirm"],
+      "action": {"type": "mcp_request", "method": "candidate_confirm", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "cursor"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "expected_task_id": {"type": "variable", "name": "task-id"},
+        "expected_intent_revision_id": {"type": "variable", "name": "intent-revision-id"},
+        "candidate_id": {"type": "variable", "name": "candidate-id"},
+        "expected_review_version": {"type": "variable", "name": "review-version"},
+        "primary": {"type": "object", "fields": {"existing_space_id": {"type": "variable", "name": "existing-space-id"}}},
+        "related_space_ids": {"type": "array", "items": []}
+      }}}
+    }
+  ],
+  "resources": [{
+    "id": "focus-repo", "synthetic_git": true,
+    "files": [{"path": "README.txt", "content": "synthetic Cursor activation repository\n"}]
+  }],
+  "variables": [
+    {"name": "existing-space-id", "value_type": "space_id", "capture": {"step": "space-create", "pointer": "/space_id"}},
+    {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
+    {"name": "intent-revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
+    {"name": "checkpoint-episode-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint", "pointer": "/episode_id"}},
+    {"name": "listed-candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-list", "pointer": "/reviews/0/candidate_id"}},
+    {"name": "candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-get", "pointer": "/candidate_id"}},
+    {"name": "episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get", "pointer": "/source_episode/episode_id"}},
+    {"name": "review-version", "value_type": "count", "capture": {"step": "candidate-get", "pointer": "/review_version"}},
+    {"name": "confirmation-id", "value_type": "confirmation_id", "capture": {"step": "candidate-confirm", "pointer": "/confirmation_id"}}
+  ],
+  "faults": [],
+  "assertions": [
+    {"id": "active-task", "invariant": {"type": "active_task_per_session", "observation": "active-observe", "session": "session", "task": "task-id"}},
+    {"id": "candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "episode-id"}},
+    {"id": "candidate-not-injected", "invariant": {"type": "candidate_is_not_auto_injected", "candidate": "candidate-id", "response": "context-before-confirm"}},
+    {"id": "confirmation-four", "invariant": {"type": "confirmation_is_atomic", "confirmation": "confirmation-id", "response": "candidate-confirm", "event_count": "four"}}
+  ],
+  "events": [
+    {"event": "sessionStart", "classification": "supported", "product_action": "session_start"},
+    {"event": "stop", "classification": "supported", "product_action": "turn_stop"},
+    {"event": "beforeTabFileRead", "classification": "observed_only"}
+  ]
+}

@@ -1,22 +1,28 @@
+mod logging_harness;
+
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Child, Command, Stdio},
 };
 
 use fs2::FileExt;
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{ExternalSessionLocator, IntentSnapshot, TaskId, WorkingIntentSnapshot};
 use sctx_event_schema::Event;
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_index::ProjectionIndex;
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::Policy;
+use sctx_local_state::{AuthorizedSessionScopeRead, AuthorizedSessionScopeStore, UserConfigStore};
 use sctx_task_runtime::TaskRuntime;
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
 
+use logging_harness::LoggingHarness;
+
 const DIAGNOSTIC: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
-const PROMPT_GUIDANCE: &str = "Shared Context PromptEnvelope received. No Working Intent was inferred from prompt text. Use $shared-context and task_intent_update to record naturally formed understanding before precise retrieval.";
 
 struct SqliteLock {
     child: Child,
@@ -59,6 +65,7 @@ impl Drop for SqliteLock {
 }
 
 struct Harness {
+    logging: LoggingHarness,
     _temporary: TempDir,
     home: std::path::PathBuf,
 }
@@ -68,7 +75,9 @@ impl Harness {
         let temporary = tempdir().unwrap();
         let home = temporary.path().join("hook failure home");
         fs::create_dir_all(&home).unwrap();
+        let logging = LoggingHarness::start(&home);
         Self {
+            logging,
             _temporary: temporary,
             home,
         }
@@ -80,6 +89,7 @@ impl Harness {
 
     fn hook(&self, agent: &str, payload: &Value) -> std::process::Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+        self.logging.apply(&mut command);
         command
             .args(["hook", "--agent", agent])
             .env("HOME", &self.home);
@@ -98,7 +108,9 @@ impl Harness {
     }
 
     fn explicit_task_context(&self) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_sctx"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+        self.logging.apply(&mut command);
+        command
             .args([
                 "--json",
                 "task",
@@ -146,6 +158,46 @@ fn cursor_post_tool(cwd: &Path, file: &Path, raw_marker: &str) -> Value {
     })
 }
 
+fn cursor_session_start(cwd: &Path, session_id: &str) -> Value {
+    json!({
+        "conversation_id": session_id,
+        "generation_id": format!("generation-{session_id}"),
+        "model": "claude-opus-4-7",
+        "hook_event_name": "sessionStart",
+        "cursor_version": "3.13.10",
+        "workspace_roots": [cwd],
+        "user_email": null,
+        "transcript_path": null,
+        "session_id": session_id,
+        "is_background_agent": false,
+        "composer_mode": "agent"
+    })
+}
+
+fn assert_neutral(output: &std::process::Output, root: &Path, secret: &str) {
+    assert!(
+        output.status.success(),
+        "Hook must fail open: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({})
+    );
+    let observable = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root_text = root.to_string_lossy().into_owned();
+    for forbidden in [secret, root_text.as_str(), "<shared-context"] {
+        assert!(
+            !observable.contains(forbidden),
+            "neutral output leaked {forbidden:?}: {observable}"
+        );
+    }
+}
+
 fn assert_fail_open(
     output: &std::process::Output,
     field: &str,
@@ -186,7 +238,7 @@ fn assert_fail_open(
 }
 
 fn initialize_store(harness: &Harness) -> GitStore {
-    GitStore::initialize(harness.root()).unwrap()
+    GitStore::bootstrap_local(harness.root()).unwrap()
 }
 
 fn task_intent() -> WorkingIntentSnapshot {
@@ -206,20 +258,14 @@ fn task_intent() -> WorkingIntentSnapshot {
 }
 
 #[test]
-fn codex_hook_fails_open_when_runtime_database_path_cannot_open() {
+fn disabled_codex_prompt_does_not_open_unavailable_runtime_database() {
     let harness = Harness::new();
     initialize_store(&harness);
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "PROMPT_SECRET_RUNTIME_OPEN";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "open-fault", secret));
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 
     let explicit = harness.explicit_task_context();
     assert_eq!(explicit.status.code(), Some(2));
@@ -228,7 +274,7 @@ fn codex_hook_fails_open_when_runtime_database_path_cannot_open() {
 }
 
 #[test]
-fn codex_hook_fails_open_when_runtime_database_is_corrupt() {
+fn disabled_codex_prompt_does_not_open_corrupt_runtime_database() {
     let harness = Harness::new();
     initialize_store(&harness);
     let runtime = TaskRuntime::initialize(harness.root()).unwrap();
@@ -241,18 +287,12 @@ fn codex_hook_fails_open_when_runtime_database_is_corrupt() {
         "codex",
         &codex_prompt(&harness.home, "corrupt-fault", secret),
     );
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("RAW_CORRUPT_DATABASE_MESSAGE"));
 }
 
 #[test]
-fn codex_hook_fails_open_when_runtime_database_is_busy() {
+fn disabled_codex_prompt_does_not_wait_for_busy_runtime_database() {
     let harness = Harness::new();
     initialize_store(&harness);
     let runtime = TaskRuntime::initialize(harness.root()).unwrap();
@@ -260,17 +300,54 @@ fn codex_hook_fails_open_when_runtime_database_is_busy() {
     let secret = "PROMPT_SECRET_RUNTIME_BUSY";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "busy-fault", secret));
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 }
 
 #[test]
-fn codex_hook_fails_open_when_index_update_is_busy() {
+fn codex_hook_without_embedded_version_never_spawns_a_per_event_probe() {
+    let harness = Harness::new();
+    let binaries = harness.home.join("fake bin");
+    fs::create_dir_all(&binaries).unwrap();
+    let marker = harness.home.join("codex-version-probe-ran");
+    let codex = binaries.join("codex");
+    fs::write(
+        &codex,
+        "#!/bin/sh\nprintf called > \"$CODEX_PROBE_MARKER\"\nprintf '0.147.0\\n'\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&codex).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&codex, permissions).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    harness.logging.apply(&mut command);
+    let mut child = command
+        .args(["hook", "--agent", "codex"])
+        .env("HOME", &harness.home)
+        .env("PATH", &binaries)
+        .env("CODEX_PROBE_MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    serde_json::to_writer(
+        child.stdin.as_mut().unwrap(),
+        &codex_prompt(&harness.home, "no-version-probe", "safe prompt"),
+    )
+    .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({})
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn disabled_codex_prompt_does_not_wait_for_busy_index() {
     let harness = Harness::new();
     let store = initialize_store(&harness);
     TaskRuntime::initialize(harness.root()).unwrap();
@@ -294,13 +371,7 @@ fn codex_hook_fails_open_when_index_update_is_busy() {
     let secret = "PROMPT_SECRET_INDEX_BUSY";
 
     let output = harness.hook("codex", &codex_prompt(&harness.home, "index-fault", secret));
-    assert_fail_open(
-        &output,
-        "systemMessage",
-        PROMPT_GUIDANCE,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 }
 
 #[test]
@@ -309,8 +380,42 @@ fn cursor_post_tool_hook_fails_open_when_runtime_is_unavailable() {
     initialize_store(&harness);
     let workspace = harness.home.join("cursor workspace");
     fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
     let file = workspace.join("contract.rs");
     fs::write(&file, "fn contract() {}\n").unwrap();
+    let workspace = fs::canonicalize(workspace).unwrap();
+    let file = fs::canonicalize(file).unwrap();
+    UserConfigStore::open_existing(harness.root())
+        .unwrap()
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&workspace),
+        )
+        .unwrap();
+    let start = harness.hook(
+        "cursor",
+        &cursor_session_start(&workspace, "cursor-fail-open"),
+    );
+    assert!(start.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&start.stdout).unwrap(),
+        json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "cursor-fail-open")
+        })
+    );
+    // The prior SessionStart Hook already opened (and so created) `runtime.sqlite` itself —
+    // both to resolve the Task Runtime operation and to record its own `hook_event` diagnostic
+    // row — so the fault is injected by replacing that file with a directory, not by assuming
+    // the path is still untouched.
+    let _ = fs::remove_file(harness.root().join("state/runtime.sqlite"));
     fs::create_dir(harness.root().join("state/runtime.sqlite")).unwrap();
     let secret = "CURSOR_RAW_SECRET_MUST_NOT_LEAK";
 
@@ -344,7 +449,10 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
     let file = fs::canonicalize(file).unwrap();
     UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&workspace))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&workspace),
+        )
         .unwrap();
     TaskRuntime::initialize(harness.root())
         .unwrap()
@@ -355,6 +463,18 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
             Vec::new(),
         )
         .unwrap();
+    let start = harness.hook(
+        "cursor",
+        &cursor_session_start(&workspace, "cursor-fail-open"),
+    );
+    assert!(start.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&start.stdout).unwrap(),
+        json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "cursor-fail-open")
+        })
+    );
     fs::create_dir(harness.root().join("state/repository-registry.sqlite")).unwrap();
     let secret = "CURSOR_REGISTRY_HOT_PATH_MUST_NOT_RUN";
 
@@ -367,7 +487,7 @@ fn cursor_post_tool_hook_ignores_repository_registry_failure() {
 }
 
 #[test]
-fn cursor_post_tool_hook_fails_open_when_catalog_config_is_invalid() {
+fn cursor_post_tool_hook_is_neutral_when_catalog_config_is_invalid() {
     let harness = Harness::new();
     initialize_store(&harness);
     let workspace = harness.home.join("invalid catalog workspace");
@@ -391,17 +511,11 @@ fn cursor_post_tool_hook_fails_open_when_catalog_config_is_invalid() {
     let secret = "CURSOR_CATALOG_CONFIG_MUST_NOT_LEAK";
 
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
-    assert_fail_open(
-        &output,
-        "additional_context",
-        DIAGNOSTIC,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
 }
 
 #[test]
-fn cursor_post_tool_hook_fails_open_immediately_when_catalog_lock_is_busy() {
+fn cursor_post_tool_hook_is_neutral_immediately_when_catalog_lock_is_busy() {
     let harness = Harness::new();
     initialize_store(&harness);
     let workspace = harness.home.join("locked catalog workspace");
@@ -428,12 +542,194 @@ fn cursor_post_tool_hook_fails_open_immediately_when_catalog_lock_is_busy() {
     let started = std::time::Instant::now();
     let output = harness.hook("cursor", &cursor_post_tool(&workspace, &file, secret));
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    assert_fail_open(
-        &output,
-        "additional_context",
-        DIAGNOSTIC,
-        &harness.root(),
-        secret,
-    );
+    assert_neutral(&output, &harness.root(), secret);
     FileExt::unlock(&lock).unwrap();
+}
+
+fn hook_raw_stdin(harness: &Harness, agent: &str, payload: &[u8]) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
+    harness.logging.apply(&mut command);
+    let mut child = command
+        .args(["hook", "--agent", agent])
+        .env("HOME", &harness.home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(payload).unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+/// Payload-shape faults must fail open exactly like runtime faults: the desktop IDE renders a
+/// non-zero Hook exit as a blocked action, so an undecodable payload degrades to a neutral no-op.
+#[test]
+fn cursor_undecodable_payload_shapes_fail_open_with_a_neutral_output() {
+    let harness = Harness::new();
+    let secret = "CURSOR_UNDECODABLE_MUST_NOT_BLOCK";
+    let mut empty_roots = cursor_session_start(&harness.home, "undecodable-roots");
+    empty_roots["workspace_roots"] = json!([]);
+    let mut unknown_event = cursor_session_start(&harness.home, "undecodable-event");
+    unknown_event["hook_event_name"] = json!("futureHook");
+    for payload in [empty_roots, unknown_event] {
+        let output = harness.hook("cursor", &payload);
+        assert_neutral(&output, &harness.root(), secret);
+        assert!(
+            !output.stderr.is_empty(),
+            "an ignored payload must leave a diagnostic"
+        );
+    }
+
+    let output = hook_raw_stdin(&harness, "cursor", b"RAW_NOT_JSON_PAYLOAD");
+    assert_neutral(&output, &harness.root(), secret);
+
+    // Each failure is emitted to the collector's independent bounded diagnostics view; Runtime
+    // remains untouched by telemetry.
+    let recent = harness.logging.diagnostics().recent_events;
+    let decode_failures = recent
+        .iter()
+        .filter(|event| event.reason.as_deref() == Some("payload_decode_failed"))
+        .count();
+    assert_eq!(
+        decode_failures, 3,
+        "expected one payload_decode_failed hook_event row per undecodable payload: {recent:#?}"
+    );
+}
+
+/// The desktop IDE 3.17.21 shapes observed in production: an empty `generation_id` on
+/// session-level events, a fractional `postToolUse` duration with an empty or missing `cwd`,
+/// and an undocumented `final_status`. All must decode and stay neutral while disabled.
+#[test]
+fn cursor_desktop_3_17_payload_shapes_decode_and_stay_neutral_when_disabled() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("desktop workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let file = workspace.join("contract.rs");
+    fs::write(&file, "fn contract() {}\n").unwrap();
+    let secret = "CURSOR_DESKTOP_SHAPE_MUST_NOT_LEAK";
+
+    let mut start = cursor_session_start(&workspace, "desktop-shape");
+    start["generation_id"] = json!("");
+    start["model"] = json!("unknown");
+    assert_neutral(&harness.hook("cursor", &start), &harness.root(), secret);
+
+    for remove_cwd in [false, true] {
+        let mut post = cursor_post_tool(&workspace, &file, secret);
+        post["duration"] = json!(9.299);
+        post["cwd"] = json!("");
+        if remove_cwd {
+            post.as_object_mut().unwrap().remove("cwd");
+        }
+        assert_neutral(&harness.hook("cursor", &post), &harness.root(), secret);
+    }
+
+    let end = json!({
+        "conversation_id": "desktop-shape",
+        "generation_id": "",
+        "model": "unknown",
+        "hook_event_name": "sessionEnd",
+        "cursor_version": "3.17.21",
+        "workspace_roots": [workspace],
+        "user_email": null,
+        "transcript_path": null,
+        "session_id": "desktop-shape",
+        "reason": "window_close",
+        "duration_ms": 0,
+        "is_background_agent": false,
+        "final_status": "unknown"
+    });
+    assert_neutral(&harness.hook("cursor", &end), &harness.root(), secret);
+}
+
+/// #34's real five-key `SessionEnd` shape must reach cleanup, not merely emit the same neutral
+/// stdout as a decode failure. Prove the runtime effect and the collector event together.
+#[test]
+fn codex_model_less_session_end_reaches_cleanup_and_success_telemetry() {
+    let harness = Harness::new();
+    initialize_store(&harness);
+    let workspace = harness.home.join("registered workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let workspace = fs::canonicalize(workspace).unwrap();
+    UserConfigStore::open_existing(harness.root())
+        .unwrap()
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&workspace),
+        )
+        .unwrap();
+    let fixtures: Vec<Value> =
+        serde_json::from_str(include_str!("../../../fixtures/agents/codex-0.147.json")).unwrap();
+    let session = "model-less-session-end";
+    let locator = ExternalSessionLocator::new("codex", session).unwrap();
+    let scopes = AuthorizedSessionScopeStore::initialize(harness.root()).unwrap();
+    let mut start = fixtures[0].clone();
+    start["session_id"] = json!(session);
+    start["cwd"] = json!(workspace);
+    let started = harness.hook("codex", &start);
+    assert!(started.status.success());
+    assert!(matches!(
+        scopes.read(&locator).unwrap(),
+        AuthorizedSessionScopeRead::Current(_)
+    ));
+
+    let mut end = fixtures[6].clone();
+    end["session_id"] = json!(session);
+    end["cwd"] = json!(workspace);
+    assert_eq!(end.as_object().unwrap().len(), 5);
+    assert!(end.get("model").is_none());
+    let ended = harness.hook("codex", &end);
+    assert!(ended.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&ended.stdout).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        scopes.read(&locator).unwrap(),
+        AuthorizedSessionScopeRead::Missing
+    );
+
+    let events = harness.logging.diagnostics().recent_events;
+    let end_events = events
+        .iter()
+        .filter(|event| event.operation.as_deref() == Some("hook.codex.session_end"))
+        .collect::<Vec<_>>();
+    assert!(
+        !end_events.is_empty(),
+        "missing SessionEnd telemetry: {events:#?}"
+    );
+    assert!(
+        end_events
+            .iter()
+            .any(|event| event.outcome == sctx_telemetry::Outcome::Success),
+        "{end_events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.outcome != sctx_telemetry::Outcome::FailOpen
+                && event.reason.as_deref() != Some("payload_decode_failed")),
+        "{events:#?}"
+    );
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

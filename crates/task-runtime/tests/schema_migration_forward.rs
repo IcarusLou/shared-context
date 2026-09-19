@@ -1,0 +1,991 @@
+//! `TaskRuntime` in-place schema upgrades. Version 13 -> 14 is additive (`hook_event`) and must
+//! touch no pre-existing row; version 14 -> 15 discards `context_usage` and must touch nothing
+//! else; version 15 -> 16 discards the recorded omissions only and keeps every proof; version
+//! 16 -> 17 is additive again (disposition provenance) and must leave every decided Review
+//! readable as the human decision it was; version 17 -> 18 is additive (two `external_session`
+//! counters for the `TurnStop` checkpoint reminder gate, WP-V6 fix 3). Version 18 -> 19 adds relation and usage-basis audit
+//! columns; version 19 -> 20 turns the one-column Claim derivation marker into a record of what
+//! that derivation found; version 20 -> 21 adds the table that holds a Prompt submitted before
+//! its Session had a Task; version 21 -> 22 separates first from latest exposure on
+//! `task_injection`. The nine chain, so a version 13 database reopened today lands on the current
+//! version.
+//!
+//! There is no standalone "build an old database" helper, so these construct one honestly: they
+//! open a fresh (current-schema) `TaskRuntime`, write representative business rows through the
+//! public API and a hand-crafted `candidate_review` row, then downgrade the file to look exactly
+//! like a real older database and rewind `PRAGMA user_version`. Reopening must migrate forward.
+
+use rusqlite::{Connection, params};
+use sctx_domain::{ExternalSessionLocator, TaskId, WorkingIntentSnapshot};
+use sctx_task_runtime::TaskRuntime;
+use tempfile::TempDir;
+
+fn intent(goal: &str) -> WorkingIntentSnapshot {
+    WorkingIntentSnapshot {
+        goal: goal.to_owned(),
+        current_direction: Some(format!("Deliver {goal}")),
+        in_scope: vec![goal.to_owned()],
+        out_of_scope: vec![],
+        domains: vec!["task-runtime".to_owned()],
+        platforms: vec![],
+        constraints: vec![],
+        acceptance_conditions: vec![format!("{goal} is recorded")],
+        artifact_hints: vec![],
+        interface_hints: vec![],
+        open_questions: vec![],
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn schema_version_13_chains_forward_in_place_and_keeps_existing_rows() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+
+    // 1. A real Task Session, written through the public API against the current schema.
+    let locator = ExternalSessionLocator::new("codex", "schema-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let (task_session_id, revision_id) = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        let outcome = runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a schema upgrade"),
+                Vec::new(),
+            )
+            .unwrap();
+        (
+            outcome.snapshot.task_session_id,
+            outcome
+                .snapshot
+                .current_intent_revision()
+                .unwrap()
+                .revision_id,
+        )
+    };
+    let database_path = root.join("state").join("runtime.sqlite");
+    assert!(database_path.is_file());
+
+    // 2. A hand-crafted `candidate_review` row (its own foreign-key chain is irrelevant to this
+    //    migration test, so it is inserted with foreign key enforcement off, exactly as a
+    //    version 13 installation's own already-written row would already exist on disk).
+    let candidate_id = "candidate-schema-migration-fixture";
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO candidate_review (
+                    candidate_id, submission_id, episode_id, task_session_id, task_id,
+                    build_id, final_checkpoint_id, checkpoint_id, claim_id, review_version,
+                    status, created_at_unix_seconds, expires_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 'pending', 1000, 2000)",
+                params![
+                    candidate_id,
+                    "submission-schema-migration-fixture",
+                    "episode-schema-migration-fixture",
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    "build-schema-migration-fixture",
+                    "checkpoint-schema-migration-fixture",
+                    "checkpoint-schema-migration-fixture",
+                    "claim-schema-migration-fixture",
+                ],
+            )
+            .unwrap();
+
+        // 3. Downgrade the file to a genuine version 13 shape: `hook_event` is the only schema
+        //    difference version 14 introduces, so dropping it and rewinding `user_version`
+        //    reproduces a real pre-upgrade installation exactly.
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS hook_event_recorded_at;
+                 DROP TABLE IF EXISTS hook_event;
+                 DROP INDEX IF EXISTS auto_confirm_rejection_recorded_at;
+                 DROP TABLE IF EXISTS auto_confirm_rejection;
+                 ALTER TABLE candidate_review DROP COLUMN decision_source;
+                 ALTER TABLE checkpoint_reference_derivation
+                    DROP COLUMN derived_at_unix_seconds;
+                 ALTER TABLE checkpoint_reference_derivation DROP COLUMN placed_count;
+                 ALTER TABLE checkpoint_reference_derivation DROP COLUMN unresolved_count;
+                 ALTER TABLE checkpoint_reference_derivation DROP COLUMN ambiguity_json;
+                 ALTER TABLE checkpoint_reference_derivation
+                    DROP COLUMN unresolved_sample_json;
+                 ALTER TABLE checkpoint_reference_derivation DROP COLUMN reopened;
+                 DROP TABLE IF EXISTS pending_prompt_signal;
+                 PRAGMA user_version = 13;",
+            )
+            .unwrap();
+    }
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 13, "fixture must start at schema version 13");
+        let hook_event_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hook_event')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!hook_event_exists, "fixture must not have hook_event yet");
+    }
+
+    // 4. Reopening must migrate in place: the version chains all the way to the current one,
+    //    hook_event now exists, and every pre-existing row -- Task Runtime tables written through
+    //    the public API, and the hand-crafted candidate_review row -- is untouched.
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        version, 22,
+        "migration must chain through to the current version"
+    );
+    let hook_event_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hook_event')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(hook_event_exists, "migration must create hook_event");
+    let hook_event_row_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM hook_event", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        hook_event_row_count, 0,
+        "migration must not fabricate hook_event rows"
+    );
+
+    let snapshot = runtime.read_snapshot_by_locator(&locator).unwrap().unwrap();
+    assert_eq!(snapshot.task_session_id, task_session_id);
+    assert_eq!(snapshot.task_id, task_id);
+    assert_eq!(
+        snapshot.current_intent_revision().unwrap().revision_id,
+        revision_id
+    );
+    assert_eq!(
+        snapshot
+            .current_intent_revision()
+            .unwrap()
+            .working_intent
+            .goal,
+        "survive a schema upgrade"
+    );
+
+    let (status, review_version, submission_id): (String, i64, String) = connection
+        .query_row(
+            "SELECT status, review_version, submission_id FROM candidate_review WHERE candidate_id = ?1",
+            params![candidate_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "pending");
+    assert_eq!(review_version, 1);
+    assert_eq!(submission_id, "submission-schema-migration-fixture");
+
+    // Legacy schema compatibility remains after the new Runtime retires its diagnostic APIs.
+    // Prove the table still accepts all original columns and reopening preserves the exact row.
+    connection
+        .execute(
+            "INSERT INTO hook_event (
+                recorded_at_unix_ms, agent_kind, external_session_id, event_kind,
+                decision, reason, duration_ms, detail
+             ) VALUES (1, 'codex', 'schema-migration-session', 'session_start',
+                       'enabled', 'ok', 3, 'legacy diagnostic')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let reopened = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(reopened.database_path()).unwrap();
+    let rows: Vec<serde_json::Value> = connection
+        .prepare(
+            "SELECT recorded_at_unix_ms, agent_kind, external_session_id, event_kind,
+                    decision, reason, duration_ms, detail FROM hook_event ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "recorded_at_unix_ms": row.get::<_, i64>(0)?,
+                "agent_kind": row.get::<_, String>(1)?,
+                "external_session_id": row.get::<_, String>(2)?,
+                "event_kind": row.get::<_, String>(3)?,
+                "decision": row.get::<_, String>(4)?,
+                "reason": row.get::<_, String>(5)?,
+                "duration_ms": row.get::<_, i64>(6)?,
+                "detail": row.get::<_, String>(7)?,
+            }))
+        })
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        [serde_json::json!({
+            "recorded_at_unix_ms": 1,
+            "agent_kind": "codex",
+            "external_session_id": "schema-migration-session",
+            "event_kind": "session_start",
+            "decision": "enabled",
+            "reason": "ok",
+            "duration_ms": 3,
+            "detail": "legacy diagnostic",
+        })]
+    );
+}
+
+/// Version 14 -> 15 clears every recorded injection outcome and nothing else.
+///
+/// The rows a version 14 installation holds were all decided by statement token similarity, which
+/// credited restatement and recorded real reuse as an omission. They are advisory local ranking
+/// state with no Event behind them and no way to re-derive them, so the migration deletes them.
+/// What was injected into which Task is a fact and survives.
+#[test]
+fn schema_version_14_discards_the_recorded_injection_outcomes_only() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "usage-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let context_id = sctx_domain::ContextId::new();
+    let revision_id = sctx_domain::RevisionId::new();
+    let intent_revision_id = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        let outcome = runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a usage reset"),
+                Vec::new(),
+            )
+            .unwrap();
+        let intent_revision_id = outcome
+            .snapshot
+            .current_intent_revision()
+            .unwrap()
+            .revision_id;
+        runtime
+            .record_task_injections(
+                task_id,
+                intent_revision_id,
+                sctx_task_runtime::ContextInjectionSource::IntentUpdate,
+                &[sctx_task_runtime::InjectedContext {
+                    context_id,
+                    revision_id,
+                }],
+            )
+            .unwrap();
+        runtime
+            .record_context_usage(&[sctx_task_runtime::ContextUsageRecord {
+                context_id,
+                task_id,
+                outcome: sctx_task_runtime::ContextUsageOutcome::Ignored,
+            }])
+            .unwrap();
+        assert_eq!(
+            runtime.context_usage_totals(&[context_id]).unwrap()[&context_id],
+            sctx_task_runtime::ContextUsageTotals {
+                reused: 0,
+                ignored: 1,
+                refuted: 0,
+            }
+        );
+        intent_revision_id
+    };
+
+    // Neither version 15 nor 16 changed a table shape, so rewinding the stamp alone is a
+    // faithful version 14, and reopening chains 14 -> 15 -> 16 in one call.
+    let database_path = root.join("state").join("runtime.sqlite");
+    Connection::open(&database_path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 14;")
+        .unwrap();
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        22
+    );
+    assert!(
+        runtime
+            .context_usage_totals(&[context_id])
+            .unwrap()
+            .is_empty(),
+        "the migration must discard every outcome the old comparison decided"
+    );
+    let injections = runtime.read_task_injections(task_id).unwrap();
+    assert_eq!(
+        injections.len(),
+        1,
+        "what was injected is a fact and survives"
+    );
+    assert_eq!(injections[0].context_id, context_id);
+    assert_eq!(injections[0].intent_revision_id, intent_revision_id);
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .unwrap()
+            .task_id,
+        task_id
+    );
+}
+
+/// Version 15 -> 16 discards the recorded omissions and keeps every proof.
+///
+/// Version 15 decided reuse from two signals; two more decide it now, so a stored `ignored` is a
+/// verdict this version would not necessarily reach on the same input and cannot be re-derived.
+/// `reused` and `refuted` are proofs and no signal was removed, so both still hold.
+#[test]
+fn schema_version_15_discards_the_recorded_omissions_and_keeps_the_proofs() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "omission-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let ignored = sctx_domain::ContextId::new();
+    let reused = sctx_domain::ContextId::new();
+    let refuted = sctx_domain::ContextId::new();
+    {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive an omission reset"),
+                Vec::new(),
+            )
+            .unwrap();
+        runtime
+            .record_context_usage(&[
+                sctx_task_runtime::ContextUsageRecord {
+                    context_id: ignored,
+                    task_id,
+                    outcome: sctx_task_runtime::ContextUsageOutcome::Ignored,
+                },
+                sctx_task_runtime::ContextUsageRecord {
+                    context_id: reused,
+                    task_id,
+                    outcome: sctx_task_runtime::ContextUsageOutcome::Reused,
+                },
+                sctx_task_runtime::ContextUsageRecord {
+                    context_id: refuted,
+                    task_id,
+                    outcome: sctx_task_runtime::ContextUsageOutcome::Refuted,
+                },
+            ])
+            .unwrap();
+    }
+
+    Connection::open(root.join("state").join("runtime.sqlite"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 15;")
+        .unwrap();
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    assert_eq!(
+        Connection::open(runtime.database_path())
+            .unwrap()
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        22
+    );
+    let totals = runtime
+        .context_usage_totals(&[ignored, reused, refuted])
+        .unwrap();
+    assert!(
+        !totals.contains_key(&ignored),
+        "an omission the old rule decided is not a verdict this version stands behind"
+    );
+    assert_eq!(
+        totals[&reused],
+        sctx_task_runtime::ContextUsageTotals {
+            reused: 1,
+            ignored: 0,
+            refuted: 0,
+        },
+        "proven reuse survives: no signal was removed"
+    );
+    assert_eq!(
+        totals[&refuted],
+        sctx_task_runtime::ContextUsageTotals {
+            reused: 0,
+            ignored: 0,
+            refuted: 1,
+        },
+        "a refutation is an Agent-stated contradiction and survives"
+    );
+}
+
+/// Version 16 -> 17 adds disposition provenance without touching one decided Review.
+///
+/// Both changes are additive: `candidate_review.decision_source` starts `NULL` on every row that
+/// already existed, and `auto_confirm_rejection` starts empty. A `NULL` reads back as `human`,
+/// which is exactly what those dispositions were — `agent_policy` did not exist when they were
+/// written, so there is nothing to guess and nothing to rewrite.
+#[test]
+fn schema_version_16_adds_disposition_provenance_without_rewriting_a_decision() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "provenance-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let task_session_id = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a provenance upgrade"),
+                Vec::new(),
+            )
+            .unwrap()
+            .snapshot
+            .task_session_id
+    };
+    let database_path = root.join("state").join("runtime.sqlite");
+
+    // A version 16 installation exactly: one already-decided Review, and neither version 17
+    // addition present.
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        connection
+            .execute(
+                "INSERT INTO candidate_review (
+                    candidate_id, submission_id, episode_id, task_session_id, task_id,
+                    build_id, final_checkpoint_id, checkpoint_id, claim_id, review_version,
+                    status, discard_reason, created_at_unix_seconds, expires_at_unix_seconds,
+                    discarded_at_unix_seconds
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 2, 'discarded', 'process detail',
+                           1000, 2000, 1500)",
+                params![
+                    "candidate-provenance-fixture",
+                    "submission-provenance-fixture",
+                    "episode-provenance-fixture",
+                    task_session_id.to_string(),
+                    task_id.to_string(),
+                    "build-provenance-fixture",
+                    "checkpoint-provenance-fixture",
+                    "checkpoint-provenance-fixture",
+                    "claim-provenance-fixture",
+                ],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX IF EXISTS auto_confirm_rejection_recorded_at;
+                 DROP TABLE IF EXISTS auto_confirm_rejection;
+                 ALTER TABLE candidate_review DROP COLUMN decision_source;
+                 PRAGMA user_version = 16;",
+            )
+            .unwrap();
+    }
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        22
+    );
+    let rejections_exist: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'auto_confirm_rejection')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        rejections_exist,
+        "migration must create the refusal counter table"
+    );
+
+    let (status, reason, decision_source): (String, String, Option<String>) = connection
+        .query_row(
+            "SELECT status, discard_reason, decision_source FROM candidate_review
+             WHERE candidate_id = ?1",
+            params!["candidate-provenance-fixture"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "discarded", "the decision itself is untouched");
+    assert_eq!(reason, "process detail");
+    assert_eq!(
+        decision_source, None,
+        "a Review decided before the column existed carries no invented provenance"
+    );
+
+    let totals = runtime.candidate_disposition_stats().unwrap();
+    assert_eq!(
+        totals.human.discarded, 1,
+        "a NULL provenance reads back as the human decision it was"
+    );
+    assert_eq!(totals.agent_policy.discarded, 0);
+    assert_eq!(totals.auto_confirm_not_permitted, 0);
+}
+
+/// Version 17 -> 18 adds the two `external_session` counters the `TurnStop` checkpoint reminder
+/// gate uses (WP-V6 fix 3) and touches nothing else.
+///
+/// Unlike the other fixtures in this file, `external_session`'s *shape* changed, so writing rows
+/// through the current schema and only rewinding `user_version` would not reproduce a genuine
+/// pre-migration database -- the columns would already be there before the migration ever ran.
+/// This rebuilds `external_session` in its true pre-migration shape (no reminder columns) to
+/// prove the `ADD COLUMN` path itself, not the migration's defensive skip of a column that
+/// already exists.
+#[test]
+fn schema_version_17_adds_the_checkpoint_reminder_counters_at_zero() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "reminder-migration-session").unwrap();
+    let task_id = TaskId::new();
+    let task_session_id = {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                task_id,
+                intent("survive a reminder-counter upgrade"),
+                Vec::new(),
+            )
+            .unwrap()
+            .snapshot
+            .task_session_id
+    };
+
+    let database_path = root.join("state").join("runtime.sqlite");
+    {
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 CREATE TABLE external_session_v17 (
+                     external_session_id TEXT PRIMARY KEY,
+                     agent_kind TEXT NOT NULL,
+                     external_session_key TEXT NOT NULL,
+                     active_task_session_id TEXT NOT NULL,
+                     active_task_id TEXT NOT NULL,
+                     UNIQUE (agent_kind, external_session_key),
+                     FOREIGN KEY (external_session_id, active_task_session_id, active_task_id)
+                         REFERENCES task_session (external_session_id, task_session_id, task_id)
+                         DEFERRABLE INITIALLY DEFERRED
+                 ) STRICT;
+                 INSERT INTO external_session_v17
+                     SELECT external_session_id, agent_kind, external_session_key,
+                            active_task_session_id, active_task_id
+                     FROM external_session;
+                 DROP TABLE external_session;
+                 ALTER TABLE external_session_v17 RENAME TO external_session;
+                 PRAGMA user_version = 17;",
+            )
+            .unwrap();
+        let has_reminder_columns: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM pragma_table_info('external_session')
+                     WHERE name = 'checkpoint_reminder_count'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_reminder_columns,
+            "fixture must reproduce a genuine version 17 external_session, without the reminder \
+             columns"
+        );
+    }
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    assert_eq!(
+        connection
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        22,
+        "migration must chain through to the current version"
+    );
+    let (reminder_count, activity): (i64, i64) = connection
+        .query_row(
+            "SELECT checkpoint_reminder_count, activity_since_checkpoint_reminder
+             FROM external_session WHERE active_task_session_id = ?1",
+            params![task_session_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (reminder_count, activity),
+        (0, 0),
+        "a migrated pre-existing Session starts with a fresh reminder budget"
+    );
+
+    // The migrated row works through the public gate/activity API exactly like a fresh row would.
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the first reminder on a migrated row still fires unconditionally"
+    );
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert_eq!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .unwrap()
+            .task_id,
+        task_id,
+        "the migrated row's Task identity is untouched"
+    );
+}
+
+/// Re-running the additive migrations over a database that already has every column must not fail.
+///
+/// `ADD COLUMN` has no `IF NOT EXISTS`, so both additive migrations guard on the column itself. A
+/// stamp rewound by hand — the same shape an interrupted upgrade leaves behind — must still
+/// migrate.
+#[test]
+fn schema_migrations_are_reentrant_over_existing_columns() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join(".shared-context");
+    let locator = ExternalSessionLocator::new("codex", "reentrant-migration-session").unwrap();
+    {
+        let runtime = TaskRuntime::initialize(&root).unwrap();
+        runtime
+            .open_or_create(
+                locator.clone(),
+                TaskId::new(),
+                intent("survive a repeated upgrade"),
+                Vec::new(),
+            )
+            .unwrap();
+    }
+    Connection::open(root.join("state").join("runtime.sqlite"))
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 16;")
+        .unwrap();
+
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    assert_eq!(
+        Connection::open(runtime.database_path())
+            .unwrap()
+            .query_row::<i64, _, _>("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap(),
+        22
+    );
+    assert!(
+        runtime
+            .read_snapshot_by_locator(&locator)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn schema_version_18_adds_audit_columns_without_losing_decisions_or_usage() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let task_id = TaskId::new();
+    runtime
+        .open_or_create(
+            ExternalSessionLocator::new("codex", "audit-migration").unwrap(),
+            task_id,
+            intent("preserve audit rows"),
+            Vec::new(),
+        )
+        .unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+        ALTER TABLE candidate_review DROP COLUMN top_relation;
+        ALTER TABLE context_usage DROP COLUMN basis;
+        PRAGMA user_version = 18;",
+        )
+        .unwrap();
+    for (index, outcome) in ["ignored", "reused", "refuted"].iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO context_usage VALUES (?1, ?2, ?3, 123)",
+                params![format!("context-{index}"), task_id.to_string(), outcome],
+            )
+            .unwrap();
+    }
+    connection
+        .execute_batch(
+            "INSERT INTO candidate_review (
+        candidate_id, submission_id, episode_id, task_session_id, task_id,
+        build_id, final_checkpoint_id, checkpoint_id, claim_id, review_version,
+        status, discard_reason, created_at_unix_seconds, expires_at_unix_seconds,
+        discarded_at_unix_seconds, decision_source
+    ) VALUES ('candidate', 'submission', 'episode', 'task-session', 'task',
+        'build', 'final', 'checkpoint', 'claim', 2, 'discarded', 'process', 10, 100, 20,
+        'agent_policy');",
+        )
+        .unwrap();
+    drop(connection);
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        let rows = connection.prepare("SELECT outcome, recorded_at_unix_seconds, basis FROM context_usage ORDER BY context_id")
+            .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            rows,
+            ["ignored", "reused", "refuted"].map(|outcome| (
+                outcome.to_owned(),
+                123,
+                "checkpoint_derived".to_owned()
+            ))
+        );
+        let stats = runtime.candidate_disposition_stats().unwrap();
+        assert_eq!(stats.agent_policy.discarded, 1);
+        assert_eq!(stats.relation_decisions.len(), 1);
+        assert_eq!(stats.relation_decisions[0].top_relation, None);
+        assert_eq!(stats.relation_decisions[0].counts.discarded, 1);
+        assert!(
+            connection
+                .execute("UPDATE context_usage SET basis = 'invented'", [])
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT discard_reason FROM candidate_review", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "process"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM task_session", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+}
+
+/// Version 19 -> 20 turns the bare Claim derivation marker into a record of what it found.
+///
+/// The load-bearing property is what an upgraded row *means*: a marker written before this
+/// version carries no ambiguity, so it reads as "derived, and nothing is known about how" and is
+/// never re-derived. An installation is upgraded without any Candidate changing underneath a
+/// reviewer, and `reopen_ambiguous_reference_derivations` leaves it alone because there is no
+/// question recorded to re-ask.
+#[test]
+fn schema_version_19_records_what_the_derivation_found_and_keeps_old_markers_closed() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let episode_id = sctx_domain::WorkEpisodeId::new();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             ALTER TABLE checkpoint_reference_derivation DROP COLUMN derived_at_unix_seconds;
+             ALTER TABLE checkpoint_reference_derivation DROP COLUMN placed_count;
+             ALTER TABLE checkpoint_reference_derivation DROP COLUMN unresolved_count;
+             ALTER TABLE checkpoint_reference_derivation DROP COLUMN ambiguity_json;
+             ALTER TABLE checkpoint_reference_derivation DROP COLUMN unresolved_sample_json;
+             ALTER TABLE checkpoint_reference_derivation DROP COLUMN reopened;
+             PRAGMA user_version = 19;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO checkpoint_reference_derivation (episode_id) VALUES (?1)",
+            params![episode_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Twice, because every migration in this chain has to be re-runnable.
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        let record = runtime
+            .reference_derivation_record(episode_id)
+            .unwrap()
+            .expect("the pre-upgrade marker survives as a record");
+        assert_eq!(record.placed, 0);
+        assert_eq!(record.unresolved, 0);
+        assert!(record.ambiguous.is_empty());
+        assert!(record.unresolved_sample.is_empty());
+        assert!(!record.reopened);
+        assert_eq!(
+            record.derived_at_unix_seconds, None,
+            "an upgraded marker does not claim a time it never recorded"
+        );
+        assert_eq!(
+            runtime.reopen_ambiguous_reference_derivations().unwrap(),
+            0,
+            "a marker with no recorded ambiguity has no question to re-ask"
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE checkpoint_reference_derivation SET reopened = 2",
+                    []
+                )
+                .is_err(),
+            "the reopen flag is a flag"
+        );
+    }
+}
+
+/// Version 20 -> 21 adds the pending Prompt table, and nothing else.
+#[test]
+fn schema_version_20_adds_the_pending_prompt_table_without_touching_anything_else() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "pending-prompt-migration").unwrap();
+    runtime
+        .open_or_create(
+            locator.clone(),
+            TaskId::new(),
+            intent("survive the pending Prompt upgrade"),
+            Vec::new(),
+        )
+        .unwrap();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS pending_prompt_signal;
+             PRAGMA user_version = 20;",
+        )
+        .unwrap();
+    drop(connection);
+
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pending_prompt_signal", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM task_session", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+}
+
+/// Version 21 -> 22 separates first exposure from latest exposure on `task_injection`.
+///
+/// The load-bearing property is what an upgraded row *means*. Before this version the single
+/// timestamp was rewritten on every re-push, so it already holds the *latest* exposure and the
+/// first one it overwrote is gone. The backfill therefore copies it, and an upgraded row reads as
+/// "these two moments are the same" -- indistinguishable from a Context pushed once, which is the
+/// honest answer. Only pushes recorded from here on can tell the difference, and the existing
+/// `context_usage` verdict beside it is not touched by either.
+#[test]
+fn schema_version_21_separates_first_exposure_from_latest_without_inventing_one() {
+    let root = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(root.path()).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "injection-exposure-migration").unwrap();
+    let task_id = TaskId::new();
+    runtime
+        .open_or_create(
+            locator,
+            task_id,
+            intent("survive the injection exposure upgrade"),
+            Vec::new(),
+        )
+        .unwrap();
+    let context_id = sctx_domain::ContextId::new();
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE task_injection DROP COLUMN last_injected_at_unix_seconds;
+             PRAGMA user_version = 21;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO task_injection (
+                task_id, context_id, intent_revision_id, revision_id,
+                injected_at_unix_seconds, source
+             ) VALUES (?1, ?2, ?3, ?4, 7_000, 'intent_update')",
+            params![
+                task_id.to_string(),
+                context_id.to_string(),
+                sctx_domain::TaskIntentRevisionId::new().to_string(),
+                sctx_domain::RevisionId::new().to_string(),
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO context_usage (
+                context_id, task_id, outcome, recorded_at_unix_seconds, basis
+             ) VALUES (?1, ?2, 'ignored', 6_000, 'checkpoint_derived')",
+            params![context_id.to_string(), task_id.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+
+    // Twice, because every migration in this chain has to be re-runnable.
+    for _ in 0..2 {
+        let runtime = TaskRuntime::initialize(root.path()).unwrap();
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            22
+        );
+        let records = runtime.read_task_injections(task_id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].injected_at_unix_seconds, 7_000);
+        assert_eq!(
+            records[0].last_injected_at_unix_seconds, 7_000,
+            "an upgraded row claims no first exposure it never recorded"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT recorded_at_unix_seconds FROM context_usage
+                     WHERE context_id = ?1 AND task_id = ?2",
+                    params![context_id.to_string(), task_id.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            6_000,
+            "the verdict recorded beside it is untouched"
+        );
+    }
+}

@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "routing": [
+    {"case": "common_parent", "kind": "enabled", "allowed": ["nested", "outer"]},
+    {"case": "outer_checkout", "kind": "enabled", "allowed": ["outer"]},
+    {"case": "nested_longest_prefix", "kind": "enabled", "allowed": ["nested"]},
+    {"case": "unregistered_directory", "kind": "disabled", "allowed": []},
+    {"case": "unregistered_sibling", "kind": "disabled", "allowed": []}
+  ],
+  "home_guard": {
+    "home_directory": "disabled",
+    "home_parent": "disabled",
+    "filesystem_root": "disabled",
+    "common_parent_below_home": "enabled"
+  },
+  "lease": {
+    "decision_kinds": ["disabled", "enabled"],
+    "record_fields": [
+      "version",
+      "external_session_locator",
+      "decision",
+      "startup_cwd",
+      "issued_at_unix_seconds"
+    ],
+    "directory_mode": 448,
+    "record_mode": 384,
+    "orphan_max_age_seconds": 2592000,
+    "concurrent_created_leases": 1,
+    "forbidden_state_fragments": [
+      "PROMPT_CANARY_M1_Z8Q4",
+      "TRANSCRIPT_CANARY_M1_P7V2",
+      "TOOL_OUTPUT_CANARY_M1_C6N9",
+      "REPORT_CANARY_M1_K3D5",
+      "BUSINESS_BODY_CANARY_M1_H2W7",
+      "checkout_path",
+      "root_path",
+      "repository_group",
+      "allowed_repository_ids",
+      "prompt",
+      "transcript",
+      "tool_output",
+      "report"
+    ]
+  }
+}

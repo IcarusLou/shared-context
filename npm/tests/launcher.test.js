@@ -16,8 +16,8 @@ const {
 } = require('../packages/shared-context/lib/launcher');
 
 test('launcher selects the package matching darwin CPU', () => {
-  assert.equal(packageFor('darwin', 'arm64'), '@company/shared-context-darwin-arm64');
-  assert.equal(packageFor('darwin', 'x64'), '@company/shared-context-darwin-x64');
+  assert.equal(packageFor('darwin', 'arm64'), '@bytedance-dev/shared-context-darwin-arm64');
+  assert.equal(packageFor('darwin', 'x64'), '@bytedance-dev/shared-context-darwin-x64');
   assert.throws(
     () => packageFor('linux', 'x64'),
     /does not support linux\/x64.*darwin\/arm64 and darwin\/x64/,
@@ -38,7 +38,7 @@ test('missing optional platform package reports the exact repair', () => {
       }),
     (error) =>
       error instanceof LauncherError &&
-      error.message.includes('@company/shared-context-darwin-arm64') &&
+      error.message.includes('@bytedance-dev/shared-context-darwin-arm64') &&
       error.message.includes('optional dependencies enabled') &&
       error.message.includes('matching offline bundle'),
   );
@@ -78,11 +78,11 @@ test('binary verification enforces checksum before code signature', (context) =>
 
 test('launcher forwards argv, inherited stdio, and native exit code unchanged', () => {
   const calls = [];
-  const status = launch(['setup', '--yes', 'space and 中文'], {
+  const status = launch(['knowledge', 'sync', '--root', 'space and 中文'], {
     platform: 'darwin',
     arch: 'arm64',
     resolve(request) {
-      assert.equal(request, '@company/shared-context-darwin-arm64/bin/sctx');
+      assert.equal(request, '@bytedance-dev/shared-context-darwin-arm64/bin/sctx');
       return '/fixture/sctx';
     },
     verify(binary) {
@@ -97,7 +97,7 @@ test('launcher forwards argv, inherited stdio, and native exit code unchanged', 
   assert.deepEqual(calls, [
     {
       command: '/fixture/sctx',
-      args: ['setup', '--yes', 'space and 中文'],
+      args: ['knowledge', 'sync', '--root', 'space and 中文'],
       options: { stdio: 'inherit' },
     },
   ]);

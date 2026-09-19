@@ -1,5 +1,9 @@
 # 团队共享 Context：预期效果
 
+> 第一次接触项目？请先阅读[《Shared Context 新手使用指南》](./docs/user-guide.md)，其中包含安装步骤、基础原理、日常用法和完整功能清单。
+
+日志采集、Git 上报和本地空间清理见[《日志采集、同步与排障》](./docs/logging.md)。
+
 ## 一句话定义
 
 > **让一个人在某个 Agent 里已经完成的理解、判断和验证，能够低成本地变成团队下一位成员和下一个 Agent 可以直接继承的有效工程 Context，而不是重新读 PRD、重新搜代码、重新问一遍。**
@@ -13,6 +17,8 @@
     ↓
 在正确时机重新注入工作流
 ```
+
+当前实现不存在 Hook 记录列表或人工筛选步骤。工作 Agent 直接用 `task_checkpoint` 提交聚焦的 Claims、Unknowns 和自包含 Evidence 摘要；服务端负责解析当前 Task/Intent、关闭 Work Episode、生成稳定重试身份并持久化 Candidate Build 队列。Checkpoint ACK 与同内容重放不写 Git，`candidate_list/get` 可恢复不可信 Candidate 提案，只有用户显式 `candidate_confirm` 才生成 accepted Context 事实。
 
 ---
 
@@ -119,13 +125,7 @@ Engineering Context Sharing
 
 的转变。
 
-原始 Agent Conversation / Trace 更多是：
-
-- Source
-- Evidence
-- Breadcrumb
-
-而不是最终直接注入其他 Agent 的知识。
+原始 Agent Conversation / Trace 不作为产品输入。工作 Agent 直接把已经形成的结论、理由、适用条件、证据摘要与局限写成 Checkpoint；这些内容在一次明确处置（人工确认，或服务端校验通过的 Agent 自动确认，ADR-0005）之前仍是不可信 Candidate。
 
 ---
 
@@ -217,9 +217,9 @@ Cross-platform Constraints
 因此整个系统需要同时解决两个问题：
 
 ```text
-Capture
+Checkpoint
   ↓
-沉淀什么 Context？
+Agent 认为哪些结论值得沉淀？
 
 Retrieve
   ↓
@@ -360,11 +360,11 @@ Session 结束
 ```text
 正常使用 IDE / Agent
         ↓
-自动捕获 Trace / Breadcrumb
+Agent 直接提交聚焦的 Claim / Unknown / Evidence 摘要
         ↓
-识别 Candidate Context
+服务端可靠排队生成 Candidate
         ↓
-聚合 / Validate
+人工 Review / Validate
         ↓
 形成 Team Context
 ```
@@ -566,7 +566,7 @@ Engineering Knowledge
 可以进一步抽象为：
 
 ```text
-Capture Once
+Conclude Once
     ↓
 Validate Once
     ↓

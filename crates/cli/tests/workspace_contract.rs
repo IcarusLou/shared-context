@@ -1,7 +1,12 @@
 use std::{collections::HashMap, fs, path::PathBuf, process::Command};
 
-const MEMBERS: [(&str, u8); 14] = [
+const MEMBERS: [(&str, u8); 19] = [
+    ("scenario-contract", 0),
+    ("scenario-runner", 2),
     ("domain", 0),
+    ("telemetry", 0),
+    ("log-service", 1),
+    ("log-sync", 2),
     ("engineering-graph", 1),
     ("local-state", 1),
     ("event-schema", 1),
@@ -82,6 +87,8 @@ fn source_asset_trees_are_not_ignored() {
         "fixtures/agents/cursor-3.13.json",
         "fixtures/agents/codex-0.147.json",
         "npm/packages/README.md",
+        "docs/dynamic-replay-phase-one.md",
+        "tests/reports/dynamic-replay-phase-one-v1.json",
     ] {
         let status = Command::new("git")
             .args(["check-ignore", "--quiet", "--no-index", path])

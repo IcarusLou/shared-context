@@ -221,6 +221,19 @@ impl<'a> Git<'a> {
         ])?;
         parse_name_status(&bytes)
     }
+
+    pub(crate) fn changed_between(&self, base_revision: &str) -> Result<Vec<NameStatus>> {
+        let bytes = self.output_bytes([
+            OsString::from("diff"),
+            OsString::from("--name-status"),
+            OsString::from("-z"),
+            OsString::from("--no-renames"),
+            OsString::from(base_revision),
+            OsString::from("HEAD"),
+            OsString::from("--"),
+        ])?;
+        parse_name_status(&bytes)
+    }
 }
 
 #[derive(Debug)]

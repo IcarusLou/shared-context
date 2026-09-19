@@ -21,15 +21,22 @@ sctx-git-store.workspace = true
 sctx-index.workspace = true
 sctx-installer.workspace = true
 sctx-local-state.workspace = true
+sctx-log-service.workspace = true
+sctx-log-sync.workspace = true
 sctx-mcp.workspace = true
 sctx-search.workspace = true
 sctx-task-runtime.workspace = true
+sctx-telemetry.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true
 
 [dev-dependencies]
 fs2.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+sctx-scenario-contract.workspace = true
+sctx-scenario-runner.workspace = true
 tempfile = "3.20"

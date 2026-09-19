@@ -3,9 +3,12 @@ use sctx_adapter_cursor::{
     encode_hook_output,
 };
 use sctx_agent_adapter::{
-    CapabilityMode, EpisodeFinalizationTrigger, TaskRuntimeOperation, plan_action,
+    AgentKind, CapabilityMode, EpisodeFinalizationTrigger, PathHint, ResolvedActivationDecision,
+    TaskRuntimeOperation, ToolCategory, plan_action_for_activation,
+    shared_context_activation_marker,
 };
 use serde_json::Value;
+use std::path::PathBuf;
 
 fn fixtures() -> Vec<Value> {
     serde_json::from_str(include_str!("../../../fixtures/agents/cursor-3.13.json")).unwrap()
@@ -36,25 +39,66 @@ fn documented_cursor_3_13_shapes_map_to_all_canonical_events() {
 }
 
 #[test]
-fn cursor_prompt_hook_is_observable_but_never_an_injection_dependency() {
+fn cursor_shell_fixture_emits_a_strict_test_runner_with_only_its_working_directory() {
+    let (event, _) =
+        decode_hook_input(&serde_json::to_vec(&fixtures().remove(2)).unwrap()).unwrap();
+    let sctx_adapter_cursor::CanonicalAgentEvent::PostToolUse {
+        tool_category,
+        path_hints,
+        ..
+    } = event
+    else {
+        panic!("fixture must decode as PostToolUse");
+    };
+    assert_eq!(tool_category, ToolCategory::TestRunner);
+    assert_eq!(
+        path_hints,
+        vec![PathHint::WorkingDirectory(PathBuf::from(
+            "/workspace/shared context"
+        ))]
+    );
+}
+
+#[test]
+fn cursor_prompt_hook_never_repeats_activation_marker() {
     let payload = fixtures().remove(1);
     let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
     let capability = capabilities(Some("3.13.10"), true);
     assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
     assert!(capability.prompt_submit);
     assert!(!capability.prompt_aware_injection);
-    let action = plan_action(&event, &capability);
-    assert!(action.task_operation.is_none());
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
+    // A Prompt plans one purely local Signal and nothing else: no marker, no reminder, and
+    // nothing the model or the user ever sees for this event.
+    assert!(matches!(
+        action.task_operation,
+        Some(TaskRuntimeOperation::RecordPromptSignal { .. })
+    ));
+    assert!(action.additional_context.is_none());
+    assert!(action.system_message.is_none());
+
+    let output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: action.additional_context,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output).unwrap(),
+        serde_json::json!({})
+    );
     assert!(
-        action
-            .system_message
-            .as_deref()
-            .is_some_and(|message| message.contains("task_intent_update"))
+        !String::from_utf8(output)
+            .unwrap()
+            .contains("<shared-context-active")
     );
 }
 
 #[test]
-fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_claims() {
+fn cursor_boundaries_plan_runtime_finalization_and_encode_its_resolved_notice() {
     let capability = capabilities(Some("3.13.10"), true);
     for (index, expected_trigger) in [
         (3, EpisodeFinalizationTrigger::PreCompact),
@@ -62,29 +106,127 @@ fn cursor_precompact_and_turn_stop_request_explicit_checkpoint_without_runtime_c
     ] {
         let (event, _) =
             decode_hook_input(&serde_json::to_vec(&fixtures().remove(index)).unwrap()).unwrap();
-        let action = plan_action(&event, &capability);
+        let action = plan_action_for_activation(
+            &event,
+            &capability,
+            ResolvedActivationDecision::Enabled,
+            "",
+        );
         assert!(matches!(
             action.task_operation,
             Some(TaskRuntimeOperation::FinalizeCheckpointedEpisode { trigger, .. })
                 if trigger == expected_trigger
         ));
-        assert!(action.system_message.as_deref().is_some_and(|message| {
-            message.contains("task_checkpoint")
-                && message.contains("Hook summary text is not Claim evidence")
-        }));
+        assert!(
+            action.system_message.is_none(),
+            "the planner must not invent runtime guidance"
+        );
+        let message = "Runtime-resolved checkpoint guidance";
+
+        // Both events carry the one text field Cursor renders. Compaction additionally
+        // re-states the activation marker on its own line, because compaction is what
+        // drops the SessionStart marker out of the model's context.
+        let output = encode_hook_output(
+            event.kind(),
+            &ResolvedAgentAction {
+                additional_context: action.additional_context.clone(),
+                system_message: Some(message.to_owned()),
+            },
+        )
+        .unwrap();
+        let expected = match expected_trigger {
+            EpisodeFinalizationTrigger::PreCompact => format!(
+                "{message}\n{}",
+                shared_context_activation_marker(AgentKind::Cursor, "conv-real-shape-01")
+            ),
+            EpisodeFinalizationTrigger::TurnStop => message.to_owned(),
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output).unwrap(),
+            serde_json::json!({"user_message": expected})
+        );
     }
 }
 
 #[test]
-fn cursor_unknown_version_and_missing_hooks_keep_only_mcp_cli() {
+fn cursor_session_start_encodes_disabled_as_neutral_and_both_enabled_scopes_identically() {
+    let (event, _) =
+        decode_hook_input(&serde_json::to_vec(&fixtures().remove(0)).unwrap()).unwrap();
+    let capability = capabilities(Some("3.13.10"), true);
+
+    let disabled = plan_action_for_activation(
+        &event,
+        &capability,
+        ResolvedActivationDecision::Disabled,
+        "",
+    );
+    assert!(disabled.task_operation.is_none());
+    let disabled_output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: disabled.additional_context,
+            system_message: disabled.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&disabled_output).unwrap(),
+        serde_json::json!({})
+    );
+
+    let action =
+        plan_action_for_activation(&event, &capability, ResolvedActivationDecision::Enabled, "");
+    assert!(action.task_operation.is_none());
+    let enabled_output = encode_hook_output(
+        event.kind(),
+        &ResolvedAgentAction {
+            additional_context: action.additional_context,
+            system_message: action.system_message,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&enabled_output).unwrap(),
+        serde_json::json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "conv-real-shape-01")
+        })
+    );
+}
+
+#[test]
+fn cursor_accepts_every_host_version_string_when_a_hook_is_available() {
+    for version in [
+        Some("3.13.0"),
+        Some("4.0.0"),
+        Some("3.12.99"),
+        // `cursor-agent --version` reports a date-like build id that is not semver.
+        Some("2026.08.25-3e8eec8"),
+        Some(""),
+        None,
+    ] {
+        let capability = capabilities(version, true);
+        assert_eq!(capability.mode, CapabilityMode::VerifiedHooks);
+        assert!(capability.session_start);
+        assert_eq!(capability.detected_version.as_deref(), version);
+        assert_eq!(capability.fixture_profile_version, "3.13.0");
+    }
+}
+
+#[test]
+fn cursor_keeps_only_mcp_cli_when_no_hook_is_available() {
     for capability in [
-        capabilities(Some("4.0.0"), true),
         capabilities(Some("3.13.10"), false),
-        capabilities(None, true),
+        capabilities(Some("2026.08.25-3e8eec8"), false),
+        capabilities(None, false),
     ] {
         assert_eq!(capability.mode, CapabilityMode::McpCliFallback);
         assert!(capability.mcp && capability.cli);
         assert!(!capability.session_start);
+        assert_eq!(
+            capability.diagnostic,
+            "Agent hooks are unavailable; using MCP + CLI fallback."
+        );
     }
 }
 
@@ -130,4 +272,134 @@ fn malformed_or_unknown_cursor_payload_fails_strictly() {
     payload["hook_event_name"] = Value::String("sessionStart".to_owned());
     payload["workspace_roots"] = Value::String("not-an-array".to_owned());
     assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
+}
+
+#[test]
+fn cursor_post_tool_policy_keeps_the_current_neutral_bytes() {
+    let mut payload = fixtures().remove(2);
+    payload["tool_name"] = serde_json::json!("Read");
+    payload["tool_input"] =
+        serde_json::json!({"file_path": "/workspace/shared context/src/lib.rs"});
+    let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    let capabilities = capabilities(Some("3.13.10"), true);
+    let action = plan_action_for_activation(
+        &event,
+        &capabilities,
+        ResolvedActivationDecision::Enabled,
+        "",
+    );
+    assert!(action.additional_context.is_none());
+    let resolved = ResolvedAgentAction {
+        additional_context: action.additional_context,
+        system_message: action.system_message,
+    };
+    assert_eq!(
+        encode_hook_output(CanonicalAgentEventKind::PostToolUse, &resolved).unwrap(),
+        b"{}".to_vec()
+    );
+}
+
+fn desktop_fixtures() -> Vec<Value> {
+    serde_json::from_str(include_str!(
+        "../../../fixtures/agents/cursor-3.17-desktop.json"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn observed_cursor_3_17_desktop_shapes_map_to_all_canonical_events() {
+    let actual = desktop_fixtures()
+        .into_iter()
+        .map(|payload| {
+            let (event, version) =
+                decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            assert_eq!(version, "3.17.21");
+            event.kind()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            CanonicalAgentEventKind::SessionStart,
+            CanonicalAgentEventKind::PromptSubmit,
+            CanonicalAgentEventKind::PostToolUse,
+            CanonicalAgentEventKind::PreCompact,
+            CanonicalAgentEventKind::TurnStop,
+            CanonicalAgentEventKind::SessionEnd,
+        ]
+    );
+}
+
+#[test]
+fn desktop_post_tool_empty_or_missing_cwd_falls_back_to_the_first_workspace_root() {
+    for remove_cwd in [false, true] {
+        let mut payload = desktop_fixtures().remove(2);
+        if remove_cwd {
+            payload.as_object_mut().unwrap().remove("cwd");
+        } else {
+            assert_eq!(payload["cwd"], Value::String(String::new()));
+        }
+        let (event, _) = decode_hook_input(&serde_json::to_vec(&payload).unwrap()).unwrap();
+        assert_eq!(event.kind(), CanonicalAgentEventKind::PostToolUse);
+        assert_eq!(
+            event.context().cwd,
+            PathBuf::from("/workspace/cross/android/TikTok")
+        );
+    }
+}
+
+#[test]
+fn desktop_lifecycle_events_tolerate_undocumented_enum_values() {
+    let mut compact = desktop_fixtures().remove(3);
+    compact["trigger"] = Value::String("background".to_owned());
+    assert!(decode_hook_input(&serde_json::to_vec(&compact).unwrap()).is_ok());
+
+    let mut stop = desktop_fixtures().remove(4);
+    stop["status"] = Value::String("requeued".to_owned());
+    assert!(decode_hook_input(&serde_json::to_vec(&stop).unwrap()).is_ok());
+
+    let mut end = desktop_fixtures().remove(5);
+    end["reason"] = Value::String("power_loss".to_owned());
+    let (event, _) = decode_hook_input(&serde_json::to_vec(&end).unwrap()).unwrap();
+    let sctx_adapter_cursor::CanonicalAgentEvent::SessionEnd { reason, .. } = event else {
+        panic!("payload must decode as SessionEnd");
+    };
+    assert_eq!(reason, "power_loss");
+}
+
+#[test]
+fn empty_workspace_roots_still_fail_the_adapter_guard() {
+    let mut payload = desktop_fixtures().remove(0);
+    payload["workspace_roots"] = serde_json::json!([]);
+    assert!(decode_hook_input(&serde_json::to_vec(&payload).unwrap()).is_err());
+}
+
+/// The visibility predicate and the encoder must agree on every event, because a caller deciding
+/// whether to spend a one-shot delivery reads the predicate and the host reads the encoder.
+#[test]
+fn model_visibility_predicate_agrees_with_the_encoder_on_every_event() {
+    for kind in [
+        CanonicalAgentEventKind::SessionStart,
+        CanonicalAgentEventKind::PromptSubmit,
+        CanonicalAgentEventKind::PostToolUse,
+        CanonicalAgentEventKind::PreCompact,
+        CanonicalAgentEventKind::TurnStop,
+        CanonicalAgentEventKind::SessionEnd,
+    ] {
+        const CONTEXT: &str = "one line of model context";
+        let encoded = encode_hook_output(
+            kind,
+            &ResolvedAgentAction {
+                additional_context: Some(CONTEXT.to_owned()),
+                system_message: None,
+            },
+        )
+        .unwrap();
+        let delivered = String::from_utf8(encoded).unwrap().contains(CONTEXT);
+        assert_eq!(
+            delivered,
+            sctx_adapter_cursor::delivers_model_visible_context(kind),
+            "{kind:?}"
+        );
+    }
 }

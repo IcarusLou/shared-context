@@ -1,7 +1,6 @@
 use std::{collections::BTreeSet, fs, path::PathBuf};
 
-use sctx_domain::ExternalSessionLocator;
-use sctx_local_state::{Breadcrumb, BreadcrumbKind, CaptureStore, PrivacyScanner, UserConfigStore};
+use sctx_local_state::{PrivacyScanner, UserConfigStore};
 use serde::Deserialize;
 use tempfile::tempdir;
 
@@ -38,39 +37,6 @@ fn shared_secret_and_pii_fixture_is_detected_and_redacted() {
         );
         assert!(!redacted.text.contains(&case.value), "{}", case.kind);
         assert!(redacted.text.contains("[REDACTED:"), "{}", case.kind);
-    }
-}
-
-#[test]
-fn capture_boundary_redacts_every_shared_privacy_fixture() {
-    let temporary = tempdir().unwrap();
-    let store = CaptureStore::initialize(temporary.path().join("capture home 中文")).unwrap();
-
-    for case in fixture().cases {
-        let receipt = store
-            .capture(&Breadcrumb {
-                external_session_locator: ExternalSessionLocator::new("codex", "privacy-fixture")
-                    .unwrap(),
-                task_owner: None,
-                kind: BreadcrumbKind::Checkpoint,
-                summary: format!("observed {}", case.value),
-                workspace_hint: None,
-                file_hints: Vec::new(),
-                diagnostics: Vec::new(),
-            })
-            .unwrap();
-        let stored = fs::read_to_string(receipt.path).unwrap();
-
-        assert!(!stored.contains(&case.value), "{}", case.kind);
-        assert!(
-            receipt
-                .finding_kinds
-                .iter()
-                .any(|kind| kind.code() == case.kind),
-            "{}: {:?}",
-            case.kind,
-            receipt.finding_kinds
-        );
     }
 }
 

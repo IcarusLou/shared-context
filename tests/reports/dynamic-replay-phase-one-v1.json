@@ -1,0 +1,39 @@
+{
+  "schema": "shared-context.dynamic-replay-phase-one-summary",
+  "version": 1,
+  "scenario_suite_commit": "9c4f505",
+  "mode": "non_blocking",
+  "source_policy": "aggregate_pacing_only",
+  "runs_per_scenario": 20,
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+  "scenarios": [
+    {"name": "codex_normal_candidate_confirm", "runs": 20, "passed": 0, "expected_fail_open": 20},
+    {"name": "cursor_normal_candidate_confirm", "runs": 20, "passed": 20, "expected_fail_open": 0},
+    {"name": "precompact_resume_new_episode", "runs": 20, "passed": 20, "expected_fail_open": 0},
+    {"name": "missing_hook_empty_close_fallback", "runs": 20, "passed": 20, "expected_fail_open": 0},
+    {"name": "turnstop_repeat_and_mcp_restart_recovery", "runs": 20, "passed": 20, "expected_fail_open": 0},
+    {"name": "same_workspace_dual_session_isolation", "runs": 20, "passed": 20, "expected_fail_open": 0}
+  ],
+  "totals": {
+    "runs": 120,
+    "completed": 120,
+    "failures": 0,
+    "passed": 100,
+    "expected_fail_open": 20
+  },
+  "classifications": {
+    "invalid_scenario": 0,
+    "unsupported_version": 0,
+    "corrupt_data": 0,
+    "expected_fail_open": 20,
+    "infrastructure_flake": 0,
+    "product_invariant_violation": 0
+  },
+  "timing_ms": {
+    "total": 221600,
+    "min": 900,
+    "max": 4100,
+    "rounding": 100
+  },
+  "semantic_digest": "sha256:5e44981537a083fd7d4093fb752c524da71fd38e75b6ff621d27f5bcdbd4cfae"
+}

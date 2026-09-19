@@ -1,0 +1,181 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "codex_task_to_confirm",
+  "agent": {
+    "vendor": "codex",
+    "version": "0.147.0",
+    "framing": "content_length"
+  },
+  "actors": [
+    {
+      "id": "session",
+      "kind": { "type": "session" }
+    },
+    {
+      "id": "task",
+      "kind": { "type": "task", "session": "session" }
+    }
+  ],
+  "actions": [
+    {
+      "id": "session-start",
+      "actor": "session",
+      "after": [],
+      "action": {
+        "type": "hook_event",
+        "event": "SessionStart",
+        "payload": {
+          "type": "object",
+          "fields": {
+            "source": { "type": "string", "value": "startup" }
+          }
+        }
+      }
+    },
+    {
+      "id": "intent-update",
+      "actor": "task",
+      "after": ["session-start"],
+      "action": {
+        "type": "mcp_request",
+        "method": "task_intent_update",
+        "params": {
+          "type": "object",
+          "fields": {
+            "intent": { "type": "string", "value": "exercise_dynamic_identity_flow" },
+            "business_label": { "type": "string", "value": "tsk_documentation" }
+          }
+        }
+      }
+    },
+    {
+      "id": "checkpoint",
+      "actor": "task",
+      "after": ["intent-update"],
+      "action": {
+        "type": "mcp_request",
+        "method": "task_checkpoint",
+        "params": {
+          "type": "object",
+          "fields": {
+            "agent_kind": { "type": "string", "value": "codex" },
+            "external_session_id": { "type": "builtin", "builtin": { "type": "actor_session_key", "actor": "session" } },
+            "claims": { "type": "array", "items": [] },
+            "unknowns": { "type": "array", "items": [] }
+          }
+        }
+      }
+    },
+    {
+      "id": "turn-stop",
+      "actor": "session",
+      "after": ["checkpoint"],
+      "action": {
+        "type": "hook_event",
+        "event": "Stop",
+        "payload": {
+          "type": "object",
+          "fields": {
+            "status": { "type": "string", "value": "completed" },
+            "task_id": { "type": "variable", "name": "task-id" }
+          }
+        }
+      }
+    },
+    {
+      "id": "confirm",
+      "actor": "task",
+      "after": ["turn-stop"],
+      "action": {
+        "type": "mcp_request",
+        "method": "candidate_confirm",
+        "params": {
+          "type": "object",
+          "fields": {
+            "candidate_id": { "type": "variable", "name": "candidate-id" }
+          }
+        }
+      }
+    },
+    {
+      "id": "confirmation-observation",
+      "actor": "task",
+      "after": ["confirm"],
+      "action": {
+        "type": "observe",
+        "source": "runtime",
+        "selector": {
+          "type": "object",
+          "fields": {
+            "confirmation_id": { "type": "variable", "name": "confirmation-id" }
+          }
+        }
+      }
+    }
+  ],
+  "variables": [
+    {
+      "name": "task-id",
+      "value_type": "task_id",
+      "capture": { "step": "intent-update", "pointer": "/task_id" }
+    },
+    {
+      "name": "intent-revision-id",
+      "value_type": "intent_revision_id",
+      "capture": { "step": "intent-update", "pointer": "/intent_revision_id" }
+    },
+    {
+      "name": "episode-id",
+      "value_type": "work_episode_id",
+      "capture": { "step": "checkpoint", "pointer": "/episode_id" }
+    },
+    {
+      "name": "candidate-id",
+      "value_type": "candidate_id",
+      "capture": { "step": "turn-stop", "pointer": "/candidate_id" }
+    },
+    {
+      "name": "confirmation-id",
+      "value_type": "confirmation_id",
+      "capture": { "step": "confirm", "pointer": "/confirmation_id" }
+    }
+  ],
+  "faults": [
+    {
+      "id": "repeat-turn-stop",
+      "fault": { "type": "repeat", "target": "turn-stop", "times": 2 }
+    }
+  ],
+  "assertions": [
+    {
+      "id": "atomic-confirmation",
+      "invariant": {
+        "type": "confirmation_is_atomic",
+        "confirmation": "confirmation-id",
+        "response": "confirm",
+        "event_count": "four"
+      }
+    }
+  ],
+  "events": [
+    {
+      "event": "SessionStart",
+      "classification": "supported",
+      "product_action": "session_start"
+    },
+    {
+      "event": "Stop",
+      "classification": "supported",
+      "product_action": "turn_stop"
+    },
+    {
+      "event": "afterAgentThought",
+      "classification": "observed_only"
+    },
+    {
+      "event": "beforeTabFileRead",
+      "classification": "unsupported"
+    }
+  ]
+}

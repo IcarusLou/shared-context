@@ -9,18 +9,19 @@ use sctx_domain::{
     Applicability, AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateBuilderProvenance, CandidateConfidence, CandidateId, CandidateRelationAssessment,
-    CandidateReviewStatus, CaptureEvidenceRef, CaptureId, CaptureUnknown, ConfirmationId,
-    ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, ErrorKind, EventId,
-    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, NormalizedBreadcrumbKind,
+    CandidateReviewStatus, CheckpointEvidenceRef, CheckpointUnknown, ConfirmationId,
+    ContextCandidate, ContextId, ContextKind, ContextRevisionDraft, DecisionSource, ErrorKind,
+    EventId, EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator,
     NormalizedWorkObservation, TaskId, TaskSignal, TaskSignalKind, TestOutcomeStatus,
     WorkEpisodeStatus, WorkSourceRef, WorkingIntentSnapshot,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
-    CandidateBuildItemStatus, CandidateBuildStatus, CandidateReviewDiscard,
-    CandidateReviewDiscardStatus, CaptureIngestion, CheckpointBoundary, CheckpointClaimDraft,
-    DEFAULT_CANDIDATE_REVIEW_TTL, IntentRevisionWriteStatus, MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
-    WorkEpisodeDiagnosticKind,
+    AgentCheckpointSubmission, AgentCheckpointWrite, AutomatedEpisodeBoundary,
+    CandidateBuildItemPreparation, CandidateBuildItemStatus, CandidateBuildStatus,
+    CandidateReviewDiscard, CandidateReviewDiscardStatus, CandidateReviewSurvey,
+    CheckpointBoundary, CheckpointClaimDraft, DEFAULT_CANDIDATE_REVIEW_TTL,
+    DirectCheckpointClaimDraft, DirectEvidenceDraft, IntentRevisionWriteStatus,
+    MAX_CANDIDATE_REVIEW_TTL, TaskRuntime,
 };
 use tempfile::TempDir;
 
@@ -62,10 +63,15 @@ fn open_task(
     (locator, snapshot)
 }
 
-fn breadcrumb(summary: &str) -> NormalizedWorkObservation {
-    NormalizedWorkObservation::Breadcrumb {
-        category: NormalizedBreadcrumbKind::Exploration,
-        summary: summary.to_owned(),
+fn validation_observation(summary: &str) -> NormalizedWorkObservation {
+    NormalizedWorkObservation::InlineValidation {
+        evidence: EvidenceSnapshotDraft {
+            kind: EvidenceType::ExperimentRecord,
+            supports: summary.to_owned(),
+            content: serde_json::json!({"summary": summary}),
+            interpretation: "The Runtime test produced a normalized Observation".to_owned(),
+            limitations: Vec::new(),
+        },
     }
 }
 
@@ -80,8 +86,6 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
             platforms: Vec::new(),
             conditions: vec!["Agent Checkpoint".to_owned()],
         },
-        assumptions: Vec::new(),
-        recheck_when: vec!["the validated behavior changes".to_owned()],
         evidence_refs: Vec::new(),
         inline_validations: vec![EvidenceSnapshotDraft {
             kind: EvidenceType::ExperimentRecord,
@@ -90,13 +94,14 @@ fn checkpoint_claim(statement: &str) -> CheckpointClaimDraft {
             interpretation: "The focused runtime behavior was directly validated".to_owned(),
             limitations: Vec::new(),
         }],
-        artifact_refs: Vec::new(),
-        related_contexts: Vec::new(),
+        engineering_references: Vec::new(),
     }
 }
 
 fn candidate_content(statement: &str) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Discovery,
         topic_key: Some("candidate/runtime-analysis".to_owned()),
         statement: statement.to_owned(),
@@ -121,7 +126,7 @@ fn checkpoint_write(
     expected_episode_version: u64,
     boundary: CheckpointBoundary,
     claims: Vec<CheckpointClaimDraft>,
-    unknowns: Vec<CaptureUnknown>,
+    unknowns: Vec<CheckpointUnknown>,
 ) -> AgentCheckpointWrite {
     AgentCheckpointWrite {
         locator: locator.clone(),
@@ -131,6 +136,27 @@ fn checkpoint_write(
         boundary,
         claims,
         unknowns,
+    }
+}
+
+fn direct_submission(
+    locator: &ExternalSessionLocator,
+    statement: &str,
+) -> AgentCheckpointSubmission {
+    AgentCheckpointSubmission {
+        locator: locator.clone(),
+        claims: vec![DirectCheckpointClaimDraft {
+            context_kind: ContextKind::Validation,
+            statement: statement.to_owned(),
+            rationale: "The direct Checkpoint operation is durable".to_owned(),
+            conditions: vec!["content addressed".to_owned()],
+            evidence: vec![DirectEvidenceDraft {
+                evidence_type: EvidenceType::ExperimentRecord,
+                summary: format!("{statement} passed"),
+                limitations: Vec::new(),
+            }],
+        }],
+        unknowns: Vec::new(),
     }
 }
 
@@ -185,6 +211,246 @@ fn finalize_review(
         .read_candidate_review(locator, candidate_id)
         .unwrap()
         .unwrap()
+}
+
+#[test]
+fn old_empty_fat_semantic_bytes_preserve_open_and_closed_retries() {
+    for boundary in [CheckpointBoundary::Continue, CheckpointBoundary::Close] {
+        let temporary = TempDir::new().unwrap();
+        let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+        let (locator, task) = open_task(&runtime, "old-fat-retry", "preserve old retry bytes");
+        let input = checkpoint_write(
+            &locator,
+            &task,
+            0,
+            boundary,
+            vec![checkpoint_claim("Old low-level Claim")],
+            Vec::new(),
+        );
+        let first = runtime.write_agent_checkpoint(&input).unwrap();
+        // Frozen old helper output; only the server-owned IDs and boundary vary.
+        let old = r#"{"boundary":"BOUNDARY","claims":[{"applicability":{"conditions":["Agent Checkpoint"],"domains":["runtime"],"platforms":[]},"artifact_refs":[],"assumptions":[],"context_kind_hint":null,"engineering_references":[],"evidence_refs":[],"inline_validations":[{"content":{"actual":"passed","test":"checkpoint"},"interpretation":"The focused runtime behavior was directly validated","kind":"experiment_record","limitations":[],"supports":"Old low-level Claim"}],"rationale":"Direct validation supports this engineering conclusion","recheck_when":[],"related_contexts":[],"relations":[],"statement":"Old low-level Claim","topic_key_hint":null}],"expected_intent_revision_id":"INTENT_ID","expected_task_id":"TASK_ID","unknowns":[]}"#
+            .replace("TASK_ID", &task.task_id.to_string())
+            .replace("INTENT_ID", &input.expected_intent_revision_id.to_string())
+            .replace("BOUNDARY", if boundary == CheckpointBoundary::Close { "close" } else { "continue" });
+        let connection = Connection::open(runtime.database_path()).unwrap();
+        let stored: String = connection
+            .query_row(
+                "SELECT semantic_json FROM agent_checkpoint WHERE checkpoint_id = ?1",
+                [first.checkpoint.checkpoint_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored, old,
+            "new writes must match the old binary comparator"
+        );
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE agent_checkpoint SET semantic_json = ?1 WHERE checkpoint_id = ?2",
+                    rusqlite::params![old, first.checkpoint.checkpoint_id.to_string()]
+                )
+                .unwrap(),
+            1
+        );
+        let retry = runtime.write_agent_checkpoint(&input).unwrap();
+        assert!(!retry.created);
+        assert_eq!(retry.checkpoint, first.checkpoint);
+        assert_eq!(
+            retry.episode.episode.episode_id,
+            first.episode.episode.episode_id
+        );
+        assert_eq!(
+            runtime
+                .list_work_episodes(task.task_session_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM agent_checkpoint", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn content_addressed_checkpoint_operations_converge_across_concurrency_and_delayed_retry() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let (locator, task) = open_task(&runtime, "content-operation", "persist direct Checkpoints");
+
+    let a = direct_submission(&locator, "Operation A");
+    let first_a = runtime.submit_agent_checkpoint(&a).unwrap();
+    assert!(!first_a.replayed);
+    assert_eq!(first_a.build.status, CandidateBuildStatus::Pending);
+    assert_eq!(first_a.build.items.len(), 1);
+    assert_eq!(
+        first_a.build.items[0].status,
+        CandidateBuildItemStatus::Queued
+    );
+
+    let b = direct_submission(&locator, "Operation B");
+    let first_b = runtime.submit_agent_checkpoint(&b).unwrap();
+    assert!(!first_b.replayed);
+    assert_ne!(first_b.operation_id, first_a.operation_id);
+    assert_ne!(
+        first_b.checkpoint.checkpoint_id,
+        first_a.checkpoint.checkpoint_id
+    );
+    assert_ne!(
+        first_b.episode.episode.episode_id,
+        first_a.episode.episode.episode_id
+    );
+
+    let delayed_a = runtime.submit_agent_checkpoint(&a).unwrap();
+    assert!(delayed_a.replayed);
+    assert_eq!(delayed_a.operation_id, first_a.operation_id);
+    assert_eq!(
+        delayed_a.checkpoint.checkpoint_id,
+        first_a.checkpoint.checkpoint_id
+    );
+    assert_eq!(
+        delayed_a.episode.episode.episode_id,
+        first_a.episode.episode.episode_id
+    );
+    assert_eq!(delayed_a.build.build_id, first_a.build.build_id);
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap()
+            .len(),
+        2,
+        "A/B/A must not create a third Episode"
+    );
+
+    let parallel = direct_submission(&locator, "Operation C concurrent");
+    let barrier = Arc::new(Barrier::new(8));
+    let handles = (0..8)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let submission = parallel.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.submit_agent_checkpoint(&submission).unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+    let outcomes = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().filter(|outcome| !outcome.replayed).count(),
+        1
+    );
+    assert!(outcomes.iter().all(|outcome| {
+        outcome.operation_id == outcomes[0].operation_id
+            && outcome.checkpoint.checkpoint_id == outcomes[0].checkpoint.checkpoint_id
+            && outcome.episode.episode.episode_id == outcomes[0].episode.episode.episode_id
+            && outcome.build.build_id == outcomes[0].build.build_id
+            && outcome.build.items[0].submission_id == outcomes[0].build.items[0].submission_id
+    }));
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap()
+            .len(),
+        3
+    );
+    let revised = runtime
+        .append_intent_revision(
+            task.task_session_id,
+            task.current_intent_revision().unwrap().revision_id,
+            intent("persist direct Checkpoints under a revised Intent"),
+        )
+        .unwrap();
+    assert_eq!(revised.status, IntentRevisionWriteStatus::Created);
+    let revised_a = runtime.submit_agent_checkpoint(&a).unwrap();
+    assert!(!revised_a.replayed);
+    assert_ne!(revised_a.operation_id, first_a.operation_id);
+    let (other_locator, other_task) = open_task(
+        &runtime,
+        "content-operation-other",
+        "persist direct Checkpoints",
+    );
+    let other_a = runtime
+        .submit_agent_checkpoint(&direct_submission(&other_locator, "Operation A"))
+        .unwrap();
+    assert!(!other_a.replayed);
+    assert_ne!(other_a.operation_id, first_a.operation_id);
+    assert_ne!(other_task.task_id, task.task_id);
+    assert_eq!(
+        runtime
+            .list_recoverable_candidate_build_episodes(&locator, 10)
+            .unwrap()
+            .len(),
+        4
+    );
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    let persisted_semantics = connection
+        .query_row(
+            "SELECT semantic_json FROM checkpoint_operation WHERE operation_id = ?1",
+            [&first_a.operation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    // This literal is the pre-R2-1 direct operation shape, independent of Claim serde.
+    assert_eq!(
+        persisted_semantics,
+        r#"{"claims":[{"conditions":["content addressed"],"context_kind":"validation","evidence":[{"evidence_type":"experiment_record","limitations":[],"summary":"Operation A passed"}],"rationale":"The direct Checkpoint operation is durable","statement":"Operation A"}],"unknowns":[]}"#
+    );
+    assert!(persisted_semantics.contains("Operation A"));
+    assert!(!persisted_semantics.contains("content-operation"));
+    assert!(!persisted_semantics.contains(&task.task_id.to_string()));
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM checkpoint_operation", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        5
+    );
+}
+
+#[test]
+fn checkpoint_operation_rolls_back_episode_checkpoint_and_outbox_together() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (locator, _task) = open_task(&runtime, "operation-rollback", "prove atomic outbox");
+    let connection = Connection::open(runtime.database_path()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_candidate_build
+             BEFORE INSERT ON candidate_build
+             BEGIN SELECT RAISE(ABORT, 'injected build reservation failure'); END;",
+        )
+        .unwrap();
+    let error = runtime
+        .submit_agent_checkpoint(&direct_submission(&locator, "Atomic rollback"))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    for table in [
+        "work_episode",
+        "work_observation",
+        "agent_checkpoint",
+        "candidate_build",
+        "candidate_build_item",
+        "checkpoint_operation",
+    ] {
+        let count = connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "{table} retained partial operation residue");
+    }
 }
 
 #[test]
@@ -247,7 +513,7 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
         1,
         CheckpointBoundary::Close,
         Vec::new(),
-        vec![CaptureUnknown {
+        vec![CheckpointUnknown {
             statement: "Compatibility remains to be checked".to_owned(),
             blocking: true,
             recheck_when: vec!["the client matrix is available".to_owned()],
@@ -283,7 +549,7 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
     let other_locator = ExternalSessionLocator::new("codex", "checkpoint-other").unwrap();
     let mut cross_task_claim = checkpoint_claim("cross Task evidence is rejected");
     cross_task_claim.inline_validations.clear();
-    cross_task_claim.evidence_refs = vec![CaptureEvidenceRef::Observation {
+    cross_task_claim.evidence_refs = vec![CheckpointEvidenceRef::Observation {
         observation_id: continued.inline_observation_ids[0],
     }];
     let cross_task = checkpoint_write(
@@ -317,6 +583,298 @@ fn checkpoint_is_atomic_semantically_idempotent_and_closes_without_hook_observat
         ErrorKind::InvalidInput,
         "Task switch must make the previous Checkpoint owner inactive"
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_disambiguates_closed_retries_new_episodes_and_open_episode_versions() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (locator, task) = open_task(&runtime, "checkpoint-episodes", "resume the same task");
+    let first = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Close,
+        vec![checkpoint_claim("Episode one is complete")],
+        Vec::new(),
+    );
+    let closed_first = runtime.write_agent_checkpoint(&first).unwrap();
+    assert!(closed_first.created);
+    assert!(matches!(
+        closed_first.episode.episode.status,
+        WorkEpisodeStatus::Closed { .. }
+    ));
+
+    let retry = runtime.write_agent_checkpoint(&first).unwrap();
+    assert!(!retry.created);
+    assert_eq!(retry.checkpoint, closed_first.checkpoint);
+    assert_eq!(retry.episode, closed_first.episode);
+
+    let second = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Episode two resumed new work")],
+        Vec::new(),
+    );
+    let opened_second = runtime.write_agent_checkpoint(&second).unwrap();
+    assert!(opened_second.created);
+    assert_ne!(
+        opened_second.episode.episode.episode_id,
+        closed_first.episode.episode.episode_id
+    );
+    assert_eq!(opened_second.episode.episode.version, 1);
+
+    let appended = checkpoint_write(
+        &locator,
+        &task,
+        1,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Episode two accepts its current version")],
+        Vec::new(),
+    );
+    let appended = runtime.write_agent_checkpoint(&appended).unwrap();
+    assert!(appended.created);
+    assert_eq!(
+        appended.episode.episode.episode_id,
+        opened_second.episode.episode.episode_id
+    );
+    assert_eq!(appended.episode.episode.version, 2);
+
+    let mut old_version_conflict = second;
+    old_version_conflict.claims[0].statement = "An old Episode two parent cannot fork".to_owned();
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&old_version_conflict)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Conflict
+    );
+
+    let close_second = checkpoint_write(
+        &locator,
+        &task,
+        2,
+        CheckpointBoundary::Close,
+        Vec::new(),
+        vec![CheckpointUnknown {
+            statement: "Episode two follow-up is recorded".to_owned(),
+            blocking: false,
+            recheck_when: vec!["the follow-up is resolved".to_owned()],
+        }],
+    );
+    runtime.write_agent_checkpoint(&close_second).unwrap();
+    let closed_history = runtime
+        .list_work_episodes(task.task_session_id, 10)
+        .unwrap();
+    assert_eq!(closed_history.len(), 2);
+
+    let nonzero_after_close = checkpoint_write(
+        &locator,
+        &task,
+        2,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim(
+            "A closed Episode rejects nonzero new work",
+        )],
+        Vec::new(),
+    );
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&nonzero_after_close)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleState
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap(),
+        closed_history,
+        "a stale closed-Episode write must leave Episode state unchanged"
+    );
+
+    let mut wrong_task = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Task CAS must be exact")],
+        Vec::new(),
+    );
+    wrong_task.expected_task_id = TaskId::new();
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&wrong_task)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap(),
+        closed_history,
+        "a Task CAS failure must not create an Episode"
+    );
+
+    let old_revision_id = task.current_intent_revision().unwrap().revision_id;
+    runtime
+        .append_intent_revision(
+            task.task_session_id,
+            old_revision_id,
+            intent("resume the same task with a revised intent"),
+        )
+        .unwrap();
+    let after_intent_update = runtime
+        .list_work_episodes(task.task_session_id, 10)
+        .unwrap();
+    let stale_intent = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Intent CAS must be exact")],
+        Vec::new(),
+    );
+    assert_eq!(
+        runtime
+            .write_agent_checkpoint(&stale_intent)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleState
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap(),
+        after_intent_update,
+        "an Intent CAS failure must not create an Episode"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn concurrent_new_episode_checkpoints_converge_and_divergent_content_cannot_fork() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
+    let (locator, task) = open_task(
+        &runtime,
+        "checkpoint-new-episode-race",
+        "serialize resumed checkpoints",
+    );
+    runtime
+        .write_agent_checkpoint(&checkpoint_write(
+            &locator,
+            &task,
+            0,
+            CheckpointBoundary::Close,
+            vec![checkpoint_claim("The first Episode establishes history")],
+            Vec::new(),
+        ))
+        .unwrap();
+
+    let same_new_episode = checkpoint_write(
+        &locator,
+        &task,
+        0,
+        CheckpointBoundary::Continue,
+        vec![checkpoint_claim("Concurrent resumed work is identical")],
+        Vec::new(),
+    );
+    let barrier = Arc::new(Barrier::new(20));
+    let outcomes = (0..20)
+        .map(|_| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let input = same_new_episode.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.write_agent_checkpoint(&input).unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.created).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.episode.episode.episode_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.checkpoint.checkpoint_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        1
+    );
+    assert_eq!(
+        runtime
+            .list_work_episodes(task.task_session_id, 10)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let closed_second = runtime.close_checkpointed_work_episode(&locator).unwrap();
+    assert!(matches!(
+        closed_second,
+        AutomatedEpisodeBoundary::Closed {
+            newly_closed: true,
+            ..
+        }
+    ));
+    let barrier = Arc::new(Barrier::new(20));
+    let divergent = (0..20)
+        .map(|index| {
+            let runtime = Arc::clone(&runtime);
+            let barrier = Arc::clone(&barrier);
+            let mut input = checkpoint_write(
+                &locator,
+                &task,
+                0,
+                CheckpointBoundary::Continue,
+                vec![checkpoint_claim("Divergent resumed work")],
+                Vec::new(),
+            );
+            input.claims[0].statement = format!("Divergent resumed work {index}");
+            thread::spawn(move || {
+                barrier.wait();
+                runtime.write_agent_checkpoint(&input)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        divergent.iter().filter(|outcome| outcome.is_ok()).count(),
+        1
+    );
+    assert!(
+        divergent
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .all(|error| error.kind() == ErrorKind::Conflict)
+    );
+    let history = runtime
+        .list_work_episodes(task.task_session_id, 10)
+        .unwrap();
+    assert_eq!(history.len(), 3);
+    let open = history
+        .iter()
+        .filter(|episode| episode.episode.status == WorkEpisodeStatus::Open)
+        .collect::<Vec<_>>();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].checkpoints.len(), 1);
 }
 
 #[test]
@@ -655,6 +1213,36 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
     );
     assert!(DEFAULT_CANDIDATE_REVIEW_TTL <= MAX_CANDIDATE_REVIEW_TTL);
 
+    // The maintenance survey sees both Pending Reviews without a locator, filters by the expiry
+    // horizon it was asked about, and -- unlike every scoped list reader above -- retires nothing:
+    // surveying at a moment well past expiry leaves the Review exactly as Pending as it was.
+    assert_eq!(
+        runtime
+            .survey_candidate_reviews_at(review.created_at_unix_seconds, 0)
+            .unwrap(),
+        CandidateReviewSurvey {
+            pending_count: 2,
+            expiring_soon_count: 0,
+        }
+    );
+    assert_eq!(
+        runtime
+            .survey_candidate_reviews_at(review.expires_at_unix_seconds + 60, 0)
+            .unwrap(),
+        CandidateReviewSurvey {
+            pending_count: 2,
+            expiring_soon_count: 2,
+        }
+    );
+    assert_eq!(
+        runtime
+            .read_candidate_review(&locator, candidate_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        CandidateReviewStatus::Pending
+    );
+
     let persisted = ContextCandidate {
         candidate_id,
         submission_id: first.submission_id,
@@ -665,7 +1253,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         .evidence_refs
         .iter()
         .filter_map(|evidence| match evidence {
-            CaptureEvidenceRef::Observation { observation_id } => Some(*observation_id),
+            CheckpointEvidenceRef::Observation { observation_id } => Some(*observation_id),
             _ => None,
         })
         .collect();
@@ -678,6 +1266,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
             source_episode: closed.episode.episode.ownership(),
             checkpoint_ids: vec![closed.checkpoint.checkpoint_id],
             observation_ids,
+            engineering_references: Vec::new(),
         },
         CandidateAnalysis {
             status: CandidateAnalysisStatus::Complete,
@@ -720,14 +1309,26 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         rationale: "Analysis failed and remains retryable".to_owned(),
     };
     failed.status = AutomaticCandidateStatus::Draft;
+    let audit_relation = || {
+        Connection::open(runtime.database_path())
+            .unwrap()
+            .query_row(
+                "SELECT top_relation FROM candidate_review WHERE candidate_id = ?1",
+                [candidate_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap()
+    };
     let first_analysis = runtime.replace_candidate_analysis(&failed).unwrap();
     assert_eq!(first_analysis.analysis_generation, 1);
+    assert_eq!(audit_relation(), None);
     assert_eq!(
         first_analysis.candidate.analysis.status,
         CandidateAnalysisStatus::Failed
     );
     let completed = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(completed.analysis_generation, 2);
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
     let replaced = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(replaced.analysis_generation, 3);
     assert_eq!(
@@ -754,11 +1355,13 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
             .unwrap()
             .is_none()
     );
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
     let recomputed = runtime.replace_candidate_analysis(&automatic).unwrap();
     assert_eq!(recomputed.analysis_generation, 1);
 
     let discarded = runtime
         .discard_candidate_review(&CandidateReviewDiscard {
+            decision_source: DecisionSource::Human,
             locator: locator.clone(),
             expected_task_id: task.task_id,
             expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
@@ -769,8 +1372,29 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         .unwrap();
     assert_eq!(discarded.status, CandidateReviewDiscardStatus::Discarded);
     assert_eq!(discarded.record.review_version, 2);
+    let mut later_analysis = automatic.clone();
+    later_analysis.analysis.assessments[0].relation = CandidateAssessmentRelation::Supports;
+    later_analysis.analysis.assessments[0].target = Some(sctx_domain::ContextRevisionRef {
+        context_id: ContextId::new(),
+        revision_id: sctx_domain::RevisionId::new(),
+    });
+    later_analysis.analysis.assessments[0].paths = vec![CandidateAssessmentPath::ContextFullText {
+        matched_terms: vec!["audit".to_owned()],
+    }];
+    runtime.replace_candidate_analysis(&later_analysis).unwrap();
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
+    runtime.replace_candidate_analysis(&failed).unwrap();
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
+    let stats = runtime.candidate_disposition_stats().unwrap();
+    assert_eq!(
+        stats.relation_decisions[0].top_relation.as_deref(),
+        Some("novel")
+    );
+    assert_eq!(stats.relation_decisions[0].counts.discarded, 1);
+
     let idempotent = runtime
         .discard_candidate_review(&CandidateReviewDiscard {
+            decision_source: DecisionSource::Human,
             locator: locator.clone(),
             expected_task_id: task.task_id,
             expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
@@ -786,6 +1410,7 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: locator.clone(),
                 expected_task_id: task.task_id,
                 expected_intent_revision_id: task.current_intent_revision().unwrap().revision_id,
@@ -817,6 +1442,14 @@ fn candidate_build_reservation_is_concurrent_stable_promotable_and_finalized_onc
         .cleanup_expired_candidate_reviews_at(review.expires_at_unix_seconds + 1)
         .unwrap();
     assert!(cleanup.expired_candidate_ids.contains(&candidate_id));
+    assert_eq!(audit_relation().as_deref(), Some("novel"));
+    let stats = runtime.candidate_disposition_stats().unwrap();
+    assert_eq!(stats.relation_decisions[0].counts.discarded, 1);
+    assert_eq!(
+        stats.human.discarded, 0,
+        "legacy live-status total is unchanged"
+    );
+
     assert!(
         runtime
             .read_candidate_analysis(candidate_id)
@@ -972,6 +1605,7 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: first_locator.clone(),
                 expected_task_id: first.task_id,
                 expected_intent_revision_id: first.current_intent_revision().unwrap().revision_id,
@@ -986,6 +1620,7 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: second_locator.clone(),
                 expected_task_id: second.task_id,
                 expected_intent_revision_id: second.current_intent_revision().unwrap().revision_id,
@@ -1014,6 +1649,7 @@ fn candidate_reviews_isolate_sessions_episodes_stale_and_reserved_confirmed_stat
     assert_eq!(
         runtime
             .discard_candidate_review(&CandidateReviewDiscard {
+                decision_source: DecisionSource::Human,
                 locator: first_locator.clone(),
                 expected_task_id: first.task_id,
                 expected_intent_revision_id: first.current_intent_revision().unwrap().revision_id,
@@ -1179,10 +1815,10 @@ fn intent_and_signal_refs_advance_only_through_explicit_episode_api() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn concurrent_append_is_version_guarded_and_capture_ingestion_is_idempotent() {
+fn concurrent_work_observation_append_is_version_guarded() {
     let temporary = TempDir::new().unwrap();
     let runtime = Arc::new(TaskRuntime::initialize(temporary.path()).unwrap());
-    let (locator, task) = open_task(&runtime, "episode-ingest", "capture work");
+    let (locator, task) = open_task(&runtime, "episode-ingest", "observe work");
     let opened = runtime
         .open_work_episode(
             &locator,
@@ -1208,7 +1844,7 @@ fn concurrent_append_is_version_guarded_and_capture_ingestion_is_idempotent() {
                 0,
                 intent_revision_id,
                 vec![source],
-                breadcrumb(&format!("concurrent observation {index}")),
+                validation_observation(&format!("concurrent observation {index}")),
             )
         }));
     }
@@ -1232,73 +1868,20 @@ fn concurrent_append_is_version_guarded_and_capture_ingestion_is_idempotent() {
     assert_eq!(episode.episode.version, 1);
     assert_eq!(episode.episode.observations.len(), 1);
 
-    let capture_id = CaptureId::new();
-    let input = CaptureIngestion {
-        capture_id,
-        episode_id: episode.episode.episode_id,
-        expected_episode_version: 1,
-        task_session_id: task.task_session_id,
-        task_id: task.task_id,
-        intent_revision_id: episode.episode.intent_revisions.last(),
-        additional_sources: Vec::new(),
-        observation: breadcrumb("claimed Capture meaning"),
-        diagnostics: vec![WorkEpisodeDiagnosticKind::CaptureRepositoryNotConfigured],
-    };
-    let barrier = Arc::new(Barrier::new(workers));
-    let mut ingesters = Vec::new();
-    for _ in 0..workers {
-        let runtime = Arc::clone(&runtime);
-        let barrier = Arc::clone(&barrier);
-        let input = input.clone();
-        ingesters.push(thread::spawn(move || {
-            barrier.wait();
-            runtime.ingest_capture(&input).unwrap()
-        }));
-    }
-    let ingested = ingesters
-        .into_iter()
-        .map(|worker| worker.join().unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        ingested.iter().filter(|outcome| outcome.inserted).count(),
-        1
-    );
-    assert_eq!(
-        ingested
-            .iter()
-            .map(|outcome| outcome.observation_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
-        1
-    );
-    let retried = runtime.ingest_capture(&input).unwrap();
-    assert!(!retried.inserted);
-    assert_eq!(retried.episode.episode.version, 2);
-    assert_eq!(retried.episode.episode.observations.len(), 2);
-    assert_eq!(retried.episode.diagnostics.len(), 1);
-    let mut conflicting_retry = input.clone();
-    conflicting_retry.observation = breadcrumb("different Capture meaning");
-    assert!(runtime.ingest_capture(&conflicting_retry).is_err());
-
-    let (_, other_task) = open_task(&runtime, "episode-other", "other owner");
-    let mut cross_task = input.clone();
-    cross_task.task_session_id = other_task.task_session_id;
-    cross_task.task_id = other_task.task_id;
-    assert!(runtime.ingest_capture(&cross_task).is_err());
     assert_eq!(
         runtime
-            .prepare_work_episode_close(episode.episode.episode_id, 2)
+            .prepare_work_episode_close(episode.episode.episode_id, 1)
             .unwrap()
             .observation_ids
             .len(),
-        2
+        1
     );
     let verification = runtime
         .verify_source_episode(episode.episode.episode_id)
         .unwrap()
         .unwrap();
     assert_eq!(verification.status, WorkEpisodeStatus::Open);
-    assert_eq!(verification.observation_count, 2);
+    assert_eq!(verification.observation_count, 1);
 }
 
 #[test]
@@ -1314,7 +1897,7 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
             0,
             CheckpointBoundary::Close,
             Vec::new(),
-            vec![CaptureUnknown {
+            vec![CheckpointUnknown {
                 statement: "Runtime deletion removes local Checkpoint state".to_owned(),
                 blocking: false,
                 recheck_when: Vec::new(),
@@ -1325,8 +1908,8 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
     fs::create_dir_all(root.join("repository")).unwrap();
     fs::write(root.join("repository/fact"), b"git fact").unwrap();
     fs::write(root.join("state/index.sqlite"), b"index").unwrap();
-    fs::create_dir_all(root.join("state/capture")).unwrap();
-    fs::write(root.join("state/capture/cap-safe.json"), b"capture").unwrap();
+    fs::create_dir_all(root.join("state/unrelated")).unwrap();
+    fs::write(root.join("state/unrelated/safe.json"), b"unrelated").unwrap();
     let database = runtime.database_path().to_path_buf();
     drop(runtime);
     for suffix in ["", "-wal", "-shm"] {
@@ -1347,7 +1930,96 @@ fn deleting_runtime_loses_episode_only_and_preserves_other_state() {
     assert_eq!(fs::read(root.join("repository/fact")).unwrap(), b"git fact");
     assert_eq!(fs::read(root.join("state/index.sqlite")).unwrap(), b"index");
     assert_eq!(
-        fs::read(root.join("state/capture/cap-safe.json")).unwrap(),
-        b"capture"
+        fs::read(root.join("state/unrelated/safe.json")).unwrap(),
+        b"unrelated"
     );
+}
+
+/// The `TurnStop` checkpoint reminder gate (WP-V6 fix 3, `docs/deferred-issues.md` #6): capped at
+/// three reminders per external Session, and an idle turn -- no
+/// [`TaskRuntime::record_checkpoint_reminder_activity`] since the last reminder -- neither shows
+/// the reminder again nor spends part of the budget.
+#[test]
+fn turn_stop_checkpoint_reminder_gate_caps_at_three_and_skips_idle_turns() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let (locator, _task) = open_task(&runtime, "reminder-gate", "throttle the TurnStop nag");
+
+    // 1st reminder: always fires, there is nothing yet to compare it against.
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the first reminder fires unconditionally"
+    );
+
+    // Immediately again, with no recorded activity in between: an idle turn is suppressed and
+    // must not consume part of the three-reminder budget.
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "a turn with no activity since the last reminder must not repeat it"
+    );
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "repeating the idle check must still not consume budget"
+    );
+
+    // Real activity unlocks the 2nd reminder.
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "activity since the last reminder unlocks the next one"
+    );
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the activity was spent by the reminder that just fired"
+    );
+
+    // Activity unlocks the 3rd and final reminder.
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the third reminder still fires"
+    );
+
+    // The budget is now spent: even with fresh activity, a 4th reminder never fires again this
+    // Session.
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "a 4th reminder must not fire even with new activity: the Session budget is spent"
+    );
+    runtime
+        .record_checkpoint_reminder_activity(&locator)
+        .unwrap();
+    assert!(
+        !runtime.gate_turn_stop_checkpoint_reminder(&locator),
+        "the budget stays spent for the rest of the Session"
+    );
+}
+
+/// A Session with no `ExternalSession` row yet (no `ActiveTask`) has nothing to throttle: the gate
+/// fails open, and recording activity against it is a harmless no-op rather than an error.
+#[test]
+fn turn_stop_checkpoint_reminder_gate_fails_open_with_no_active_task() {
+    let temporary = TempDir::new().unwrap();
+    let runtime = TaskRuntime::initialize(temporary.path()).unwrap();
+    let missing = ExternalSessionLocator::new("codex", "reminder-gate-missing").unwrap();
+
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&missing),
+        "no ExternalSession row means nothing to throttle: the gate fails open"
+    );
+    assert!(
+        runtime.gate_turn_stop_checkpoint_reminder(&missing),
+        "failing open is not itself state: it does not start consuming a budget that has no row \
+         to live on"
+    );
+    runtime
+        .record_checkpoint_reminder_activity(&missing)
+        .expect("recording activity with no row is a harmless no-op, not an error");
 }

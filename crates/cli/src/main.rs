@@ -1,73 +1,100 @@
 //! `sctx` command-line entry point.
 
 mod args;
+mod logs;
 
 use std::{
-    collections::BTreeSet,
+    cell::{Cell, RefCell},
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs,
     io::{self, Read},
+    os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     str::FromStr,
     sync::Arc,
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use args::Options;
 use sctx_agent_adapter::{
-    AgentCapabilities, CanonicalAgentAction, CanonicalBreadcrumbKind, EpisodeFinalizationTrigger,
-    ResolvedAgentAction, TaskRuntimeOperation, ToolOutcome, TrustState, plan_action,
+    AgentCapabilities, AgentEventContext, CanonicalAgentAction, CanonicalAgentEvent,
+    CanonicalAgentEventKind, EpisodeFinalizationTrigger, FileAccess,
+    MAX_SHELL_COMMAND_PATH_CANDIDATES, PathHint, ResolvedActivationDecision, ResolvedAgentAction,
+    TaskRuntimeOperation, ToolCategory, ToolOutcome, TrustState, plan_action_for_activation,
+    shared_context_activation_marker_with_policy,
 };
 use sctx_domain::{
-    Applicability, CandidateReviewStatus, ConflictParticipant, ConflictResolutionDraft,
-    ConflictResolutionResult, ContextGovernanceStatus, ContextId, ContextKind,
-    ContextRevisionDraft, DomainProjection, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, IntentSnapshot, PublicationAction, PublicationDraft, RepositoryId,
-    ResolutionOutcome, Result, ReviewDraft, ReviewSummary, ReviewVerdict, RevisionId,
-    SemanticConflictDraft, SpaceId, TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
+    AgentCheckpointId, Applicability, CandidateReviewStatus, ConflictParticipant,
+    ConflictResolutionDraft, ConflictResolutionResult, ContextGovernanceStatus, ContextId,
+    ContextKind, ContextRevisionDraft, DecisionSource, DomainProjection, Error, ErrorKind,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot, PublicationAction,
+    PublicationDraft, PublicationId, RepositoryId, ResolutionOutcome, Result, ReviewDraft,
+    ReviewSummary, ReviewVerdict, RevisionId, SemanticConflictDraft, SpaceId, TaskSessionSnapshot,
+    TaskSignal, TaskSignalKind, WorkEpisodeId, WorkEpisodeStatus,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendOutcome, AppendRequest, BatchId, GitStore};
 use sctx_index::{
     DomainSnapshot, IndexMetadata, ProjectionDiagnosticView, ProjectionIndex, RebuildOutcome,
 };
+use sctx_installer::maintain::MaintainOptions;
 use sctx_local_state::{
-    Breadcrumb, BreadcrumbKind, CaptureDiagnosticKind, CaptureStore, CaptureTaskOwner,
-    CatalogCheckoutStatus, RepositoryCatalogSnapshot, UserConfigStore,
+    AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    CatalogCheckoutStatus, MaintenanceLock, MaintenanceSettings, Policy, PrivacyScanner,
+    RepositoryCatalogDiagnostic, RepositoryCatalogSnapshot, ResolvedPolicy, UserConfigStore,
+    installation_policy,
 };
 use sctx_mcp::{
     ArtifactFocusQuery, AssociationExplainInput, AssociationRebuildInput, CandidateAnalyzeInput,
-    CandidateConfirmInput, CandidateDiscardInput, CandidateGetInput, CandidateListInput,
-    EngineeringReferenceRecordInput, RepositoryScanInput, TaskCheckpointInput,
-    TaskContextReadInput, TaskIntentUpdateInput, TaskSignalSupersedeInput,
+    CandidateConfirmBatchInput, CandidateConfirmInput, CandidateDiscardBatchInput,
+    CandidateDiscardInput, CandidateGetInput, CandidateListInput, EngineeringReferenceRecordInput,
+    RepositoryScanInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
+    TaskSignalSupersedeInput,
 };
-use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
-use sctx_task_runtime::{AutomatedEpisodeBoundary, CandidateBuildStatus, TaskRuntime};
+use sctx_search::{
+    ContextPackDetailLevel, ContextStatus, ScopeFilter, SearchEngine, SearchFilters,
+    SearchMatchMode, SearchRequest,
+};
+use sctx_task_runtime::{
+    AutomatedEpisodeBoundary, CandidateBuildStatus, HookEventDecision, PendingPromptOutcome,
+    SignalRetentionRule, TaskRuntime,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const HOOK_TASK_UNAVAILABLE: &str = "Shared Context task retrieval is temporarily unavailable. Coding can continue; retry through MCP or CLI later.";
+const INTENT_BOOTSTRAP_REMINDER: &str = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
+const _: () = assert!(INTENT_BOOTSTRAP_REMINDER.len() <= 128);
 
 const HELP: &str = r"Shared Context command-line interface
 
 Usage: sctx [--json] <COMMAND>
 
 Commands:
-  setup [--demo] [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
+  setup [--demo] [--embedding] [--agents cursor,codex] [--knowledge-store-url GIT_URL]
+      [--root PATH] [--runtime-source PATH]
   demo
-  doctor [--fix] [--root PATH]
+  doctor [--fix] [--recheck] [--root PATH]
   upgrade [--agents cursor,codex] [--root PATH] [--runtime-source PATH]
   uninstall [--root PATH]
-  knowledge delete --confirm-path PATH --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE
+  data reset [--dry-run] [--yes]
+  maintain run [--opportunistic] | maintain status
+  policy show|reset
+  knowledge sync|delete
+  logs init|collect|sync|status|prune|doctor|enable|disable|report|trace
+  embedding install|status|remove
   space create|intent revise|list|get
-  candidate list|get|discard|confirm|build-closed-episode|analyze
+  recall stats
+  candidate list|get|discard|confirm|stats|build-closed-episode|analyze
   context revise|review|publish|withdraw|get
+  context withdraw --decision-source human|agent_policy [--external-session <ID>] [--dry-run]
   semantic conflict open|resolve
   task context|artifact-focus|checkpoint|intent update|signal supersede
-  repository add|list|doctor|scan
+  repository add|list|doctor|rename|scan
   engineering-reference record
   association explain|rebuild
   search
@@ -110,12 +137,140 @@ Evidence JSON shape:
 fn main() -> ExitCode {
     let raw = env::args_os().skip(1).collect::<Vec<_>>();
     let json_output = raw.iter().any(|arg| arg == "--json");
-    match utf8_args(raw).and_then(|args| run(&args, json_output)) {
-        Ok(()) => ExitCode::SUCCESS,
+    match utf8_args(raw) {
+        Ok(args) => {
+            let telemetry = CliTelemetry::new(&args);
+            let result = run(&args, json_output);
+            if let Some(telemetry) = telemetry {
+                telemetry.finish(result.as_ref().err());
+            }
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    emit_error(&error, json_output);
+                    ExitCode::from(2)
+                }
+            }
+        }
         Err(error) => {
             emit_error(&error, json_output);
             ExitCode::from(2)
         }
+    }
+}
+
+struct CliTelemetry {
+    logs_root: PathBuf,
+    invocation_id: String,
+    operation: &'static str,
+    started: Instant,
+}
+
+impl CliTelemetry {
+    fn new(args: &[String]) -> Option<Self> {
+        let operation = cli_operation(args)?;
+        let logs_root = sctx_telemetry::default_logs_root()?;
+        let invocation_id = sctx_telemetry::new_invocation_id();
+        let event = sctx_telemetry::Event::started(
+            sctx_telemetry::EntryPoint::Cli,
+            sctx_telemetry::EventKind::OperationStarted,
+            invocation_id.clone(),
+            operation,
+        );
+        let _ = sctx_telemetry::emit_to(&logs_root, &event);
+        Some(Self {
+            logs_root,
+            invocation_id,
+            operation,
+            started: Instant::now(),
+        })
+    }
+
+    fn finish(self, error: Option<&Error>) {
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Cli,
+            sctx_telemetry::EventKind::OperationFinished,
+            self.invocation_id,
+            self.operation,
+            if error.is_some() {
+                sctx_telemetry::Outcome::Failure
+            } else {
+                sctx_telemetry::Outcome::Success
+            },
+        );
+        event.sequence = 1;
+        event.duration_ms =
+            Some(u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        if let Some(error) = error {
+            event.error_code = Some(telemetry_error_code(error.kind()).to_owned());
+            event.error_family = Some(error_family(error.kind()).to_owned());
+        }
+        let _ = sctx_telemetry::emit_to(&self.logs_root, &event);
+    }
+}
+
+fn cli_operation(args: &[String]) -> Option<&'static str> {
+    let first = args.first()?.as_str();
+    let second = args.get(1).map(String::as_str);
+    match (first, second) {
+        ("setup", _) => Some("setup"),
+        ("demo", _) => Some("demo"),
+        ("doctor", _) if args.iter().any(|arg| arg == "--hooks") => Some("doctor.hooks"),
+        ("doctor", _) if args.iter().any(|arg| arg == "--recheck") => Some("doctor.recheck"),
+        ("doctor", _) => Some("doctor"),
+        ("upgrade", _) => Some("upgrade"),
+        ("uninstall", _) => Some("uninstall"),
+        ("search", _) => Some("search"),
+        ("validate", _) => Some("validate"),
+        ("data", Some("reset")) => Some("data.reset"),
+        ("maintain", Some("run")) => Some("maintain.run"),
+        ("maintain", Some("status")) => Some("maintain.status"),
+        ("policy", Some("show")) => Some("policy.show"),
+        ("policy", Some("reset")) => Some("policy.reset"),
+        ("knowledge", Some("sync")) => Some("knowledge.sync"),
+        ("knowledge", Some("delete")) => Some("knowledge.delete"),
+        ("embedding", Some("install")) => Some("embedding.install"),
+        ("embedding", Some("status")) => Some("embedding.status"),
+        ("embedding", Some("remove")) => Some("embedding.remove"),
+        ("space", Some("create")) => Some("space.create"),
+        ("space", Some("list")) => Some("space.list"),
+        ("space", Some("get")) => Some("space.get"),
+        ("space", Some("intent")) => Some("space.intent"),
+        ("candidate", Some("list")) => Some("candidate.list"),
+        ("candidate", Some("get")) => Some("candidate.get"),
+        ("candidate", Some("discard")) => Some("candidate.discard"),
+        ("candidate", Some("confirm")) => Some("candidate.confirm"),
+        ("candidate", Some("stats")) => Some("candidate.stats"),
+        ("recall", Some("stats")) => Some("recall.stats"),
+        ("candidate", Some("build-closed-episode")) => Some("candidate.build_closed_episode"),
+        ("candidate", Some("analyze")) => Some("candidate.analyze"),
+        ("context", Some("revise")) => Some("context.revise"),
+        ("context", Some("review")) => Some("context.review"),
+        ("context", Some("publish")) => Some("context.publish"),
+        ("context", Some("withdraw")) => Some("context.withdraw"),
+        ("context", Some("get")) => Some("context.get"),
+        ("semantic", Some("conflict")) => Some("semantic.conflict"),
+        ("task", Some("context")) => Some("task.context"),
+        ("task", Some("artifact-focus")) => Some("task.artifact_focus"),
+        ("task", Some("checkpoint")) => Some("task.checkpoint"),
+        ("task", Some("intent")) => Some("task.intent"),
+        ("task", Some("signal")) => Some("task.signal"),
+        ("repository", Some("add")) => Some("repository.add"),
+        ("repository", Some("list")) => Some("repository.list"),
+        ("repository", Some("doctor")) => Some("repository.doctor"),
+        ("repository", Some("rename")) => Some("repository.rename"),
+        ("repository", Some("scan")) => Some("repository.scan"),
+        ("engineering-reference", Some("record")) => Some("engineering_reference.record"),
+        ("association", Some("explain")) => Some("association.explain"),
+        ("association", Some("rebuild")) => Some("association.rebuild"),
+        ("index", Some("rebuild")) => Some("index.rebuild"),
+        ("index", Some("status")) => Some("index.status"),
+        ("pending", Some("list")) => Some("pending.list"),
+        ("pending", Some("commit")) => Some("pending.commit"),
+        ("pending", Some("move-aside")) => Some("pending.move_aside"),
+        // Hooks have their own decision event. Logging commands never recursively log. MCP is a
+        // long-lived protocol boundary and records typed tool/protocol events instead.
+        _ => None,
     }
 }
 
@@ -130,6 +285,36 @@ fn utf8_args(args: Vec<OsString>) -> Result<Vec<String>> {
 }
 
 fn run(args: &[String], json_output: bool) -> Result<()> {
+    let _maintenance = if requires_shared_maintenance_guard(args) {
+        Some(MaintenanceLock::initialize(installation_root()?)?.try_shared()?)
+    } else {
+        None
+    };
+    run_without_maintenance(args, json_output)
+}
+
+fn requires_shared_maintenance_guard(args: &[String]) -> bool {
+    args.first().is_some_and(|command| {
+        matches!(
+            command.as_str(),
+            "demo"
+                | "space"
+                | "candidate"
+                | "context"
+                | "semantic"
+                | "task"
+                | "repository"
+                | "engineering-reference"
+                | "association"
+                | "search"
+                | "index"
+                | "pending"
+                | "validate"
+        )
+    })
+}
+
+fn run_without_maintenance(args: &[String], json_output: bool) -> Result<()> {
     match args {
         [] => {
             print!("{HELP}");
@@ -139,8 +324,11 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
             print!("{HELP}");
             Ok(())
         }
+        // The build fingerprint rides along because a version number alone has three times been
+        // read as identifying a generation it did not: every build between two version bumps
+        // reports the same number, so an installed binary could not say which source it came from.
         [arg] if arg == "-V" || arg == "--version" => {
-            println!("sctx {}", env!("CARGO_PKG_VERSION"));
+            println!("sctx {}", sctx_telemetry::VERSION);
             Ok(())
         }
         [command, rest @ ..] if command == "setup" => {
@@ -152,9 +340,15 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
             run_install_lifecycle("upgrade", rest, json_output)
         }
         [command, rest @ ..] if command == "uninstall" => run_uninstall(rest, json_output),
+        [group, rest @ ..] if group == "data" => run_data(rest, json_output),
+        [group, rest @ ..] if group == "maintain" => run_maintain(rest, json_output),
+        [group, rest @ ..] if group == "policy" => run_policy(rest, json_output),
         [group, rest @ ..] if group == "knowledge" => run_knowledge(rest, json_output),
+        [group, rest @ ..] if group == "embedding" => run_embedding(rest, json_output),
+        [group, rest @ ..] if group == "logs" => logs::run(rest, json_output),
         [group, rest @ ..] if group == "space" => run_space(rest, json_output),
         [group, rest @ ..] if group == "candidate" => run_candidate(rest, json_output),
+        [group, rest @ ..] if group == "recall" => run_recall(rest, json_output),
         [group, rest @ ..] if group == "context" => run_context(rest, json_output),
         [group, rest @ ..] if group == "semantic" => run_semantic(rest, json_output),
         [group, rest @ ..] if group == "task" => run_task(rest, json_output),
@@ -174,27 +368,60 @@ fn run(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--yes", "--demo"])?;
+    let options = Options::parse(args, &["--yes", "--demo", "--embedding"])?;
     options.allow_only(
         &[
             "--agents",
             "--root",
             "--runtime-source",
             "--runtime-version",
+            "--knowledge-store-url",
         ],
-        &["--yes", "--demo"],
+        &["--yes", "--demo", "--embedding"],
     )?;
     if command != "setup" && options.has("--demo") {
         return Err(invalid("--demo applies only to setup"));
     }
+    // `upgrade` deliberately never provisions the channel. An upgrade is expected to be quick and
+    // unattended; a 2.4 GB download is neither, and an installation that wanted the channel
+    // already has it.
+    if command != "setup" && options.has("--embedding") {
+        return Err(invalid(
+            "--embedding applies only to setup; run `sctx embedding install` to add the channel to an existing installation",
+        ));
+    }
+    if command != "setup" && options.provided("--knowledge-store-url") {
+        return Err(invalid("--knowledge-store-url applies only to setup"));
+    }
     let installer = installer_from_options(&options)?;
     let setup = setup_options(&options)?;
-    let report = if command == "setup" {
+    let mut report = if command == "setup" {
         installer.setup(&setup)?
     } else {
         installer.upgrade(&setup)?
     };
+    // Logging owns a separate service transaction. Reconcile it only after the installer returns,
+    // which guarantees the business maintenance lease and setup lock have both been released.
+    if let Some(logs_root) = sctx_telemetry::default_logs_root() {
+        if !logs_root.is_absolute() {
+            report.notices.push(
+                "logging service was not changed because SCTX_LOGS_ROOT is not absolute".to_owned(),
+            );
+        } else if let Some(home) = home_directory() {
+            let lifecycle = sctx_installer::logs_launchd::reconcile_log_service(
+                &home,
+                &logs_root,
+                &report.runtime,
+            );
+            report.changed |= lifecycle.changed;
+            report.notices.extend(lifecycle.notices);
+        }
+    }
+    if options.has("--embedding") {
+        append_setup_embedding(&mut report, json_output);
+    }
     if options.has("--demo") {
+        let _maintenance = MaintenanceLock::open_or_create(&report.root)?.try_shared()?;
         let (demo, metadata) = complete_demo(&report.root)?;
         emit(
             "setup.demo",
@@ -212,7 +439,7 @@ fn run_install_lifecycle(command: &str, args: &[String], json_output: bool) -> R
 }
 
 fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &["--fix"])?;
+    let options = Options::parse(args, &["--fix", "--recheck", "--hooks"])?;
     options.allow_only(
         &[
             "--root",
@@ -220,8 +447,24 @@ fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
             "--runtime-version",
             "--agents",
         ],
-        &["--fix"],
+        &["--fix", "--recheck", "--hooks"],
     )?;
+    if options.has("--hooks") {
+        if options.has("--fix") || options.has("--recheck") {
+            return Err(invalid(
+                "sctx doctor --hooks reports Hook diagnostics only; run --fix or --recheck separately",
+            ));
+        }
+        return run_doctor_hooks(&options, json_output);
+    }
+    if options.has("--recheck") {
+        if options.has("--fix") {
+            return Err(invalid(
+                "sctx doctor --recheck evaluates recheck_when only; run --fix separately",
+            ));
+        }
+        return run_doctor_recheck(&options, json_output);
+    }
     let installer = installer_from_options(&options)?;
     let report = if options.has("--fix") {
         installer.doctor_fix(&setup_options(&options)?)?
@@ -231,21 +474,426 @@ fn run_doctor(args: &[String], json_output: bool) -> Result<()> {
     emit_lifecycle(&report, json_output)
 }
 
+/// Evaluates the structured `recheck_when` subset against the local Repository checkouts.
+///
+/// The outcome is local derived state written to this machine's projection: it never becomes an
+/// Event, and a projection rebuild clears it, so this is the command to re-run afterwards.
+fn run_doctor_recheck(options: &Options, json_output: bool) -> Result<()> {
+    let root = options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
+    let response = sctx_mcp::context_recheck_at_root(root)?;
+    let data =
+        serde_json::to_value(&response).map_err(json_error("serialize recheck evaluation"))?;
+    emit_raw(
+        "doctor.recheck",
+        &response.tree,
+        response.generation,
+        &data,
+        json_output,
+    )
+}
+
+const HOOK_DIAGNOSTIC_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Reports the collector's independent Hook diagnostic view. A missing or stopped collector is an
+/// explicit unavailable source, not a reason to reopen the legacy Runtime diagnostic table.
+fn run_doctor_hooks(options: &Options, json_output: bool) -> Result<()> {
+    let business_root = options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
+    let logs_root = sctx_telemetry::default_logs_root();
+    let diagnostics = logs_root
+        .as_deref()
+        .map(sctx_log_service::load_hook_diagnostics)
+        .transpose();
+    let (source, diagnostic_error, counts, recent) = match diagnostics {
+        Ok(Some(view)) => ("telemetry", None, view.counts, view.recent_events),
+        Ok(None) => (
+            "unavailable",
+            Some("logs_root_unavailable".to_owned()),
+            Vec::new(),
+            Vec::new(),
+        ),
+        Err(error) => (
+            "unavailable",
+            Some(format!("{:?}", error.code()).to_lowercase()),
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
+    let active_leases = AuthorizedSessionScopeStore::initialize(&business_root)
+        .and_then(|store| store.survey_stale_leases(Duration::ZERO))
+        .map(|survey| survey.total_entries)
+        .ok();
+    let data = json!({
+        "source": source,
+        "diagnostic_error": diagnostic_error,
+        "window_hours": HOOK_DIAGNOSTIC_WINDOW_MS / (60 * 60 * 1000),
+        "counts": counts
+            .iter()
+            .map(|count| json!({
+                "decision": hook_diagnostic_outcome(count.decision),
+                "reason": count.reason,
+                "count": count.count,
+            }))
+            .collect::<Vec<_>>(),
+        "recent_events": recent
+            .iter()
+            .map(|event| json!({
+                "recorded_at_unix_ms": event.occurred_at_unix_ms,
+                "agent_kind": hook_diagnostic_operation(event.operation.as_deref()).0,
+                "event_kind": hook_diagnostic_operation(event.operation.as_deref()).1,
+                "decision": hook_diagnostic_outcome(event.outcome),
+                "reason": event.reason.as_deref().unwrap_or("unspecified"),
+                "decode_error_class": event.error_code,
+                "decode_field": event
+                    .error_family
+                    .as_deref()
+                    .and_then(|value| value.strip_prefix("field.")),
+                "host_schema": event
+                    .error_family
+                    .as_deref()
+                    .filter(|value| !value.starts_with("field.")),
+                "duration_ms": event.duration_ms.unwrap_or(0),
+            }))
+            .collect::<Vec<_>>(),
+        "active_leases": active_leases,
+    });
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string(&data).map_err(json_error("serialize doctor hooks output"))?
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data)
+                .map_err(json_error("serialize doctor hooks output"))?
+        );
+    }
+    Ok(())
+}
+
+const fn hook_diagnostic_outcome(outcome: sctx_telemetry::Outcome) -> &'static str {
+    match outcome {
+        sctx_telemetry::Outcome::Success => "enabled",
+        sctx_telemetry::Outcome::FailOpen => "fail_open",
+        sctx_telemetry::Outcome::Degraded => "neutral",
+        sctx_telemetry::Outcome::Disabled => "disabled",
+        sctx_telemetry::Outcome::Started => "started",
+        sctx_telemetry::Outcome::Failure => "failure",
+        sctx_telemetry::Outcome::Dropped => "dropped",
+        sctx_telemetry::Outcome::Unknown => "unknown",
+    }
+}
+
+fn hook_diagnostic_operation(operation: Option<&str>) -> (&str, &str) {
+    let Some(operation) = operation.and_then(|value| value.strip_prefix("hook.")) else {
+        return ("unknown", "unknown");
+    };
+    operation.split_once('.').unwrap_or(("unknown", "unknown"))
+}
+
 fn run_uninstall(args: &[String], json_output: bool) -> Result<()> {
     let options = Options::parse(args, &[])?;
     options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
-    let report = installer_from_options(&options)?.uninstall()?;
+    let mut report = installer_from_options(&options)?.uninstall()?;
+    // The business uninstall has completed and released its locks. The collector service is
+    // independently owned; removing it is best effort and always retains the logging root.
+    if let Some(logs_root) = sctx_telemetry::default_logs_root() {
+        if !logs_root.is_absolute() {
+            report.warnings.push(
+                "logging service was preserved because SCTX_LOGS_ROOT is not absolute".to_owned(),
+            );
+        } else if let Some(home) = home_directory() {
+            let lifecycle = sctx_installer::logs_launchd::uninstall_log_service(&home, &logs_root);
+            report.warnings.extend(lifecycle.notices);
+            if lifecycle.configured || logs_root.exists() {
+                report.preserved.push(logs_root);
+            }
+        }
+    }
     emit_lifecycle(&report, json_output)
+}
+
+fn run_data(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid("Usage: sctx data reset [--dry-run] [--yes]"));
+    };
+    if command != "reset" {
+        return Err(invalid("data command must be reset"));
+    }
+    let options = Options::parse(rest, &["--dry-run", "--yes"])?;
+    options.allow_only(
+        &["--root", "--runtime-source", "--runtime-version"],
+        &["--dry-run", "--yes"],
+    )?;
+    let report =
+        installer_from_options(&options)?.reset_data(sctx_installer::DataResetOptions {
+            confirmed: options.has("--yes"),
+            dry_run: options.has("--dry-run"),
+        })?;
+    emit_lifecycle(&report, json_output)
+}
+
+const MAINTAIN_HELP: &str = r"Usage:
+  sctx maintain run [--opportunistic] [--root PATH]
+  sctx maintain status [--root PATH]
+
+`run` performs one periodic maintenance cycle: it rebuilds the Engineering Graph,
+counts the Candidate Reviews and provisional Spaces awaiting a human decision, and
+synchronizes the Knowledge Store. Every step is independent -- one failure never
+stops the rest -- and the result is recorded in state/maintain-digest.json, which
+`sctx doctor` reads. Nothing here disposes of a Candidate or edits knowledge.
+
+`--opportunistic` makes the run yield instead of wait: the Knowledge Store sync is
+attempted once and skipped if the installation is busy, which suits a run triggered
+by something a person is waiting on. Without it the sync retries with backoff.
+";
+
+/// `maintain` is deliberately absent from [`requires_shared_maintenance_guard`]: the run holds a
+/// shared lease for its read-only steps and must have released it before `knowledge sync` takes
+/// the exclusive one, so it manages its own leases rather than inheriting one for its whole life.
+fn run_maintain(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        print!("{MAINTAIN_HELP}");
+        return Ok(());
+    }
+    let [command, rest @ ..] = args else {
+        return Err(invalid(MAINTAIN_HELP));
+    };
+    match command.as_str() {
+        "run" => {
+            let options = Options::parse(rest, &["--opportunistic"])?;
+            options.allow_only(
+                &["--root", "--runtime-source", "--runtime-version"],
+                &["--opportunistic"],
+            )?;
+            let digest = installer_from_options(&options)?.maintain(&MaintainOptions {
+                opportunistic: options.has("--opportunistic"),
+            })?;
+            if json_output {
+                return emit_lifecycle(&digest, true);
+            }
+            print_maintain_digest(&digest);
+            Ok(())
+        }
+        "status" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
+            let status = installer_from_options(&options)?.maintain_status()?;
+            if json_output {
+                return emit_lifecycle(&status, true);
+            }
+            print_maintain_status(&status);
+            Ok(())
+        }
+        _ => Err(invalid(MAINTAIN_HELP)),
+    }
+}
+
+const POLICY_HELP: &str = r"Usage:
+  sctx policy show [--root PATH]
+  sctx policy reset [--root PATH]
+
+Team policy is Markdown in <root>/policy.md, delivered to the model at run time:
+`## session` inside the SessionStart activation marker, `## checkpoint` in the
+task_checkpoint tool description, `## stop` on a boundary checkpoint reminder, and
+`## triage` in the Candidate disposition text. Every section is optional and any
+other heading or prose is ignored. `[policy] path` in config.toml points somewhere
+else. An absent, unreadable, or oversize file never breaks a Session: the built-in
+default is delivered instead, and `sctx doctor` reports which.
+
+`show` prints the effective policy and the file it came from. `reset` rewrites the
+built-in default, first moving any existing file aside with a timestamp suffix.
+";
+
+fn run_policy(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        print!("{POLICY_HELP}");
+        return Ok(());
+    }
+    let [command, rest @ ..] = args else {
+        return Err(invalid(POLICY_HELP));
+    };
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(&["--root"], &[])?;
+    let root = options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))?;
+    match command.as_str() {
+        "show" => {
+            let resolved = installation_policy(&root);
+            if json_output {
+                return emit_lifecycle(&policy_json(&resolved), true);
+            }
+            print_policy(&resolved);
+            Ok(())
+        }
+        "reset" => {
+            let outcome = reset_policy_file(&root)?;
+            if json_output {
+                return emit_lifecycle(&outcome, true);
+            }
+            if let Some(backup) = &outcome.backup_path {
+                println!("moved aside: {}", backup.display());
+            }
+            println!("wrote default policy: {}", outcome.path.display());
+            Ok(())
+        }
+        _ => Err(invalid(POLICY_HELP)),
+    }
+}
+
+fn policy_json(resolved: &ResolvedPolicy) -> Value {
+    json!({
+        "path": resolved.path,
+        "status": resolved.status.reason(),
+        "summary": resolved.summary(),
+        "oversize_sections": resolved.oversize_sections,
+        "sections": {
+            "session": resolved.policy.session(),
+            "checkpoint": resolved.policy.checkpoint(),
+            "stop": resolved.policy.stop(),
+            "triage": resolved.policy.triage(),
+        }
+    })
+}
+
+fn print_policy(resolved: &ResolvedPolicy) {
+    println!("path: {}", resolved.path.display());
+    println!("status: {}", resolved.summary());
+    for (name, text) in [
+        ("session", resolved.policy.session()),
+        ("checkpoint", resolved.policy.checkpoint()),
+        ("stop", resolved.policy.stop()),
+        ("triage", resolved.policy.triage()),
+    ] {
+        println!();
+        println!("## {name}");
+        if text.is_empty() {
+            println!("(not stated)");
+        } else {
+            println!("{text}");
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PolicyResetOutcome {
+    path: PathBuf,
+    backup_path: Option<PathBuf>,
+}
+
+/// Rewrites `policy.md` with the built-in default, keeping whatever was there.
+///
+/// The existing file is moved aside under a timestamp suffix rather than overwritten, because it
+/// is a document a person wrote and this command's whole purpose is to be reachable when that
+/// document is broken. `create_new` on the backup name means a second reset in the same second
+/// fails loudly instead of destroying the first backup.
+fn reset_policy_file(root: &Path) -> Result<PolicyResetOutcome> {
+    let path = root.join(sctx_local_state::POLICY_FILE_NAME);
+    let backup_path = if path.exists() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| invalid(format!("read system clock: {error}")))?
+            .as_secs();
+        let backup = root.join(format!("policy.md.{stamp}.bak"));
+        fs::rename(&path, &backup)
+            .map_err(|error| Error::new(ErrorKind::Io, format!("move policy.md aside: {error}")))?;
+        Some(backup)
+    } else {
+        None
+    };
+    fs::write(&path, sctx_local_state::DEFAULT_POLICY_MARKDOWN)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("write policy.md: {error}")))?;
+    Ok(PolicyResetOutcome { path, backup_path })
+}
+
+fn print_maintain_status(status: &sctx_installer::maintain::MaintainStatus) {
+    println!("root: {}", status.root.display());
+    println!("digest: {}", status.digest_path.display());
+    let (Some(last_run), Some(digest)) = (status.last_run_at_unix_seconds, status.digest.as_ref())
+    else {
+        println!("last run: never");
+        println!("Run `sctx maintain run` to record one.");
+        return;
+    };
+    println!("last run: Unix second {last_run}");
+    print_maintain_digest(digest);
+}
+
+fn print_maintain_digest(digest: &sctx_installer::maintain::MaintainDigest) {
+    use sctx_installer::maintain::MaintainOutcome;
+    println!(
+        "mode: {}",
+        match digest.mode {
+            sctx_installer::maintain::MaintainMode::Scheduled => "scheduled",
+            sctx_installer::maintain::MaintainMode::Opportunistic => "opportunistic",
+        }
+    );
+    println!(
+        "duration: {}s",
+        digest
+            .finished_at_unix_seconds
+            .saturating_sub(digest.started_at_unix_seconds)
+    );
+    println!("steps:");
+    for step in &digest.steps {
+        let outcome = match step.outcome {
+            MaintainOutcome::Ok => "ok",
+            MaintainOutcome::Skipped => "skipped",
+            MaintainOutcome::Failed => "failed",
+        };
+        print!("  {:<26} {outcome}", step.name);
+        if step.attempts > 1 {
+            print!(" (after {} attempts)", step.attempts);
+        }
+        if let Some(reason) = &step.reason {
+            print!(": {reason}");
+        }
+        if step.needs_human {
+            print!(" [needs a human decision]");
+        }
+        println!();
+    }
+    println!("awaiting a decision:");
+    println!(
+        "  {} Candidate Reviews pending, {} of them expiring within {} days",
+        digest.counts.pending_candidate_reviews,
+        digest.counts.expiring_candidate_reviews,
+        digest.counts.candidate_expiry_horizon_seconds / (24 * 60 * 60),
+    );
+    println!(
+        "  {} provisional Spaces still carrying a server-proposed Intent",
+        digest.counts.provisional_spaces
+    );
+    println!(
+        "  {} of {} Engineering References unresolved, {} relocation candidates",
+        digest.counts.unresolved_references,
+        digest.counts.engineering_references,
+        digest.counts.relocation_candidates,
+    );
+    if let Some(generation) = &digest.graph_generation {
+        println!("graph generation: {generation}");
+    }
 }
 
 fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
         return Err(invalid(
-            "Usage: sctx knowledge delete --confirm-path <ABSOLUTE_PATH> --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE",
+            "Usage: sctx knowledge sync | sctx knowledge delete --confirm-path <ABSOLUTE_PATH> --confirm DELETE-SHARED-CONTEXT-KNOWLEDGE",
         ));
     };
+    if command == "sync" {
+        let options = Options::parse(rest, &[])?;
+        options.allow_only(&["--root", "--runtime-source", "--runtime-version"], &[])?;
+        let report = installer_from_options(&options)?.sync_knowledge()?;
+        return emit_lifecycle(&report, json_output);
+    }
     if command != "delete" {
-        return Err(invalid("knowledge command must be delete"));
+        return Err(invalid("knowledge command must be sync or delete"));
     }
     let options = Options::parse(rest, &[])?;
     options.allow_only(
@@ -266,6 +914,160 @@ fn run_knowledge(args: &[String], json_output: bool) -> Result<()> {
         &json!({"repository": deleted, "deleted": true}),
         json_output,
     )
+}
+
+const EMBEDDING_HELP: &str = r"Usage:
+  sctx embedding install [--model <NAME>] [--model-url <BASE_URL>]
+      [--runtime-url <URL>] [--expected-sha256 <SHA256>] [--root PATH]
+  sctx embedding status [--verify] [--root PATH]
+  sctx embedding remove --yes [--root PATH]
+
+`install` downloads an ONNX export and an ONNX Runtime library into
+`~/.shared-context/embedding/`, proves the model loads, writes `[retrieval]`,
+and fills the vector cache. It needs about 2.4 GB of disk and is safe to rerun:
+verified files are not downloaded twice.
+
+`--model` selects the export: `f2llm-v2-0.6b` (codefuse-ai/F2LLM-v2-0.6B, the
+default) or `bge-m3` (BAAI/bge-m3). An installation already holding one keeps
+working; `sctx embedding status` reports which one is there.
+
+`--model-url` names a base directory serving the model's files at the same
+relative paths the upstream repository uses -- so a mirror of the default model
+serves `onnx/model.onnx`, `onnx/model.onnx_data`, `tokenizer.json` and
+`config.json`. The built-in SHA-256 digests still apply, so a mirror serving
+different bytes is rejected.
+";
+
+/// Provisions, inspects, or removes the optional embedding recall channel (ADR-0004).
+///
+/// Progress goes to stderr, and only when `--json` was not asked for. A half-hour download that
+/// printed nothing until it finished would look indistinguishable from a hang, so a human gets a
+/// running account; but stderr is also where this CLI puts its error envelope, so narrating over
+/// it would leave a scripted caller parsing prose. `--json` means a machine is reading, and a
+/// machine gets the two streams it was promised and nothing else.
+fn run_embedding(args: &[String], json_output: bool) -> Result<()> {
+    let [command, rest @ ..] = args else {
+        return Err(invalid(EMBEDDING_HELP));
+    };
+    if is_help(args) || is_help(rest) {
+        print!("{EMBEDDING_HELP}");
+        return Ok(());
+    }
+    let mut progress = embedding_progress(json_output);
+    match command.as_str() {
+        "install" => {
+            let options = Options::parse(rest, &[])?;
+            options.allow_only(
+                &[
+                    "--root",
+                    "--runtime-source",
+                    "--runtime-version",
+                    "--model",
+                    "--model-url",
+                    "--runtime-url",
+                    "--expected-sha256",
+                ],
+                &[],
+            )?;
+            let root = embedding_root(&options)?;
+            let report = sctx_installer::embedding::install(
+                &root,
+                &embedding_install_options(&options)?,
+                &mut progress,
+            )?;
+            emit_lifecycle(&report, json_output)
+        }
+        "status" => {
+            let options = Options::parse(rest, &["--verify"])?;
+            options.allow_only(
+                &["--root", "--runtime-source", "--runtime-version"],
+                &["--verify"],
+            )?;
+            let report = sctx_installer::embedding::status(
+                &embedding_root(&options)?,
+                options.has("--verify"),
+            )?;
+            emit_lifecycle(&report, json_output)
+        }
+        "remove" => {
+            let options = Options::parse(rest, &["--yes"])?;
+            options.allow_only(
+                &["--root", "--runtime-source", "--runtime-version"],
+                &["--yes"],
+            )?;
+            let report = sctx_installer::embedding::remove(
+                &embedding_root(&options)?,
+                options.has("--yes"),
+                &mut progress,
+            )?;
+            emit_lifecycle(&report, json_output)
+        }
+        _ => Err(invalid(format!(
+            "embedding command must be install, status, or remove\n\n{EMBEDDING_HELP}"
+        ))),
+    }
+}
+
+/// Narrates a long provisioning run to stderr, unless a machine asked for JSON.
+fn embedding_progress(json_output: bool) -> impl FnMut(&str) {
+    move |line: &str| {
+        if !json_output {
+            eprintln!("sctx embedding: {line}");
+        }
+    }
+}
+
+fn embedding_root(options: &Options) -> Result<PathBuf> {
+    options
+        .optional("--root")?
+        .map_or_else(installation_root, |value| Ok(PathBuf::from(value)))
+}
+
+fn embedding_install_options(
+    options: &Options,
+) -> Result<sctx_installer::embedding::InstallOptions> {
+    Ok(sctx_installer::embedding::InstallOptions {
+        model: options
+            .optional("--model")?
+            .map(sctx_installer::embedding::EmbeddingModel::parse)
+            .transpose()?
+            .unwrap_or_default(),
+        model_url: options.optional("--model-url")?.map(str::to_owned),
+        runtime_url: options.optional("--runtime-url")?.map(str::to_owned),
+        expected_runtime_sha256: options.optional("--expected-sha256")?.map(str::to_owned),
+    })
+}
+
+/// Runs the embedding provisioning that `setup --embedding` asked for, without letting it fail
+/// setup.
+///
+/// The channel is an optional enhancement to retrieval, and the installation it enhances is
+/// already complete and working by the time this runs. Failing the whole `setup` over a download
+/// that timed out would trade a working installation for no installation, so a failure becomes a
+/// notice on the report and an operator who can rerun `sctx embedding install` whenever they like.
+///
+/// It runs *after* `installer.setup()` returns rather than inside it, because setup holds the
+/// exclusive maintenance lock for its whole duration and a 2.4 GB download does not belong inside
+/// a lock that blocks every other `sctx` process on the machine.
+fn append_setup_embedding(report: &mut sctx_installer::SetupReport, json_output: bool) {
+    let mut progress = embedding_progress(json_output);
+    match sctx_installer::embedding::install(
+        &report.root,
+        &sctx_installer::embedding::InstallOptions::default(),
+        &mut progress,
+    ) {
+        Ok(embedding) => report.notices.push(format!(
+            "Embedding recall channel enabled: {} at {}, runtime {}, {} Context revision(s) embedded.",
+            embedding.model,
+            embedding.model_path.display(),
+            embedding.runtime_path.display(),
+            embedding.embedded
+        )),
+        Err(error) => report.notices.push(format!(
+            "Setup finished, but --embedding did not: {error} Retrieval stays lexical, which is \
+             the default; rerun `sctx embedding install` to try again."
+        )),
+    }
 }
 
 fn installer_from_options(options: &Options) -> Result<sctx_installer::Installer> {
@@ -299,29 +1101,38 @@ fn installer_from_options(options: &Options) -> Result<sctx_installer::Installer
 }
 
 fn setup_options(options: &Options) -> Result<sctx_installer::SetupOptions> {
-    let Some(value) = options.optional("--agents")? else {
-        return Ok(sctx_installer::SetupOptions::default());
-    };
-    let mut agents = BTreeSet::new();
-    for agent in value.split(',') {
-        match agent.trim() {
-            "cursor" => {
-                agents.insert(sctx_installer::Agent::Cursor);
-            }
-            "codex" => {
-                agents.insert(sctx_installer::Agent::Codex);
-            }
-            value => {
-                return Err(invalid(format!(
-                    "unsupported setup Agent {value:?}; expected cursor,codex"
-                )));
+    let agents = if let Some(value) = options.optional("--agents")? {
+        let mut agents = BTreeSet::new();
+        for agent in value.split(',') {
+            match agent.trim() {
+                "cursor" => {
+                    agents.insert(sctx_installer::Agent::Cursor);
+                }
+                "codex" => {
+                    agents.insert(sctx_installer::Agent::Codex);
+                }
+                value => {
+                    return Err(invalid(format!(
+                        "unsupported setup Agent {value:?}; expected cursor,codex"
+                    )));
+                }
             }
         }
-    }
-    if agents.is_empty() {
-        return Err(invalid("--agents must select cursor and/or codex"));
-    }
-    Ok(sctx_installer::SetupOptions { agents })
+        if agents.is_empty() {
+            return Err(invalid("--agents must select cursor and/or codex"));
+        }
+        agents
+    } else {
+        sctx_installer::SetupOptions::default().agents
+    };
+    let knowledge_store_url = options
+        .optional("--knowledge-store-url")?
+        .map(str::parse)
+        .transpose()?;
+    Ok(sctx_installer::SetupOptions {
+        agents,
+        knowledge_store_url,
+    })
 }
 
 fn emit_lifecycle(value: &impl Serialize, json_output: bool) -> Result<()> {
@@ -372,6 +1183,10 @@ fn demo_intent() -> IntentSnapshot {
 
 fn demo_context() -> ContextRevisionDraft {
     ContextRevisionDraft {
+        // The fixed demo fixture has no derived problem framing or unresolved locator hints to
+        // carry (WP-D's reference derivation only runs over real checkpoint claims).
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Validation,
         topic_key: Some(DEMO_TOPIC.to_owned()),
         statement: DEMO_STATEMENT.to_owned(),
@@ -630,19 +1445,20 @@ fn verify_demo_mcp(
         .and_then(|response| response.pointer("/result/tools"))
         .and_then(Value::as_array)
         .ok_or_else(|| invariant("demo MCP tools/list response is missing"))?;
-    if tools.len() != 16
-        || [
-            "task_checkpoint",
-            "candidate_list",
-            "candidate_get",
-            "candidate_discard",
-            "candidate_confirm",
-        ]
+    // Compare the whole emitted surface against the one shared name list rather than spot-checking
+    // the Candidate Review tools: a hardcoded count plus five sampled names let `space_create` ship
+    // in `tools/list` without the demo noticing.
+    let emitted = tools
         .iter()
-        .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
-    {
+        .map(|tool| tool["name"].as_str().unwrap_or_default())
+        .collect::<BTreeSet<_>>();
+    let expected = sctx_agent_adapter::shared_context_tool_names()
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if tools.len() != expected.len() || emitted != expected {
         return Err(invariant(
-            "demo MCP tools/list did not return the Candidate Review surface",
+            "demo MCP tools/list did not return the full tool surface, including Candidate Review",
         ));
     }
     let results = responses
@@ -658,6 +1474,192 @@ fn verify_demo_mcp(
         ));
     }
     Ok(())
+}
+
+/// Best-effort, non-blocking diagnostic recorder for one `sctx hook` invocation.
+///
+/// The producer only emits a bounded frame to the collector FIFO. It never opens Runtime, writes
+/// a diagnostic file, creates the logging root, retries, or changes Hook stdout/stderr.
+struct HookEventRecorder {
+    agent: String,
+    logs_root: Option<PathBuf>,
+    invocation_id: String,
+    sequence: Cell<u32>,
+    event_kind: RefCell<Option<&'static str>>,
+    session_digest: RefCell<Option<String>>,
+    decode_error_class: RefCell<Option<&'static str>>,
+    host_schema: RefCell<Option<&'static str>>,
+    /// Reason and detail the single Enabled completion row carries instead of a bare `ok`.
+    completion: RefCell<Option<(&'static str, Option<String>)>>,
+    started: Instant,
+}
+
+impl HookEventRecorder {
+    fn new(agent: &str) -> Self {
+        Self {
+            agent: agent.to_owned(),
+            logs_root: sctx_telemetry::default_logs_root(),
+            invocation_id: sctx_telemetry::new_invocation_id(),
+            sequence: Cell::new(0),
+            event_kind: RefCell::new(None),
+            session_digest: RefCell::new(None),
+            decode_error_class: RefCell::new(None),
+            host_schema: RefCell::new(None),
+            completion: RefCell::new(None),
+            started: Instant::now(),
+        }
+    }
+
+    /// Names what this Hook actually did, for the one Enabled completion row it will write.
+    ///
+    /// A normal Enabled Hook emits one completion telemetry event. Ordinary outcomes replace
+    /// its `ok` reason rather than emitting an extra event; faults can flush their own event.
+    fn note_completion(&self, reason: &'static str, detail: Option<String>) {
+        *self.completion.borrow_mut() = Some((reason, detail));
+    }
+
+    fn take_completion(&self) -> (&'static str, Option<String>) {
+        self.completion.borrow_mut().take().unwrap_or(("ok", None))
+    }
+
+    /// Binds the decoded event kind and session id. Every `flush` after this call uses the
+    /// bound values; a `flush` before it (only reachable from an undecodable payload) records
+    /// `event_kind = "undecodable"` and no session id.
+    fn bind(&self, event_kind: CanonicalAgentEventKind, session_id: &str) {
+        *self.event_kind.borrow_mut() = Some(hook_event_kind_str(event_kind));
+        *self.session_digest.borrow_mut() = telemetry_session_digest(&self.agent, session_id);
+    }
+
+    /// Binds only the adapter's closed diagnostic metadata after strict decoding failed.
+    fn bind_decode_diagnostic(&self, diagnostic: &sctx_adapter_codex::HookDecodeDiagnostic) {
+        if let Some(event_kind) = diagnostic.event_kind {
+            *self.event_kind.borrow_mut() = Some(hook_event_kind_str(event_kind));
+        }
+        if let Some(session_id) = diagnostic.session_id.as_deref() {
+            *self.session_digest.borrow_mut() = telemetry_session_digest(&self.agent, session_id);
+        }
+        *self.decode_error_class.borrow_mut() = Some(diagnostic.error_class.as_str());
+        *self.host_schema.borrow_mut() = Some(diagnostic.field.map_or_else(
+            || diagnostic.host_schema.as_str(),
+            sctx_adapter_codex::HookDecodeField::telemetry_family,
+        ));
+    }
+
+    fn flush(&self, decision: HookEventDecision, reason: &str, _detail: Option<String>) {
+        let Some(logs_root) = &self.logs_root else {
+            return;
+        };
+        let event_kind = self.event_kind.borrow().unwrap_or("undecodable");
+        let (outcome, authorization) = match decision {
+            HookEventDecision::Enabled => (
+                sctx_telemetry::Outcome::Success,
+                sctx_telemetry::Authorization::Authorized,
+            ),
+            HookEventDecision::FailOpen => (
+                sctx_telemetry::Outcome::FailOpen,
+                sctx_telemetry::Authorization::Unverified,
+            ),
+            HookEventDecision::Disabled => (
+                sctx_telemetry::Outcome::Disabled,
+                sctx_telemetry::Authorization::Unauthorized,
+            ),
+            HookEventDecision::Neutral => (
+                sctx_telemetry::Outcome::Degraded,
+                sctx_telemetry::Authorization::NotApplicable,
+            ),
+        };
+        let sequence = self.sequence.get();
+        self.sequence.set(sequence.saturating_add(1));
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Hook,
+            sctx_telemetry::EventKind::HookDecision,
+            self.invocation_id.clone(),
+            format!("hook.{}.{event_kind}", self.agent),
+            outcome,
+        );
+        event.sequence = sequence;
+        event.authorization = authorization;
+        event.duration_ms =
+            Some(u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        // `reason` comes exclusively from closed Hook branches in this module. Detail is omitted:
+        // existing diagnostics can contain paths and error text which do not belong on the wire.
+        event.reason = Some(reason.to_owned());
+        event.error_code = self.decode_error_class.borrow().map(str::to_owned);
+        event.error_family = self.host_schema.borrow().map(str::to_owned);
+        event
+            .session_digest
+            .clone_from(&self.session_digest.borrow());
+        let _ = sctx_telemetry::emit_to(logs_root, &event);
+    }
+}
+
+fn telemetry_session_digest(agent: &str, external_session_id: &str) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    if !matches!(agent, "cursor" | "codex")
+        || external_session_id.is_empty()
+        || external_session_id.len() > 256
+    {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(agent.as_bytes());
+    digest.update([0]);
+    digest.update(external_session_id.as_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+const fn hook_event_kind_str(kind: CanonicalAgentEventKind) -> &'static str {
+    match kind {
+        CanonicalAgentEventKind::SessionStart => "session_start",
+        CanonicalAgentEventKind::PromptSubmit => "prompt_submit",
+        CanonicalAgentEventKind::PostToolUse => "post_tool_use",
+        CanonicalAgentEventKind::PreCompact => "pre_compact",
+        CanonicalAgentEventKind::TurnStop => "turn_stop",
+        CanonicalAgentEventKind::SessionEnd => "session_end",
+    }
+}
+
+/// Character bound for the existing local Hook diagnostic detail plumbing. The telemetry
+/// recorder omits detail from its wire payload.
+const MAX_HOOK_DETAIL_CHARS: usize = 256;
+
+/// Truncates a safe (non-prompt, non-tool-output) local diagnostic string by Unicode characters.
+fn truncate_hook_detail(text: &str) -> String {
+    text.chars().take(MAX_HOOK_DETAIL_CHARS).collect()
+}
+
+/// Decodes one vendor payload, or fails open with closed adapter diagnostics.
+///
+/// `Ok(None)` means the payload is undecodable. It comes from the Agent host, not the user, so
+/// an unrecognized shape (a new desktop build, say) is a neutral no-op rather than exit 2, which
+/// hosts render as a blocked action. Exit 2 stays reserved for CLI usage errors.
+fn decode_hook_payload(
+    agent: &str,
+    input: &[u8],
+    installed_agent_version: Option<String>,
+    recorder: &HookEventRecorder,
+) -> Result<Option<(CanonicalAgentEvent, Option<String>)>> {
+    let decoded = if agent == "cursor" {
+        sctx_adapter_cursor::decode_hook_input(input)
+            .map(|(event, payload_version)| (event, Some(payload_version)))
+    } else {
+        match sctx_adapter_codex::decode_hook_input_with_diagnostic(input) {
+            Ok(event) => Ok((event, installed_agent_version)),
+            Err(failure) => {
+                recorder.bind_decode_diagnostic(failure.diagnostic());
+                Err(failure.into_error())
+            }
+        }
+    };
+    match decoded {
+        Ok(decoded) => Ok(Some(decoded)),
+        Err(error) if error.kind() == ErrorKind::InvalidInput => {
+            eprintln!("sctx hook: ignoring undecodable {agent} payload: {error}");
+            recorder.flush(HookEventDecision::FailOpen, "payload_decode_failed", None);
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn run_hook(args: &[String]) -> Result<()> {
@@ -697,6 +1699,7 @@ fn run_hook(args: &[String]) -> Result<()> {
             "--hook-available and --trust are probe-only options used with --capabilities",
         ));
     }
+    let recorder = HookEventRecorder::new(agent);
     let mut input = Vec::new();
     io::stdin()
         .read_to_end(&mut input)
@@ -705,25 +1708,269 @@ fn run_hook(args: &[String]) -> Result<()> {
         return Err(invalid("hook stdin must contain one JSON payload"));
     }
 
-    let (event, version) = if agent == "cursor" {
-        let (event, payload_version) = sctx_adapter_cursor::decode_hook_input(&input)?;
-        (event, Some(payload_version))
-    } else {
-        let event = sctx_adapter_codex::decode_hook_input(&input)?;
-        let version = options
-            .optional("--agent-version")?
-            .map(str::to_owned)
-            .or_else(|| detect_agent_version(agent));
-        (event, version)
+    let installed_agent_version = options.optional("--agent-version")?.map(str::to_owned);
+    let Some((event, version)) =
+        decode_hook_payload(agent, &input, installed_agent_version, &recorder)?
+    else {
+        println!("{{}}");
+        return Ok(());
     };
+    recorder.bind(event.kind(), &event.context().session_id);
     let trust = parse_trust(agent, None, true)?;
     let capabilities = agent_capabilities(agent, version.as_deref(), true, trust);
-    let action = plan_action(&event, &capabilities);
-    let resolved = resolve_hook_action(action)?;
-    let output = if agent == "cursor" {
-        sctx_adapter_cursor::encode_hook_output(event.kind(), &resolved)?
+    let maintenance = installation_root()
+        .and_then(MaintenanceLock::open_or_create)
+        .and_then(|lock| lock.try_shared())
+        .ok();
+    if maintenance.is_none() {
+        recorder.flush(HookEventDecision::FailOpen, "maintenance_lock_busy", None);
+    }
+    let authorization = if maintenance.is_some() {
+        resolve_hook_authorization(agent, &event, &recorder)
     } else {
-        sctx_adapter_codex::encode_hook_output(event.kind(), &resolved)?
+        HookAuthorization::disabled()
+    };
+    let activation = authorization.activation;
+    let activated = activation == ResolvedActivationDecision::Enabled;
+    // Resolved once per Hook, before planning, because two different channels want it: the
+    // activation marker carries `## session` and the boundary reminder carries `## stop`.
+    // Resolution never fails; a degraded one is a telemetry row, never a refused activation.
+    let policy = hook_policy(activated, &recorder);
+    let action = plan_hook_action(&event, &capabilities, &authorization, &policy, &recorder);
+    let resolved = resolve_hook_action(action, &policy, &recorder);
+    if maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionEnd {
+        remove_hook_session_scope(agent, &event.context().session_id, &recorder);
+    }
+    print_hook_output(agent, event.kind(), &resolved)?;
+    // After the response is on stdout, because that is the moment the delivery became real.
+    record_self_healed_marker_delivery(
+        agent,
+        &event,
+        &capabilities,
+        &policy,
+        &authorization,
+        &resolved,
+        &recorder,
+    );
+    if activated && !capabilities.hooks_verified() {
+        eprintln!("{}", capabilities.diagnostic);
+    }
+    // A Disabled outcome that reached here without any fail-open/degraded flush along the way is
+    // not a diagnostic event — it is the product's normal, by-design behavior for a Session
+    // Shared Context was never authorized for, and that Session must leave exactly zero local
+    // residue (verified by `repository_scoped_context_acceptance` and
+    // `repository_scoped_activation_acceptance`). Only an Enabled completion is recorded here;
+    // every genuine fault along a Disabled path already recorded its own row above.
+    if activated {
+        let (reason, detail) = recorder.take_completion();
+        recorder.flush(HookEventDecision::Enabled, reason, detail);
+    }
+    // Dead last, after the response is already on stdout and every lease decision is recorded: the
+    // opportunistic maintenance track must never be something a Session waits for.
+    if activated && maintenance.is_some() && event.kind() == CanonicalAgentEventKind::SessionStart {
+        spawn_opportunistic_maintenance(&authorization.maintenance, &recorder);
+    }
+    Ok(())
+}
+
+/// Starts one detached `sctx maintain run --opportunistic` when maintenance has gone stale.
+///
+/// This is the half of the two-track schedule that reaches a laptop asleep at the `LaunchAgent`'s
+/// hour -- and, on a machine where launchd refused the job, the only half there is.
+///
+/// The cost on the Hook hot path is fixed and tiny by construction: one read of a single-line file
+/// and one `spawn`. No database is opened, no lock is taken, and nothing is waited for. Every
+/// failure is silence except one Hook telemetry event, because a Session's start is not the place to
+/// report that a background chore could not begin.
+///
+/// The child is put in its own process group so that closing the editor -- which signals the
+/// Hook's group -- does not kill a maintenance run mid-Git-operation. Its three streams go to
+/// `/dev/null`: the run's durable record is `state/maintain-digest.json`, and inheriting the
+/// Hook's stdout would put a JSON digest into the Agent's response.
+fn spawn_opportunistic_maintenance(
+    maintenance: &MaintenanceSettings,
+    recorder: &HookEventRecorder,
+) {
+    let Some(stale_after) = maintenance.opportunistic_after_seconds() else {
+        return;
+    };
+    let Ok(root) = installation_root() else {
+        return;
+    };
+    // A missing marker means maintenance has never run here, which is exactly the installation
+    // this track exists for. An unreadable or malformed one is left to `sctx doctor`.
+    let Ok(last_run) = sctx_installer::maintain::read_last_run(&root) else {
+        return;
+    };
+    if let Some(last_run) = last_run {
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return;
+        };
+        // Saturating, so a marker written by a clock ahead of this one reads as "just ran" rather
+        // than as an enormous age that starts a run on every single Session.
+        if now.as_secs().saturating_sub(last_run) <= stale_after {
+            return;
+        }
+    }
+    let outcome = Command::new(root.join("bin/current/sctx"))
+        .args(["maintain", "run", "--opportunistic"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    match outcome {
+        // The handle is dropped without `wait`, which on Unix neither kills nor reaps the child:
+        // it outlives this Hook and is reparented when the Hook exits a moment from now.
+        Ok(_child) => recorder.flush(
+            HookEventDecision::Neutral,
+            "opportunistic_maintenance_started",
+            None,
+        ),
+        Err(error) => recorder.flush(
+            HookEventDecision::Neutral,
+            "opportunistic_maintenance_unavailable",
+            Some(truncate_hook_detail(&error.to_string())),
+        ),
+    }
+}
+
+/// Resolves the complete Hook policy for one event: pure activation policy,
+/// then `PostToolUse` Catalog attribution, then a self-healed activation marker.
+fn plan_hook_action(
+    event: &CanonicalAgentEvent,
+    capabilities: &AgentCapabilities,
+    authorization: &HookAuthorization,
+    policy: &Policy,
+    recorder: &HookEventRecorder,
+) -> CanonicalAgentAction {
+    let activation = authorization.activation;
+    let action = plan_action_for_activation(event, capabilities, activation, policy.session());
+    // Only an event that actually planned a Signal merge has anything to attribute. Shared
+    // Context's own MCP tool calls plan nothing on purpose, and running attribution over them
+    // reported the by-design path as `attribution_failed` on every single call.
+    let action = if matches!(
+        action.task_operation,
+        Some(TaskRuntimeOperation::MergeSignals { .. })
+    ) && activation == ResolvedActivationDecision::Enabled
+    {
+        authorization
+            .scope
+            .as_ref()
+            .zip(authorization.catalog.as_ref())
+            .and_then(|(scope, catalog)| {
+                match attribute_post_tool_action(event, action, scope, catalog) {
+                    Ok(action) => Some(action),
+                    Err(error) => {
+                        recorder.flush(
+                            HookEventDecision::Neutral,
+                            "attribution_failed",
+                            Some(truncate_hook_detail(error.message())),
+                        );
+                        None
+                    }
+                }
+            })
+            .unwrap_or_else(CanonicalAgentAction::neutral)
+    } else {
+        action
+    };
+    add_self_healed_activation_marker(event, action, capabilities, authorization, policy)
+}
+
+/// Resolves this installation's runtime team policy for one Hook, reporting a degraded file.
+///
+/// Fail-open is the whole contract: an absent, unreadable, or oversize `policy.md` yields the
+/// compiled-in default, so a typo in a Markdown file can never cost a Session its activation. It
+/// is not silent, though. The degraded status rides in the existing closed `hook_decision` reason
+/// field -- the telemetry schema is `deny_unknown_fields` with no attribute map, so no field was
+/// added for this -- and `sctx doctor` says the same thing where an operator will actually read it.
+fn hook_policy(activated: bool, recorder: &HookEventRecorder) -> Policy {
+    if !activated {
+        return Policy::compiled_default();
+    }
+    let Ok(root) = installation_root() else {
+        return Policy::compiled_default();
+    };
+    let resolved = installation_policy(&root);
+    if resolved.status.is_degraded() {
+        recorder.flush(
+            HookEventDecision::FailOpen,
+            resolved.status.reason(),
+            Some(truncate_hook_detail(&resolved.oversize_sections.join(","))),
+        );
+    }
+    resolved.policy
+}
+
+#[derive(Debug)]
+struct HookAuthorization {
+    activation: ResolvedActivationDecision,
+    scope: Option<AuthorizedSessionScope>,
+    catalog: Option<RepositoryCatalogSnapshot>,
+    /// The maintenance schedule, read from the same `config.toml` open the Catalog cost. Only the
+    /// `SessionStart` opportunistic gate reads it; every other event carries it unused.
+    maintenance: MaintenanceSettings,
+    /// True when *this* event created the Session's missing lease and owes it the activation
+    /// marker `SessionStart` never delivered.
+    deliver_activation_marker: bool,
+}
+
+impl HookAuthorization {
+    fn disabled() -> Self {
+        Self {
+            activation: ResolvedActivationDecision::Disabled,
+            scope: None,
+            catalog: None,
+            // A Session this installation never authorized starts nothing, so the value is only
+            // ever read through the `Enabled` gate below and the default is never acted on.
+            maintenance: MaintenanceSettings::default(),
+            deliver_activation_marker: false,
+        }
+    }
+}
+
+/// Re-states the activation marker for a Session whose `SessionStart` never delivered one.
+///
+/// `SessionStart` is the only event that renders the marker, so a `SessionStart` that failed
+/// open — a busy maintenance lock is enough — left its Session permanently without the one datum
+/// the Agent cannot guess: the host Session id it must send back as `external_session_id`. The
+/// lease self-heal already rebuilds authorization from a later event; this rebuilds the marker
+/// with it, exactly once per lease.
+///
+/// The marker takes the `additional_context` field only when nothing else claimed it, preserving
+/// model context already selected by activation policy. Events whose vendor output cannot
+/// carry model-visible text — a Cursor
+/// `beforeSubmitPrompt` or `sessionEnd` encodes an empty object — are skipped rather than
+/// spending the one-shot delivery on a field that is dropped.
+fn add_self_healed_activation_marker(
+    event: &CanonicalAgentEvent,
+    mut action: CanonicalAgentAction,
+    capabilities: &AgentCapabilities,
+    authorization: &HookAuthorization,
+    policy: &Policy,
+) -> CanonicalAgentAction {
+    if !authorization.deliver_activation_marker || action.additional_context.is_some() {
+        return action;
+    }
+    action.additional_context = Some(shared_context_activation_marker_with_policy(
+        capabilities.agent,
+        &event.context().session_id,
+        policy.session(),
+    ));
+    action
+}
+
+/// Encodes one resolved action for its host and writes it to stdout.
+fn print_hook_output(
+    agent: &str,
+    event: CanonicalAgentEventKind,
+    resolved: &ResolvedAgentAction,
+) -> Result<()> {
+    let output = if agent == "cursor" {
+        sctx_adapter_cursor::encode_hook_output(event, resolved)?
+    } else {
+        sctx_adapter_codex::encode_hook_output(event, resolved)?
     };
     println!(
         "{}",
@@ -731,10 +1978,514 @@ fn run_hook(args: &[String]) -> Result<()> {
             Error::new(ErrorKind::Io, format!("hook output is not UTF-8: {error}"))
         })?
     );
-    if !capabilities.hooks_verified() {
-        eprintln!("{}", capabilities.diagnostic);
-    }
     Ok(())
+}
+
+/// Spends the lease's one-shot activation-marker delivery, once the response has carried it.
+///
+/// The delivery is one-shot, so recording it before the response exists means every way of losing
+/// the text between the decision and stdout burns it permanently: the Session is marked as told
+/// and never told. The marker is the one datum an Agent cannot guess — the host Session id it must
+/// send back as `external_session_id` — so a burned delivery costs that Session every MCP call it
+/// would ever have made.
+///
+/// Confirmation is by value, not by flag: the marker is rendered again from the same three inputs
+/// and compared against what the response actually carries. A planner that put something else in
+/// `additional_context`, or a fail-open that cleared it, therefore leaves the lease unspent and
+/// the next event offers the marker again.
+///
+/// Two concurrent Hooks can now both confirm and both record, where the old ordering let the lease
+/// write serialize them. A Session told its own id twice is a duplicated sentence; a Session never
+/// told it is inert for its whole life, which is the trade this ordering takes deliberately. The
+/// same is true of a failure to record here: the marker was delivered, so the worst case is one
+/// more delivery on the next event.
+fn record_self_healed_marker_delivery(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    capabilities: &AgentCapabilities,
+    policy: &Policy,
+    authorization: &HookAuthorization,
+    resolved: &ResolvedAgentAction,
+    recorder: &HookEventRecorder,
+) {
+    if !authorization.deliver_activation_marker {
+        return;
+    }
+    let session_id = &event.context().session_id;
+    let delivered = shared_context_activation_marker_with_policy(
+        capabilities.agent,
+        session_id,
+        policy.session(),
+    );
+    if resolved.additional_context.as_deref() != Some(delivered.as_str()) {
+        return;
+    }
+    let outcome = installation_root().and_then(|root| {
+        let locator = ExternalSessionLocator::new(agent, session_id)?;
+        AuthorizedSessionScopeStore::initialize(&root)?
+            .try_mark_activation_marker_delivered(&locator)
+    });
+    if let Err(error) = outcome {
+        recorder.flush(
+            HookEventDecision::Neutral,
+            "marker_mark_failed",
+            Some(truncate_hook_detail(error.message())),
+        );
+    }
+}
+
+/// Whether this event is worth spending an Agent's one-shot activation-marker delivery on.
+///
+/// Two questions, asked in order. The wire question belongs to the adapter that encodes the
+/// output, so it is asked there and never restated here: the two hosts disagree — a Codex `Stop`
+/// or `PreCompact` has no `hookSpecificOutput` variant and drops everything written to model
+/// context, while the same Cursor events carry it in `user_message` — and a single shared answer
+/// would spend the delivery on a field one host silently discards, leaving that Session
+/// permanently without the id it must send back. The dispatch is the same `agent` string the Hook
+/// command already uses to pick an adapter for [`agent_capabilities`] and for the encode itself.
+///
+/// The policy question is the caller's: a Prompt is excluded even where the host would deliver it,
+/// because the Prompt Hook never states the marker, and a Session repairing its own lease is not
+/// the reason to make that the exception. `SessionStart` is excluded by its caller, which renders
+/// the marker unconditionally and owes no self-heal.
+fn carries_model_visible_context(agent: &str, kind: CanonicalAgentEventKind) -> bool {
+    if kind == CanonicalAgentEventKind::PromptSubmit {
+        return false;
+    }
+    if agent == "cursor" {
+        sctx_adapter_cursor::delivers_model_visible_context(kind)
+    } else {
+        sctx_adapter_codex::delivers_model_visible_context(kind)
+    }
+}
+
+fn resolve_hook_authorization(
+    agent: &str,
+    event: &CanonicalAgentEvent,
+    recorder: &HookEventRecorder,
+) -> HookAuthorization {
+    match resolve_hook_authorization_inner(
+        agent,
+        event.kind(),
+        &event.context().session_id,
+        &event.context().cwd,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                "authorization_internal",
+                Some(truncate_hook_detail(error.message())),
+            );
+            HookAuthorization::disabled()
+        }
+    }
+}
+
+fn resolve_hook_authorization_inner(
+    agent: &str,
+    event_kind: CanonicalAgentEventKind,
+    session_id: &str,
+    startup_cwd: &Path,
+) -> Result<HookAuthorization> {
+    let root = installation_root()?;
+    let locator = ExternalSessionLocator::new(agent, session_id)?;
+    let config = UserConfigStore::open_existing(&root)?;
+    let (catalog, _, maintenance) = config.repository_catalog_with_hooks()?;
+    let store = AuthorizedSessionScopeStore::initialize(&root)?;
+
+    // A lease is permanent, but its decision is not: the recorded canonical
+    // `startup_cwd` is re-resolved against the Catalog this Hook just read, so a
+    // `repository add` or removal reaches an already running Session on its next
+    // event — including a Session started at a common parent, which simply gains or
+    // loses one of the Repositories it records for. Re-resolution is pure — no stat, no Git, no scan — so this stays on
+    // the Hook hot path.
+    // Every event, not only `SessionStart`, may create the lease it is missing. A host
+    // that installs the Hook mid-Session, starts it after the Session began, or stores a
+    // record this Store must classify as `Missing` would otherwise leave that Session
+    // permanently and silently unauthorized: the marker never appears, and every MCP call
+    // is refused for its whole life. Authorization is identical either way — the event's
+    // own cwd (the vendor adapters already fall back to the first workspace root) resolved
+    // against this Catalog — so a Session outside every registered Repository still
+    // records Disabled. The added hot-path cost is one `canonicalize`, and the write is
+    // non-blocking.
+    let mut deliver_activation_marker = false;
+    let scope = match store.try_read_reconciled(&locator, &catalog)? {
+        AuthorizedSessionScopeRead::Current(scope) => Some(scope),
+        AuthorizedSessionScopeRead::Missing => {
+            let canonical_startup_cwd = fs::canonicalize(startup_cwd).map_err(|error| {
+                Error::new(ErrorKind::Io, format!("canonicalize startup cwd: {error}"))
+            })?;
+            let scope = store
+                .try_authorize_missing(&locator, &catalog, &canonical_startup_cwd)?
+                .scope;
+            // `SessionStart` renders the marker unconditionally, so only a later event that had
+            // to build the lease itself owes one. Recording the delivery in the lease is what
+            // keeps the next event from repeating it — the same one-shot bookkeeping the Intent
+            // bootstrap reminder uses.
+            //
+            // This decides only that the marker is *owed*; the recording happens in
+            // [`record_self_healed_marker_delivery`], after the response carrying it is on
+            // stdout. Deciding and recording used to be this one call, and every later way of
+            // losing the marker therefore burned it: a failed Task Runtime operation makes
+            // `resolve_hook_action` fail open with `additional_context: None`, which dropped a
+            // marker the lease had already been told was delivered, leaving that Session with no
+            // way to ever learn the `external_session_id` it must send back.
+            //
+            // The delivery is offered here and nowhere else, because a lease this event did not
+            // create cannot be told apart from one a `SessionStart` created — both carry
+            // `activation_marker_delivered: false`, since a `SessionStart` marker is rendered
+            // without recording anything. A lease built by an event whose host drops model
+            // context therefore keeps its delivery unspent but never gets a second chance at it
+            // (deferred-issues #37). Unspent is still the right state: recording a delivery the
+            // host discarded is a lie about what the Session was told.
+            deliver_activation_marker = event_kind != CanonicalAgentEventKind::SessionStart
+                && carries_model_visible_context(agent, event_kind)
+                && scope.decision.is_enabled()
+                && !scope.activation_marker_delivered;
+            Some(scope)
+        }
+    };
+    let activation = if scope
+        .as_ref()
+        .is_some_and(|scope| scope.decision.is_enabled())
+    {
+        ResolvedActivationDecision::Enabled
+    } else {
+        ResolvedActivationDecision::Disabled
+    };
+    Ok(HookAuthorization {
+        activation,
+        scope,
+        catalog: Some(catalog),
+        maintenance,
+        deliver_activation_marker,
+    })
+}
+
+fn remove_hook_session_scope(agent: &str, session_id: &str, recorder: &HookEventRecorder) {
+    let Some((root, locator)) = installation_root()
+        .ok()
+        .zip(ExternalSessionLocator::new(agent, session_id).ok())
+    else {
+        return;
+    };
+    let removed =
+        AuthorizedSessionScopeStore::initialize(root).and_then(|store| store.try_remove(&locator));
+    if let Err(error) = removed {
+        recorder.flush(
+            HookEventDecision::Neutral,
+            "session_cleanup_failed",
+            Some(truncate_hook_detail(error.message())),
+        );
+    }
+}
+
+#[derive(Debug)]
+enum HookEventAttribution {
+    /// Every path resolved to a Repository this Session is authorized for. The Workspace it
+    /// resolved through is a precondition, not a result: nothing downstream records a location,
+    /// so only the attributed files travel on.
+    Registered {
+        file_hints: Vec<PathBuf>,
+    },
+    NonLocating,
+}
+
+#[derive(Debug)]
+enum SafePathAttribution {
+    Registered {
+        repository_id: RepositoryId,
+        checkout_path: PathBuf,
+        file_hint: Option<PathBuf>,
+    },
+    Unregistered,
+}
+
+fn attribute_post_tool_action(
+    event: &CanonicalAgentEvent,
+    mut action: CanonicalAgentAction,
+    scope: &AuthorizedSessionScope,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<CanonicalAgentAction> {
+    let CanonicalAgentEvent::PostToolUse {
+        context,
+        path_hints,
+        ..
+    } = event
+    else {
+        return Err(invariant("PostToolUse attribution received another event"));
+    };
+    let attribution = resolve_post_tool_attribution(context, path_hints, scope, catalog)?;
+    let Some(TaskRuntimeOperation::MergeSignals { file_hints, .. }) =
+        action.task_operation.as_mut()
+    else {
+        return Err(invariant("enabled PostToolUse has no merge operation"));
+    };
+    match attribution {
+        HookEventAttribution::Registered {
+            file_hints: attributed_files,
+        } => file_hints.clone_from(&attributed_files),
+        HookEventAttribution::NonLocating => file_hints.clear(),
+    }
+    Ok(action)
+}
+
+fn resolve_post_tool_attribution(
+    context: &AgentEventContext,
+    path_hints: &[PathHint],
+    scope: &AuthorizedSessionScope,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<HookEventAttribution> {
+    if !scope.decision.is_enabled() {
+        return Err(invalid("PostToolUse requires an enabled Session scope"));
+    }
+    let base = event_base_directory(context);
+    let (candidates, structured): (Vec<&PathHint>, Vec<&PathHint>) = path_hints
+        .iter()
+        .partition(|hint| matches!(hint, PathHint::CommandCandidate(_)));
+
+    let mut repository_ids = BTreeSet::new();
+    let mut checkout_paths = BTreeSet::new();
+    let mut file_hints = BTreeSet::new();
+    let mut has_unregistered_path = false;
+    if structured.is_empty() {
+        collect_safe_path_attribution(
+            resolve_safe_directory(&absolute_against(base, &context.cwd), catalog)?,
+            &mut repository_ids,
+            &mut checkout_paths,
+            &mut file_hints,
+            &mut has_unregistered_path,
+        );
+    } else {
+        for hint in structured {
+            collect_safe_path_attribution(
+                resolve_structured_path_hint(hint, base, catalog)?,
+                &mut repository_ids,
+                &mut checkout_paths,
+                &mut file_hints,
+                &mut has_unregistered_path,
+            );
+        }
+    }
+
+    if has_unregistered_path {
+        return Ok(HookEventAttribution::NonLocating);
+    }
+    if repository_ids.is_empty() || checkout_paths.is_empty() {
+        return Err(invariant("PostToolUse attribution resolved no safe path"));
+    }
+    if resolve_registered_workspace(&checkout_paths, scope).is_none() {
+        return Ok(HookEventAttribution::NonLocating);
+    }
+    extend_command_candidate_files(&candidates, base, catalog, &checkout_paths, &mut file_hints);
+    Ok(HookEventAttribution::Registered {
+        file_hints: file_hints.into_iter().collect(),
+    })
+}
+
+/// The directory a relative path hint is resolved against.
+///
+/// Cursor's desktop build sends some tool events with relative paths, which the absolute-path
+/// rule rejected outright and which therefore contributed no clue at all. The event states where
+/// it ran: its own working directory, or — when the host omitted one — the first Workspace root
+/// it declared. Neither is trusted as a location on its own; the joined path still has to pass
+/// every existing safety check, including the canonical-form check that rejects a join through
+/// a symlinked or non-normalized base.
+fn event_base_directory(context: &AgentEventContext) -> Option<&Path> {
+    if context.cwd.is_absolute() {
+        return Some(context.cwd.as_path());
+    }
+    context
+        .workspace_roots
+        .iter()
+        .find(|root| root.is_absolute())
+        .map(PathBuf::as_path)
+}
+
+/// Joins a relative path onto the event's base directory, leaving an absolute path alone.
+///
+/// A relative path with no usable base stays relative, so [`validate_safe_existing_path`]
+/// rejects it exactly as it did before.
+fn absolute_against(base: Option<&Path>, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    base.map_or_else(|| path.to_path_buf(), |base| base.join(path))
+}
+
+/// Resolves the bounded command-derived candidates of one already attributed event.
+///
+/// Every rule here is a rejection rule, because a candidate is a guess: it must resolve to an
+/// existing, non-symlink, canonical regular file inside a checkout this event *already*
+/// attributed to. Landing in a different registered Repository is not enough — accepting one
+/// could widen the event's Workspace and flip it non-locating, so a guess is never allowed to
+/// change an outcome the structured hints decided. Nothing here fails the event, and at most
+/// [`MAX_SHELL_COMMAND_PATH_CANDIDATES`] candidates are inspected.
+fn extend_command_candidate_files(
+    candidates: &[&PathHint],
+    base: Option<&Path>,
+    catalog: &RepositoryCatalogSnapshot,
+    checkout_paths: &BTreeSet<PathBuf>,
+    file_hints: &mut BTreeSet<PathBuf>,
+) {
+    for hint in candidates.iter().take(MAX_SHELL_COMMAND_PATH_CANDIDATES) {
+        let PathHint::CommandCandidate(path) = hint else {
+            continue;
+        };
+        let path = absolute_against(base, path);
+        let Ok(metadata) = validate_safe_existing_path(&path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let Ok(Some((_, checkout_path))) = catalog.deepest_checkout_for(&path) else {
+            continue;
+        };
+        if checkout_paths.contains(&checkout_path) {
+            file_hints.insert(path);
+        }
+    }
+}
+
+fn resolve_structured_path_hint(
+    hint: &PathHint,
+    base: Option<&Path>,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<SafePathAttribution> {
+    match hint {
+        PathHint::File(path) => resolve_safe_file(&absolute_against(base, path), catalog),
+        PathHint::Path(path) => {
+            let path = absolute_against(base, path);
+            let metadata = validate_safe_existing_path(&path)?;
+            if metadata.is_file() {
+                return resolve_safe_file(&path, catalog);
+            }
+            resolve_safe_directory(&path, catalog)
+        }
+        PathHint::WorkingDirectory(path) => {
+            resolve_safe_directory(&absolute_against(base, path), catalog)
+        }
+        PathHint::CommandCandidate(_) => Err(invariant(
+            "a command candidate is never resolved as a structured path hint",
+        )),
+        PathHint::Ambiguous => Err(invalid("PostToolUse contains an ambiguous path hint")),
+    }
+}
+
+fn resolve_safe_file(
+    path: &Path,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<SafePathAttribution> {
+    let metadata = validate_safe_existing_path(path)?;
+    if !metadata.is_file() {
+        return Err(invalid(
+            "PostToolUse file path must identify a regular file",
+        ));
+    }
+    let declared = match catalog.resolve_declared_path(path) {
+        Ok(declared) => declared,
+        Err(error) if error.kind() == ErrorKind::RepositoryNotConfigured => {
+            return Ok(SafePathAttribution::Unregistered);
+        }
+        Err(error) => return Err(error),
+    };
+    let resolved =
+        catalog.resolve_file_path(path, std::slice::from_ref(&declared.checkout_path))?;
+    Ok(SafePathAttribution::Registered {
+        repository_id: resolved.repository_id,
+        checkout_path: resolved.checkout_path,
+        file_hint: Some(path.to_path_buf()),
+    })
+}
+
+fn resolve_safe_directory(
+    directory: &Path,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<SafePathAttribution> {
+    let metadata = validate_safe_existing_path(directory)?;
+    if !metadata.is_dir() {
+        return Err(invalid(
+            "PostToolUse working directory must identify a directory",
+        ));
+    }
+    // Only a directory *inside* a registered checkout attributes an event. A parent
+    // directory that merely contains checkouts activates the Session but locates nothing,
+    // so it stays unregistered here.
+    match catalog.deepest_checkout_for(directory)? {
+        Some((repository_id, checkout_path)) => Ok(SafePathAttribution::Registered {
+            repository_id,
+            checkout_path,
+            file_hint: None,
+        }),
+        None => Ok(SafePathAttribution::Unregistered),
+    }
+}
+
+fn validate_safe_existing_path(path: &Path) -> Result<fs::Metadata> {
+    if !path.is_absolute() {
+        return Err(invalid("PostToolUse path must be absolute"));
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("inspect PostToolUse path: {error}")))?;
+    if metadata.file_type().is_symlink() || (!metadata.is_file() && !metadata.is_dir()) {
+        return Err(invalid(
+            "PostToolUse path must identify a non-symlink regular file or directory",
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("canonicalize PostToolUse path: {error}"),
+        )
+    })?;
+    if canonical != path {
+        return Err(invalid(
+            "PostToolUse path must be canonical and contain no symlink components",
+        ));
+    }
+    Ok(metadata)
+}
+
+fn collect_safe_path_attribution(
+    attribution: SafePathAttribution,
+    repository_ids: &mut BTreeSet<RepositoryId>,
+    checkout_paths: &mut BTreeSet<PathBuf>,
+    file_hints: &mut BTreeSet<PathBuf>,
+    has_unregistered_path: &mut bool,
+) {
+    if let SafePathAttribution::Registered {
+        repository_id,
+        checkout_path,
+        file_hint,
+    } = attribution
+    {
+        repository_ids.insert(repository_id);
+        checkout_paths.insert(checkout_path);
+        file_hints.extend(file_hint);
+    } else {
+        *has_unregistered_path = true;
+    }
+}
+
+/// Picks the one Workspace root that covers every checkout this event touched.
+///
+/// A single checkout is its own Workspace. Several checkouts only belong together when
+/// the Session itself started at a directory that contains all of them — which is exactly
+/// the common-parent activation the lease already recorded. Anything wider is not this
+/// Session's Workspace, so the event stays non-locating.
+fn resolve_registered_workspace(
+    checkout_paths: &BTreeSet<PathBuf>,
+    scope: &AuthorizedSessionScope,
+) -> Option<PathBuf> {
+    if checkout_paths.len() == 1 {
+        return checkout_paths.first().cloned();
+    }
+    checkout_paths
+        .iter()
+        .all(|checkout| checkout.starts_with(&scope.startup_cwd))
+        .then(|| scope.startup_cwd.clone())
 }
 
 fn agent_capabilities(
@@ -750,156 +2501,187 @@ fn agent_capabilities(
     }
 }
 
-fn resolve_hook_action(action: CanonicalAgentAction) -> Result<ResolvedAgentAction> {
+fn resolve_hook_action(
+    action: CanonicalAgentAction,
+    policy: &Policy,
+    recorder: &HookEventRecorder,
+) -> ResolvedAgentAction {
     let CanonicalAgentAction {
         task_operation,
-        breadcrumb,
+        additional_context,
         system_message,
     } = action;
-    let lifecycle_operation = task_operation.as_ref().is_some_and(|operation| {
-        matches!(
-            operation,
-            TaskRuntimeOperation::FinalizeCheckpointedEpisode { .. }
-                | TaskRuntimeOperation::CleanupSessionState { .. }
-        )
-    });
-    let task_resolution = match task_operation.map(resolve_task_operation).transpose() {
+    let task_resolution = match task_operation
+        .map(|operation| resolve_task_operation(operation, policy, recorder))
+        .transpose()
+    {
         Ok(resolution) => resolution.unwrap_or_default(),
-        Err(_) => {
-            return Ok(ResolvedAgentAction {
+        Err(error) => {
+            recorder.flush(
+                HookEventDecision::FailOpen,
+                "task_operation_failed",
+                Some(truncate_hook_detail(error.message())),
+            );
+            // Model context planned for this event is dropped along with the failed operation:
+            // this response says only that retrieval is unavailable. A one-shot delivery in there
+            // is not lost by it, because nothing is recorded as delivered until
+            // `record_self_healed_marker_delivery` sees the marker survive to the response, and
+            // it does not survive this one.
+            return ResolvedAgentAction {
                 additional_context: None,
                 system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
-            });
+            };
         }
     };
-    if let Some(breadcrumb) = breadcrumb {
-        let root = installation_root()?;
-        if capture_breadcrumb(&root, breadcrumb).is_err() && !lifecycle_operation {
-            return Ok(ResolvedAgentAction {
-                additional_context: None,
-                system_message: Some(HOOK_TASK_UNAVAILABLE.to_owned()),
-            });
-        }
+    ResolvedAgentAction {
+        additional_context,
+        // Some("") is an explicit runtime silence override. Filter only after choosing it,
+        // so an adapter fallback cannot turn a quiet replay back into a notification.
+        system_message: task_resolution
+            .system_message
+            .or(system_message)
+            .filter(|message| !message.is_empty()),
     }
-    Ok(ResolvedAgentAction {
-        additional_context: task_resolution.additional_context,
-        system_message: task_resolution.system_message.or(system_message),
-    })
 }
 
 #[derive(Default)]
 struct ResolvedTaskOperation {
-    additional_context: Option<String>,
     system_message: Option<String>,
 }
 
-fn capture_breadcrumb(
-    root: &Path,
-    breadcrumb: sctx_agent_adapter::CanonicalBreadcrumb,
-) -> Result<()> {
-    let (task_owner, diagnostics) = match TaskRuntime::initialize(root)
-        .and_then(|runtime| runtime.read_snapshot_by_locator(&breadcrumb.external_session_locator))
-    {
-        Ok(Some(snapshot)) => (
-            Some(CaptureTaskOwner {
-                task_session_id: snapshot.task_session_id,
-                task_id: snapshot.task_id,
-                intent_revision_id: snapshot
-                    .current_intent_revision()
-                    .ok_or_else(|| invariant("ActiveTask has no Intent Head"))?
-                    .revision_id,
-            }),
-            Vec::new(),
-        ),
-        Ok(None) => (None, vec![CaptureDiagnosticKind::NoActiveTask]),
-        Err(_) => (None, vec![CaptureDiagnosticKind::RuntimeUnavailable]),
-    };
-    CaptureStore::initialize(root)?.capture(&Breadcrumb {
-        external_session_locator: breadcrumb.external_session_locator,
-        task_owner,
-        kind: match breadcrumb.kind {
-            CanonicalBreadcrumbKind::ToolOutcome => BreadcrumbKind::ToolOutcome,
-            CanonicalBreadcrumbKind::Checkpoint => BreadcrumbKind::Checkpoint,
-        },
-        summary: breadcrumb.summary,
-        workspace_hint: breadcrumb.workspace_hint,
-        file_hints: breadcrumb.file_hints,
-        diagnostics,
-    })?;
-    Ok(())
-}
-
-fn resolve_task_operation(operation: TaskRuntimeOperation) -> Result<ResolvedTaskOperation> {
+fn resolve_task_operation(
+    operation: TaskRuntimeOperation,
+    policy: &Policy,
+    recorder: &HookEventRecorder,
+) -> Result<ResolvedTaskOperation> {
     match operation {
-        TaskRuntimeOperation::MergeObservations {
+        TaskRuntimeOperation::MergeSignals {
             locator,
-            cwd,
-            workspace_roots,
             file_hints,
-            tool_name,
+            tool_category,
+            file_access,
             outcome,
+            ..
         } => {
             let root = installation_root()?;
-            let runtime = TaskRuntime::initialize(&root)?;
-            if runtime.read_snapshot_by_locator(&locator)?.is_none() {
+            let runtime = TaskRuntime::initialize_for_hook(&root)?;
+            let Some(active) = runtime.read_snapshot_by_locator(&locator)? else {
+                let mark_result = AuthorizedSessionScopeStore::initialize(&root)
+                    .and_then(|store| store.try_mark_intent_bootstrap_notified(&locator));
+                let notify = mark_result.as_ref().copied().unwrap_or(false);
+                if let Err(error) = &mark_result {
+                    recorder.flush(
+                        HookEventDecision::Neutral,
+                        "bootstrap_mark_failed",
+                        Some(truncate_hook_detail(error.message())),
+                    );
+                }
+                return Ok(ResolvedTaskOperation {
+                    system_message: notify.then(|| INTENT_BOOTSTRAP_REMINDER.to_owned()),
+                });
+            };
+            // A real PostToolUse against an ActiveTask, independent of whether it goes on to
+            // produce a new Signal below: this is exactly the "substantial tool activity" the
+            // TurnStop checkpoint reminder gate (WP-V6 fix 3) needs to tell an idle turn from one
+            // where the Agent kept working. Best-effort like every other Hook-path write beside the
+            // diagnostic log; losing this counter only makes the gate more conservative, never less.
+            let _ = runtime.record_checkpoint_reminder_activity(&locator);
+            let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
+            let derived = normalized_tool_signals(
+                &catalog,
+                &file_hints,
+                tool_category,
+                file_access,
+                outcome,
+            )?;
+            // Two different outcomes used to share one reason, and the louder one hid the
+            // quieter: an event that produced no Signal at all was reported as an event whose
+            // Signals were already known. `no_attributable_files` is the honest name for a tool
+            // call that named nothing this Session could place, which is exactly what a Codex
+            // Session full of `exec` calls looked like before command candidates existed.
+            if derived.is_empty() {
+                recorder.note_completion("no_attributable_files", None);
                 return Ok(ResolvedTaskOperation::default());
             }
-            let catalog = UserConfigStore::open_existing(&root)?.repository_catalog()?;
-            let signals = normalized_observation_signals(
-                &catalog,
-                &cwd,
-                &workspace_roots,
-                &file_hints,
-                &tool_name,
-                outcome,
-            );
-            if !signals.is_empty() {
-                let _outcome = runtime.merge_signals_by_locator(&locator, signals)?;
+            let signals = unrecorded_signals(&active, derived);
+            if signals.is_empty() {
+                recorder.note_completion("signal_write_skipped_nothing_new", None);
+                return Ok(ResolvedTaskOperation::default());
+            }
+            let merged = runtime.merge_hook_signals_by_locator(
+                &locator,
+                signals,
+                &file_signal_retention(),
+            )?;
+            if let Some(merged) = merged {
+                recorder.note_completion(
+                    "file_signal_recorded",
+                    Some(truncate_hook_detail(&format!(
+                        "inserted={} retired={}",
+                        merged.inserted, merged.retired
+                    ))),
+                );
             }
             Ok(ResolvedTaskOperation::default())
         }
+        TaskRuntimeOperation::RecordPromptSignal { locator, prompt } => {
+            record_prompt_signal(&locator, &prompt, recorder);
+            Ok(ResolvedTaskOperation::default())
+        }
         TaskRuntimeOperation::FinalizeCheckpointedEpisode { locator, trigger } => {
-            finalize_checkpointed_episode(&locator, trigger)
+            finalize_checkpointed_episode(&locator, trigger, policy)
         }
         TaskRuntimeOperation::CleanupSessionState { locator } => {
             let root = installation_root()?;
-            let runtime = TaskRuntime::initialize(&root)?;
+            let runtime = TaskRuntime::initialize_for_hook(&root)?;
+            let _usage = runtime.record_session_close_usage(&locator);
             let _active = runtime.read_snapshot_by_locator(&locator)?;
-            let _reviews = runtime.cleanup_expired_candidate_reviews()?;
-            let _captures = CaptureStore::initialize(root)?.cleanup_expired()?;
+            let _reviews = runtime.cleanup_expired_candidate_reviews();
             Ok(ResolvedTaskOperation::default())
         }
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn finalize_checkpointed_episode(
     locator: &ExternalSessionLocator,
     trigger: EpisodeFinalizationTrigger,
+    policy: &Policy,
 ) -> Result<ResolvedTaskOperation> {
     let root = installation_root()?;
-    let runtime = TaskRuntime::initialize(&root)?;
+    let runtime = TaskRuntime::initialize_for_hook(&root)?;
     let boundary = runtime.close_checkpointed_work_episode(locator)?;
     let trigger_name = match trigger {
         EpisodeFinalizationTrigger::PreCompact => "PreCompact",
         EpisodeFinalizationTrigger::TurnStop => "TurnStop",
     };
-    let system_message = match boundary {
+    let closure_message = |episode_id, final_checkpoint_id, build_status, item_count| {
+        format!(
+            "Shared Context {trigger_name}: Work Episode {episode_id} is durably closed at Checkpoint {final_checkpoint_id}; Candidate Builder is {build_status} with {item_count} item(s). Candidate review remains explicit and untrusted.",
+        )
+    };
+    let mut replayed_build = None;
+    let mut system_message = match boundary {
         AutomatedEpisodeBoundary::NoActiveTask => format!(
             "Shared Context {trigger_name}: no ActiveTask exists. Continue coding normally; use $shared-context and task_intent_update before checkpointing."
         ),
-        AutomatedEpisodeBoundary::NoEpisode {
-            task_id,
-            intent_revision_id,
-            ..
-        } => format!(
-            "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with expected_intent_revision_id {intent_revision_id}; Hook text is not Claim evidence."
+        AutomatedEpisodeBoundary::NoEpisode { task_id, .. } => checkpoint_reminder_text(
+            &runtime,
+            locator,
+            trigger,
+            policy,
+            format!(
+                "Shared Context {trigger_name}: no Work Episode is open for Task {task_id}. Use $shared-context and call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+            ),
         ),
-        AutomatedEpisodeBoundary::CheckpointRequired {
-            episode,
-            intent_revision_id,
-        } => format!(
-            "Shared Context {trigger_name}: Work Episode {} remains open at version {} because no current-Intent Checkpoint exists. Before compaction or completion, call task_checkpoint for Task {} with expected_intent_revision_id {intent_revision_id} and complete Claims/Unknowns. Hook text is not Claim evidence.",
-            episode.episode.episode_id, episode.episode.version, episode.episode.task_id,
+        AutomatedEpisodeBoundary::CheckpointRequired { .. } => checkpoint_reminder_text(
+            &runtime,
+            locator,
+            trigger,
+            policy,
+            format!(
+                "Shared Context {trigger_name}: current work has no Checkpoint. Before compaction or completion, call task_checkpoint with complete direct Claims/Unknowns; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+            ),
         ),
         AutomatedEpisodeBoundary::Closed {
             episode,
@@ -913,6 +2695,15 @@ fn finalize_checkpointed_episode(
                 return Err(invariant("automated closed Episode lacks final Checkpoint"));
             };
             let existing = runtime.read_candidate_build(episode_id)?;
+            if !newly_closed {
+                replayed_build = Some((
+                    episode_id,
+                    final_checkpoint_id,
+                    existing
+                        .as_ref()
+                        .is_none_or(|build| build.status == CandidateBuildStatus::Pending),
+                ));
+            }
             let should_build = newly_closed
                 || existing
                     .as_ref()
@@ -949,16 +2740,152 @@ fn finalize_checkpointed_episode(
                     )
                 },
             );
-            format!(
-                "Shared Context {trigger_name}: Work Episode {episode_id} is durably closed at Checkpoint {final_checkpoint_id}; Candidate Builder is {build_status} with {item_count} item(s). Candidate review remains explicit and untrusted.",
-            )
+            closure_message(episode_id, final_checkpoint_id, build_status, item_count)
         }
     };
     recover_one_pending_episode_build(&root, &runtime, locator)?;
+    if let Some((episode_id, final_checkpoint_id, could_recover)) = replayed_build {
+        // Quieting a replay never bypasses either build attempt above. Only a newly terminal
+        // current build earns another receipt; completion of an older Episode does not.
+        system_message = if could_recover {
+            runtime
+                .read_candidate_build(episode_id)?
+                .filter(|build| build.status != CandidateBuildStatus::Pending)
+                .map_or_else(String::new, |build| {
+                    closure_message(
+                        episode_id,
+                        final_checkpoint_id,
+                        if build.status == CandidateBuildStatus::Complete {
+                            "complete"
+                        } else {
+                            "incomplete"
+                        },
+                        build.items.len(),
+                    )
+                })
+        } else {
+            String::new()
+        };
+        if system_message.is_empty() {
+            system_message = continued_work_reminder(
+                &runtime,
+                locator,
+                trigger,
+                trigger_name,
+                policy,
+                episode_id,
+                final_checkpoint_id,
+            );
+        }
+    }
     Ok(ResolvedTaskOperation {
-        additional_context: None,
         system_message: Some(system_message),
     })
+}
+
+/// Applies the `TurnStop` checkpoint-reminder throttle (WP-V6 fix 3, `docs/deferred-issues.md`
+/// #6) to one "checkpoint is missing" message.
+///
+/// `PreCompact` fires once per compaction, which is already rare and is the one boundary that
+/// re-attaches the `$shared-context` activation marker the model needs after its transcript is
+/// dropped -- so only `TurnStop`, the every-turn trigger the docs issue is about, consults the
+/// budget; `PreCompact` always shows `nag` unmodified.
+fn checkpoint_reminder_text(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+    policy: &Policy,
+    nag: String,
+) -> String {
+    checkpoint_reminder_text_with(
+        runtime,
+        locator,
+        trigger,
+        policy,
+        nag,
+        // Deliberately without the `call task_checkpoint` directive the budgeted reminders above
+        // carry: repeating even a softened version of the same instruction would still read as
+        // urging, which is exactly what the throttle exists to stop doing.
+        "Shared Context TurnStop: checkpoint still pending; this Session already received its \
+         automated reminders for it.",
+    )
+}
+
+/// [`checkpoint_reminder_text`] with the throttled ending as a parameter.
+///
+/// Two callers want different silences once the budget is spent. A Session with no Checkpoint at
+/// all is told once that it has stopped being reminded, because the absence is still true and the
+/// line replaces a nag it would otherwise keep receiving. A Session whose Episode already closed
+/// gets nothing (`""`): its steady state is the silence R2-3 (A8) established, and a spent budget
+/// simply returns it there rather than substituting a different sentence to repeat forever.
+fn checkpoint_reminder_text_with(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+    policy: &Policy,
+    nag: String,
+    throttled: &str,
+) -> String {
+    // The team's `## stop` line rides only on a reminder that is actually asking for a Checkpoint.
+    // The throttled variant below deliberately drops it along with the directive it qualifies:
+    // restating the standard a Checkpoint has to meet, on a turn where we have already stopped
+    // asking for one, is the same urging the throttle exists to stop.
+    let nag = if policy.stop().trim().is_empty() {
+        nag
+    } else {
+        format!("{nag} {}", Policy::inline(policy.stop()).trim())
+    };
+    if trigger != EpisodeFinalizationTrigger::TurnStop {
+        return nag;
+    }
+    if runtime.gate_turn_stop_checkpoint_reminder(locator) {
+        nag
+    } else {
+        throttled.to_owned()
+    }
+}
+
+/// Asks for the next Checkpoint when a Session kept working after its Work Episode closed.
+///
+/// This is the branch that produced nothing at all. A `close`-boundary Checkpoint ends the
+/// Episode, and from the next turn onward every boundary resolves to
+/// `Closed { newly_closed: false }` --- a state that reached neither the reminder text nor the
+/// reminder gate, so no later turn could ever ask for another Checkpoint. Two independent replays
+/// show what that costs: a 21.8h Cursor Session finished with `checkpoint_reminder_count = 0`
+/// against 429 recorded tool actions, and ten commits and +3148 lines landed after its Checkpoint
+/// with nothing recorded about any of it. Reviving the branch also revives the team's `## stop`
+/// policy segment, which only ever rides on a reminder that is asking for a Checkpoint.
+///
+/// The boundary with R2-3 (A8) is the message, not the branch. A8 removed the *closure receipt* --
+/// "Work Episode X is durably closed" repeated on every turn --- and that stays removed: this
+/// fires only where A8 already resolved to silence, never alongside the receipt, and the receipt's
+/// one permitted replay (a Candidate Build that just became terminal) still wins the turn.
+///
+/// Fresh activity is the entire precondition. An Episode that closed and then saw nothing happen
+/// is finished work, and asking it for another Checkpoint would be exactly the reflex-nagging the
+/// throttle exists to stop.
+fn continued_work_reminder(
+    runtime: &TaskRuntime,
+    locator: &ExternalSessionLocator,
+    trigger: EpisodeFinalizationTrigger,
+    trigger_name: &str,
+    policy: &Policy,
+    episode_id: WorkEpisodeId,
+    final_checkpoint_id: AgentCheckpointId,
+) -> String {
+    if runtime.checkpoint_reminder_activity(locator) == 0 {
+        return String::new();
+    }
+    checkpoint_reminder_text_with(
+        runtime,
+        locator,
+        trigger,
+        policy,
+        format!(
+            "Shared Context {trigger_name}: Work Episode {episode_id} is closed at Checkpoint {final_checkpoint_id} and this Session has kept working since. Call task_checkpoint again with complete direct Claims/Unknowns for the work done after that Checkpoint; the server resolves the current Task, Intent, and lifecycle. Hook text is not Claim evidence."
+        ),
+        "",
+    )
 }
 
 fn recover_one_pending_episode_build(
@@ -986,19 +2913,211 @@ fn recover_one_pending_episode_build(
     Ok(())
 }
 
-fn normalized_observation_signals(
-    _catalog: &RepositoryCatalogSnapshot,
-    _cwd: &Path,
-    _workspace_roots: &[PathBuf],
-    _file_hints: &[PathBuf],
-    tool_name: &str,
+/// Maximum Active Prompt Signals one Task retains.
+///
+/// A Prompt Signal is an unreviewed clue, and a long Session submits many. Eight keeps the
+/// recent shape of what the user asked for without letting one Task's association tokens
+/// drift into a transcript.
+const MAX_ACTIVE_PROMPT_SIGNALS: usize = 8;
+
+/// Maximum Active file Signals (`Diff` plus `Workspace`) one Task retains.
+const MAX_ACTIVE_FILE_SIGNALS: usize = 16;
+
+/// Character ceiling for one stored Prompt Signal, applied after redaction.
+const MAX_PROMPT_SIGNAL_CHARS: usize = 512;
+
+fn prompt_signal_retention() -> Vec<SignalRetentionRule> {
+    vec![SignalRetentionRule {
+        kinds: vec![TaskSignalKind::Prompt],
+        max_active: MAX_ACTIVE_PROMPT_SIGNALS,
+    }]
+}
+
+/// `Diff` and `Workspace` share one budget: both describe files this Task touched, and a Task
+/// that reads twenty files and edits twenty more should not keep forty locating clues alive.
+fn file_signal_retention() -> Vec<SignalRetentionRule> {
+    vec![SignalRetentionRule {
+        kinds: vec![TaskSignalKind::Diff, TaskSignalKind::Workspace],
+        max_active: MAX_ACTIVE_FILE_SIGNALS,
+    }]
+}
+
+/// What one `PromptSubmit` did with the Prompt it carried.
+enum PromptSignalOutcome {
+    /// Attached to the `ActiveTask`; `retired` Prompts were superseded to make room.
+    Recorded { retired: usize },
+    /// Held until this Session declares a Task; `pending` is how many are now held.
+    Stashed { pending: usize },
+    /// Nothing to hold: no Runtime database, no Task, an empty Prompt after redaction, a slash
+    /// command, or a stash already at its ceiling. The reason is the telemetry reason string.
+    Skipped(&'static str),
+}
+
+/// Records one Prompt Signal, or holds it until this Session has a Task to attach it to.
+///
+/// Three properties are load-bearing and are why this never returns an error to the caller:
+///
+/// * It never creates Task state. No `ActiveTask` still means no Task, no Intent revision, and no
+///   change to the Intent bootstrap reminder — a Prompt is a clue about work, never a reason to
+///   invent a Task. What it may now do is hold the Prompt in a table with no foreign key, so the
+///   one sentence that states what a Session is for survives until `task_intent_update` arrives.
+///   That sentence was previously lost by construction: the Prompt that defines the work is
+///   always submitted before the Task that would hold it exists.
+/// * It never stores text it did not scan. The Prompt is redacted first and truncated second, so
+///   a secret cannot survive by sitting past the character ceiling; a Prompt too large for the
+///   scanner is dropped rather than stored unscanned. The stash stores exactly the same scanned,
+///   truncated text a Signal would have stored.
+/// * It is invisible to the model. Both vendors encode `PromptSubmit` as an empty object, and a
+///   failure here must not change that, so every fault is sent to Hook telemetry and swallowed
+///   instead of becoming a `systemMessage`.
+fn record_prompt_signal(
+    locator: &ExternalSessionLocator,
+    prompt: &str,
+    recorder: &HookEventRecorder,
+) {
+    let outcome = || -> Result<PromptSignalOutcome> {
+        let root = installation_root()?;
+        // No Task Runtime database means no `ActiveTask` can exist yet, and creating one here is
+        // exactly what this must not do: activation alone must never fabricate Task state, and a
+        // Prompt must never be the event that first writes `runtime.sqlite`. The common case — a
+        // Session whose user has not called `task_intent_update` yet, on an installation that has
+        // run before — still reaches the stash, because that database already exists.
+        if !root.join("state").join("runtime.sqlite").is_file() {
+            return Ok(PromptSignalOutcome::Skipped(
+                "prompt_signal_skipped_no_task",
+            ));
+        }
+        let Some(content) = redacted_prompt_signal_content(prompt)? else {
+            return Ok(PromptSignalOutcome::Skipped("prompt_signal_skipped_empty"));
+        };
+        let runtime = TaskRuntime::initialize_for_hook(&root)?;
+        let Some(active) = runtime.read_snapshot_by_locator(locator)? else {
+            // A slash command names a tool, not a task. `/sctx-review` says nothing about what
+            // this Session is for, and the stash holds two Prompts: one of them must not be spent
+            // on a command word. A Prompt that merely *starts* with a path is not a command --
+            // the token after the slash has to read like a command name.
+            if is_slash_command(prompt) {
+                return Ok(PromptSignalOutcome::Skipped(
+                    "prompt_signal_skipped_slash_command",
+                ));
+            }
+            return Ok(match runtime.stash_pending_prompt(locator, &content)? {
+                PendingPromptOutcome::Stashed { pending } => {
+                    PromptSignalOutcome::Stashed { pending }
+                }
+                PendingPromptOutcome::AlreadyPending => {
+                    PromptSignalOutcome::Skipped("prompt_signal_already_pending")
+                }
+                PendingPromptOutcome::Full => {
+                    PromptSignalOutcome::Skipped("prompt_signal_pending_full")
+                }
+            });
+        };
+        let signals = unrecorded_signals(
+            &active,
+            vec![TaskSignal {
+                kind: TaskSignalKind::Prompt,
+                content,
+            }],
+        );
+        if signals.is_empty() {
+            return Ok(PromptSignalOutcome::Recorded { retired: 0 });
+        }
+        let merged =
+            runtime.merge_hook_signals_by_locator(locator, signals, &prompt_signal_retention())?;
+        Ok(merged.map_or(
+            PromptSignalOutcome::Skipped("prompt_signal_skipped_no_task"),
+            |merged| PromptSignalOutcome::Recorded {
+                retired: merged.retired,
+            },
+        ))
+    }();
+    match outcome {
+        Ok(PromptSignalOutcome::Recorded { retired }) => recorder.note_completion(
+            "prompt_signal_recorded",
+            Some(truncate_hook_detail(&format!("retired={retired}"))),
+        ),
+        Ok(PromptSignalOutcome::Stashed { pending }) => recorder.note_completion(
+            "prompt_signal_stashed",
+            Some(truncate_hook_detail(&format!("pending={pending}"))),
+        ),
+        Ok(PromptSignalOutcome::Skipped(reason)) => recorder.note_completion(reason, None),
+        Err(error) => recorder.flush(
+            HookEventDecision::FailOpen,
+            "signal_write_failed",
+            Some(truncate_hook_detail(error.message())),
+        ),
+    }
+}
+
+/// Whether one Prompt is a host slash command rather than a statement of work.
+///
+/// The shape test is deliberate about what it excludes. The first token after the slash must be a
+/// command name — letters, digits, `-` and `_` and nothing else — so `/sctx-review` and
+/// `/compact now` are commands while `/Users/me/project/notes.md is the plan` is not: a path
+/// carries further separators inside that token and fails the test.
+fn is_slash_command(prompt: &str) -> bool {
+    let Some(rest) = prompt.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let name = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([',', '.', ':', ';', '!', '?']);
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// Drops Signals this Task already carries as Active, so an unchanged observation never opens a
+/// write transaction.
+///
+/// The merge itself is already idempotent, but idempotence inside a transaction still costs the
+/// write lock, and a Session that reads the same file in a loop would serialize every Hook
+/// process behind one. The snapshot this filters against was read on the way in, so the check is
+/// free; a concurrent insert that races it is still deduplicated inside the transaction.
+fn unrecorded_signals(active: &TaskSessionSnapshot, signals: Vec<TaskSignal>) -> Vec<TaskSignal> {
+    signals
+        .into_iter()
+        .filter(|signal| !active.task_signals.contains(signal))
+        .collect()
+}
+
+/// Redacts, then truncates, one Prompt into storable Signal content.
+///
+/// `None` means there is nothing safe and non-empty left to store. An oversized Prompt the
+/// scanner refuses is an error, not a `None`: the caller must not silently treat unscanned text
+/// as clean.
+fn redacted_prompt_signal_content(prompt: &str) -> Result<Option<String>> {
+    let redacted = PrivacyScanner::default().redact(prompt)?;
+    let content = redacted
+        .text
+        .chars()
+        .take(MAX_PROMPT_SIGNAL_CHARS)
+        .collect::<String>();
+    let content = content.trim().to_owned();
+    Ok((!content.is_empty()).then_some(content))
+}
+
+/// Derives this event's Signals from the structured, already attributed observation.
+///
+/// Every path here has already been resolved against the Catalog by
+/// [`attribute_post_tool_action`], so a file Signal names a registered Repository and a path
+/// relative to its checkout — never an absolute path from the user's machine. No raw command,
+/// tool input value, or tool output participates.
+fn normalized_tool_signals(
+    catalog: &RepositoryCatalogSnapshot,
+    file_hints: &[PathBuf],
+    tool_category: ToolCategory,
+    file_access: Option<FileAccess>,
     outcome: ToolOutcome,
-) -> Vec<TaskSignal> {
+) -> Result<Vec<TaskSignal>> {
     let mut signals = Vec::new();
-    if is_test_tool(tool_name) {
+    if tool_category == ToolCategory::TestRunner {
         let test_outcome = format!(
-            "{} {}",
-            tool_name.trim(),
+            "test runner {}",
             match outcome {
                 ToolOutcome::Succeeded => "succeeded",
                 ToolOutcome::Failed => "failed",
@@ -1006,14 +3125,39 @@ fn normalized_observation_signals(
         );
         push_signal(&mut signals, TaskSignalKind::TestOutcome, &test_outcome);
     }
-    signals
+    // A file the Agent rewrote states far more about this Task than a file it read, so the two
+    // become different kinds. Retrieval consumes `Diff` today and `Workspace` is carried for the
+    // locating channel that will consume it; both stay clues, never Evidence.
+    // A shell command names the files it mentioned without ever saying whether it read or
+    // rewrote them, so it settles for the same weaker kind a read gets — never `Diff`.
+    let kind = match (file_access, tool_category) {
+        (Some(FileAccess::Modify), _) => TaskSignalKind::Diff,
+        (Some(FileAccess::Read), _) | (None, ToolCategory::Shell) => TaskSignalKind::Workspace,
+        (None, _) => return Ok(signals),
+    };
+    for file in file_hints {
+        if let Some(content) = repository_relative_signal_content(catalog, file)? {
+            push_signal(&mut signals, kind, &content);
+        }
+    }
+    Ok(signals)
 }
 
-fn is_test_tool(tool_name: &str) -> bool {
-    let name = tool_name.trim().to_ascii_lowercase();
-    ["test", "check", "lint"]
-        .iter()
-        .any(|word| name.contains(word))
+/// Renders one attributed file as `<RepositoryId>:<checkout-relative path>`.
+fn repository_relative_signal_content(
+    catalog: &RepositoryCatalogSnapshot,
+    file: &Path,
+) -> Result<Option<String>> {
+    let Some((repository_id, checkout_path)) = catalog.deepest_checkout_for(file)? else {
+        return Ok(None);
+    };
+    let Ok(relative) = file.strip_prefix(&checkout_path) else {
+        return Ok(None);
+    };
+    Ok(relative
+        .to_str()
+        .filter(|relative| !relative.is_empty())
+        .map(|relative| format!("{repository_id}:{relative}")))
 }
 
 fn push_signal(signals: &mut Vec<TaskSignal>, kind: TaskSignalKind, content: &str) {
@@ -1026,8 +3170,20 @@ fn push_signal(signals: &mut Vec<TaskSignal>, kind: TaskSignalKind, content: &st
     }
 }
 
+/// Probes the Agent that actually runs the Hook.
+///
+/// Cursor ships two executables: the Hook-running CLI `cursor-agent` (date-like build ids such as
+/// `2026.08.25-3e8eec8`) and the desktop shim `cursor` (semver). Probe `cursor-agent` first so the
+/// reported version belongs to the Hook host; fall back to the shim only when it is absent. The
+/// value is informational and never gates capabilities.
 fn detect_agent_version(agent: &str) -> Option<String> {
-    let executable = if agent == "cursor" { "cursor" } else { "codex" };
+    if agent == "cursor" {
+        return agent_version_output("cursor-agent").or_else(|| agent_version_output("cursor"));
+    }
+    agent_version_output("codex")
+}
+
+fn agent_version_output(executable: &str) -> Option<String> {
     let mut child = Command::new(executable)
         .arg("--version")
         .stdout(Stdio::piped())
@@ -1107,7 +3263,7 @@ impl Runtime {
     }
 
     fn open_at(root: &Path) -> Result<Self> {
-        let base_store = GitStore::initialize(root)?;
+        let base_store = GitStore::open_existing(root)?;
         let index = ProjectionIndex::for_store(&base_store);
         let store = base_store
             .with_candidate_submission_index(Arc::new(index.clone()))
@@ -1216,8 +3372,11 @@ fn run_space(args: &[String], json_output: bool) -> Result<()> {
                         .filter_map(|id| space.intent.revisions.get(id))
                         .map(|revision| revision.intent.title.clone())
                         .collect::<Vec<_>>();
+                    // A conflicted Space has no winning head, so it never reports provisional.
+                    let provisional = sctx_domain::space_is_provisional(space);
                     json!({"space_id": space.space_id, "intent_heads": space.intent.heads,
-                           "titles": titles, "context_count": space.contexts.len()})
+                           "titles": titles, "context_count": space.contexts.len(),
+                           "provisional": provisional})
                 })
                 .collect::<Vec<_>>();
             emit(
@@ -1257,27 +3416,31 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "list" => {
             if is_help(rest) {
                 println!(
-                    "Usage: sctx candidate list --agent-kind <KIND> --external-session-id <ID> [--status pending|discarded|expired|confirmed] [--limit <N>] [--cursor <CURSOR>] [--token-budget <N>]"
+                    "Usage: sctx candidate list --agent-kind <KIND> --external-session-id <ID> [--status pending|discarded|expired|confirmed] [--limit <N>] [--cursor <CURSOR>] [--token-budget <N>] [--compact]"
                 );
                 return Ok(());
             }
-            let options = Options::parse(rest, &[])?;
+            let options = Options::parse(rest, &["--compact"])?;
             options.allow_only(
                 &[
                     "--agent-kind",
                     "--external-session-id",
                     "--status",
+                    "--scope",
                     "--limit",
                     "--cursor",
                     "--token-budget",
                 ],
-                &[],
+                &["--compact"],
             )?;
             let input = CandidateListInput {
                 agent_kind: options.required("--agent-kind")?.to_owned(),
                 external_session_id: options.required("--external-session-id")?.to_owned(),
                 status: parse_candidate_review_status(
                     options.optional("--status")?.unwrap_or("pending"),
+                )?,
+                scope: parse_candidate_review_scope(
+                    options.optional("--scope")?.unwrap_or("task"),
                 )?,
                 limit: parse_usize(options.optional("--limit")?.unwrap_or("20"), "limit")?,
                 cursor: options.optional("--cursor")?.map(str::to_owned),
@@ -1286,15 +3449,26 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                     "token budget",
                 )?,
             };
-            let response = sctx_mcp::candidate_list_at_root(installation_root()?, &input)?;
+            // `--compact` mirrors the MCP `detail_level: "compact"` selector: the Full Rust entry
+            // point stays the default so existing behavior is unchanged when the flag is absent.
+            let detail_level = if options.has("--compact") {
+                ContextPackDetailLevel::Compact
+            } else {
+                ContextPackDetailLevel::Full
+            };
+            let response = sctx_mcp::candidate_list_with_detail_at_root(
+                installation_root()?,
+                &input,
+                detail_level,
+            )?;
             let metadata = Runtime::open()?.index.synchronize()?.metadata;
-            emit(
-                "candidate.list",
-                &metadata,
-                serde_json::to_value(response)
+            let data = match detail_level {
+                ContextPackDetailLevel::Compact => serde_json::to_value(response.compact())
+                    .map_err(json_error("serialize compact Candidate Review list"))?,
+                ContextPackDetailLevel::Full => serde_json::to_value(response)
                     .map_err(json_error("serialize Candidate Review list"))?,
-                json_output,
-            )
+            };
+            emit("candidate.list", &metadata, data, json_output)
         }
         [command, rest @ ..] if command == "get" => {
             if is_help(rest) {
@@ -1325,7 +3499,7 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
         [command, rest @ ..] if command == "discard" => {
             if is_help(rest) {
                 println!(
-                    "Usage: sctx candidate discard --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --candidate-id <ID> --expected-review-version <N> --reason <TEXT>"
+                    "Usage: sctx candidate discard --agent-kind <KIND> --external-session-id <ID> --expected-task-id <ID> --expected-intent-revision-id <ID> --candidate-id <ID> [--candidate-id <ID> ...] --expected-review-version <N> --reason <TEXT>\n  (repeat --candidate-id to discard several owned Pending Candidates atomically)"
                 );
                 return Ok(());
             }
@@ -1342,48 +3516,117 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 ],
                 &[],
             )?;
-            let input = CandidateDiscardInput {
-                agent_kind: options.required("--agent-kind")?.to_owned(),
-                external_session_id: options.required("--external-session-id")?.to_owned(),
-                expected_task_id: options.required("--expected-task-id")?.to_owned(),
-                expected_intent_revision_id: options
-                    .required("--expected-intent-revision-id")?
-                    .to_owned(),
-                candidate_id: options.required("--candidate-id")?.to_owned(),
-                expected_review_version: parse_u64(
-                    options.required("--expected-review-version")?,
-                    "expected Review version",
-                )?,
-                reason: options.required("--reason")?.to_owned(),
-            };
-            let response = sctx_mcp::candidate_discard_at_root(installation_root()?, &input)?;
-            let metadata = Runtime::open()?.index.synchronize()?.metadata;
-            emit(
-                "candidate.discard",
-                &metadata,
-                serde_json::to_value(response)
-                    .map_err(json_error("serialize Candidate discard response"))?,
-                json_output,
-            )
+            let candidate_ids = strings(options.many("--candidate-id"));
+            if candidate_ids.is_empty() {
+                return Err(invalid("missing required option --candidate-id"));
+            }
+            let agent_kind = options.required("--agent-kind")?.to_owned();
+            let external_session_id = options.required("--external-session-id")?.to_owned();
+            let expected_task_id = options.required("--expected-task-id")?.to_owned();
+            let expected_intent_revision_id = options
+                .required("--expected-intent-revision-id")?
+                .to_owned();
+            let expected_review_version = parse_u64(
+                options.required("--expected-review-version")?,
+                "expected Review version",
+            )?;
+            let reason = options.required("--reason")?.to_owned();
+            if let [candidate_id] = candidate_ids.as_slice() {
+                let input = CandidateDiscardInput {
+                    agent_kind,
+                    external_session_id,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    candidate_id: candidate_id.clone(),
+                    expected_review_version,
+                    reason,
+                    decision_source: DecisionSource::Human,
+                };
+                let response = sctx_mcp::candidate_discard_at_root(installation_root()?, &input)?;
+                let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                emit(
+                    "candidate.discard",
+                    &metadata,
+                    serde_json::to_value(response)
+                        .map_err(json_error("serialize Candidate discard response"))?,
+                    json_output,
+                )
+            } else {
+                let input = CandidateDiscardBatchInput {
+                    agent_kind,
+                    external_session_id,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    candidate_ids,
+                    expected_review_version,
+                    reason,
+                    decision_source: DecisionSource::Human,
+                };
+                let response =
+                    sctx_mcp::candidate_discard_batch_at_root(installation_root()?, &input)?;
+                let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                let mut data = serde_json::to_value(response)
+                    .map_err(json_error("serialize Candidate discard batch response"))?;
+                if let Value::Object(ref mut map) = data {
+                    map.insert("batch".to_owned(), Value::Bool(true));
+                }
+                emit("candidate.discard", &metadata, data, json_output)
+            }
         }
         [command, rest @ ..] if command == "confirm" => {
             if is_help(rest) {
-                println!("Usage: sctx candidate confirm --input <JSON_FILE>");
+                println!(
+                    "Usage: sctx candidate confirm --input <JSON_FILE>\n  (JSON with candidate_ids confirms several owned Pending Candidates atomically; candidate_id confirms one)"
+                );
                 return Ok(());
             }
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--input"], &[])?;
-            let input: CandidateConfirmInput =
-                read_json(options.required("--input")?, "Candidate Confirmation input")?;
-            let response = sctx_mcp::candidate_confirm_at_root(installation_root()?, &input)?;
-            let metadata = Runtime::open()?.index.synchronize()?.metadata;
-            emit(
-                "candidate.confirm",
-                &metadata,
-                serde_json::to_value(response)
-                    .map_err(json_error("serialize Candidate Confirmation response"))?,
-                json_output,
-            )
+            let path = options.required("--input")?;
+            let raw: Value = read_json(path, "Candidate Confirmation input")?;
+            let has_single = raw.get("candidate_id").is_some();
+            let has_batch = raw.get("candidate_ids").is_some();
+            match (has_single, has_batch) {
+                (true, false) => {
+                    let input: CandidateConfirmInput =
+                        serde_json::from_value(raw).map_err(|error| {
+                            invalid(format!(
+                                "invalid Candidate Confirmation input JSON in {path}: {error}"
+                            ))
+                        })?;
+                    let response =
+                        sctx_mcp::candidate_confirm_at_root(installation_root()?, &input)?;
+                    let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                    emit(
+                        "candidate.confirm",
+                        &metadata,
+                        serde_json::to_value(response)
+                            .map_err(json_error("serialize Candidate Confirmation response"))?,
+                        json_output,
+                    )
+                }
+                (false, true) => {
+                    let input: CandidateConfirmBatchInput =
+                        serde_json::from_value(raw).map_err(|error| {
+                            invalid(format!(
+                                "invalid Candidate Confirmation batch input JSON in {path}: {error}"
+                            ))
+                        })?;
+                    let response =
+                        sctx_mcp::candidate_confirm_batch_at_root(installation_root()?, &input)?;
+                    let metadata = Runtime::open()?.index.synchronize()?.metadata;
+                    let mut data = serde_json::to_value(response).map_err(json_error(
+                        "serialize Candidate Confirmation batch response",
+                    ))?;
+                    if let Value::Object(ref mut map) = data {
+                        map.insert("batch".to_owned(), Value::Bool(true));
+                    }
+                    emit("candidate.confirm", &metadata, data, json_output)
+                }
+                _ => Err(invalid(
+                    "Candidate Confirmation input must include exactly one of candidate_id or candidate_ids",
+                )),
+            }
         }
         [command, rest @ ..] if command == "analyze" => {
             if is_help(rest) {
@@ -1432,8 +3675,9 @@ fn run_candidate(args: &[String], json_output: bool) -> Result<()> {
                 json_output,
             )
         }
+        [command, rest @ ..] if command == "stats" => run_candidate_stats(rest, json_output),
         _ => Err(invalid(format!(
-            "invalid candidate command; expected list|get|discard|confirm|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
+            "invalid candidate command; expected list|get|discard|confirm|stats|build-closed-episode|analyze\n\n{CONTEXT_WRITE_HELP}"
         ))),
     }
 }
@@ -1463,6 +3707,7 @@ fn run_context(args: &[String], json_output: bool) -> Result<()> {
                 &context.revision_heads,
                 &parents.iter().copied().collect(),
             )?;
+            validate_context_relation_targets(&snapshot.projection, context_id, &draft)?;
             let event = Event::context_revised(space_id, context_id, parents, draft, None)?;
             let (_, revision_id) = context_identity(&event);
             let event_id = event.event_id();
@@ -1481,7 +3726,14 @@ fn run_context(args: &[String], json_output: bool) -> Result<()> {
             run_publication(rest, PublicationAction::Publish, json_output)
         }
         [command, rest @ ..] if command == "withdraw" => {
-            run_publication(rest, PublicationAction::Withdraw, json_output)
+            // One `withdraw` with two selectors. The single-Context form is unchanged; naming
+            // `--decision-source` switches to the batch form, which reverses a whole class of
+            // automatic acceptances at once — the reversal path ADR-0005 requires.
+            if rest.iter().any(|argument| argument == "--decision-source") {
+                run_withdraw_by_disposition(rest, json_output)
+            } else {
+                run_publication(rest, PublicationAction::Withdraw, json_output)
+            }
         }
         [command, rest @ ..] if command == "get" => {
             let options = Options::parse(rest, &[])?;
@@ -1668,6 +3920,209 @@ fn run_publication(args: &[String], action: PublicationAction, json_output: bool
                "batch_id": append.batch_id, "commit_oid": append.commit_oid}),
         json_output,
     )
+}
+
+const WITHDRAW_BY_DISPOSITION_HELP: &str = r"Usage:
+  sctx context withdraw --decision-source human|agent_policy
+      [--external-session <XSS_ID>] [--dry-run]
+
+Withdraws every accepted Context this installation confirmed under the given disposition.
+Each Context is withdrawn through the ordinary Publication event path, one append at a time:
+nothing already written is modified, and a Context whose current Publication Head no longer
+selects an accepted revision is reported as skipped rather than forced.
+
+The selector is answered from this machine's local runtime, which knows what this installation
+decided. A Context confirmed on another machine is not in it and is never touched.
+";
+
+/// Reverses a whole class of Candidate dispositions, one ordinary withdrawal at a time.
+///
+/// The Contexts are selected from the local Runtime, because `decision_source` is provenance this
+/// installation recorded about its own decisions. Each withdrawal is then an ordinary
+/// `context.publication_changed` append: the batch is a selector over an existing operation, not a
+/// new kind of write, so a partial failure leaves every already-withdrawn Context withdrawn and
+/// names the one that stopped it.
+fn run_withdraw_by_disposition(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        print!("{WITHDRAW_BY_DISPOSITION_HELP}");
+        return Ok(());
+    }
+    let options = Options::parse(args, &["--dry-run"])?;
+    options.allow_only(&["--decision-source", "--external-session"], &["--dry-run"])?;
+    let decision_source = DecisionSource::parse(options.required("--decision-source")?)?;
+    let external_session_id = options
+        .optional("--external-session")?
+        .map(|value| parse_id(value, "ExternalSession ID"))
+        .transpose()?;
+    let dry_run = options.has("--dry-run");
+
+    let root = installation_root()?;
+    let tasks = TaskRuntime::initialize(&root)?;
+    let selected = tasks.list_confirmed_dispositions(Some(decision_source), external_session_id)?;
+    let runtime = Runtime::open_at(&root)?;
+    let snapshot = runtime.domain_snapshot()?;
+
+    let mut planned = Vec::new();
+    let mut skipped = Vec::new();
+    for disposition in &selected {
+        match locate_withdrawable(&snapshot.projection, disposition.result_context_id) {
+            Some(target) => planned.push(target),
+            None => skipped.push(json!({
+                "context_id": disposition.result_context_id,
+                "candidate_id": disposition.candidate_id,
+                "reason": "no accepted Publication Head selects a revision to withdraw; it is already withdrawn, unpublished, or in governance conflict",
+            })),
+        }
+    }
+
+    if dry_run {
+        return emit(
+            "context.withdraw.batch",
+            &snapshot.metadata,
+            json!({
+                "decision_source": decision_source.as_str(),
+                "dry_run": true,
+                "selected": selected.len(),
+                "planned": planned.iter().map(withdrawal_json).collect::<Vec<_>>(),
+                "skipped": skipped,
+            }),
+            json_output,
+        );
+    }
+
+    let mut withdrawn = Vec::new();
+    let mut metadata = snapshot.metadata;
+    for target in &planned {
+        let event = Event::publication_changed(
+            target.space_id,
+            target.context_id,
+            PublicationDraft {
+                previous_publication_ids: target.previous_publication_ids.clone(),
+                action: PublicationAction::Withdraw,
+                revision_id: target.revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )?;
+        let event_id = event.event_id();
+        let (append, appended) = runtime.append(event)?;
+        metadata = appended;
+        let mut entry = withdrawal_json(target);
+        entry["event_id"] = json!(event_id);
+        entry["batch_id"] = json!(append.batch_id);
+        entry["commit_oid"] = json!(append.commit_oid);
+        withdrawn.push(entry);
+    }
+    emit(
+        "context.withdraw.batch",
+        &metadata,
+        json!({
+            "decision_source": decision_source.as_str(),
+            "dry_run": false,
+            "selected": selected.len(),
+            "withdrawn": withdrawn,
+            "skipped": skipped,
+        }),
+        json_output,
+    )
+}
+
+/// One accepted Context resolved to everything an ordinary withdrawal needs.
+struct WithdrawalTarget {
+    space_id: SpaceId,
+    context_id: ContextId,
+    revision_id: RevisionId,
+    previous_publication_ids: Vec<PublicationId>,
+}
+
+fn withdrawal_json(target: &WithdrawalTarget) -> Value {
+    json!({
+        "space_id": target.space_id,
+        "context_id": target.context_id,
+        "revision_id": target.revision_id,
+    })
+}
+
+/// Finds the Space and revision one accepted Context would be withdrawn from.
+///
+/// Only an `Accepted` Context is a target. `Deprecated` is what a withdrawal already produced, so
+/// selecting it would append a second withdrawal of something already withdrawn and make re-running
+/// the selector grow history for no change; `Unpublished` and a governance conflict are exactly the
+/// cases the single-Context `withdraw` refuses, and a batch must not do quietly what the explicit
+/// command refuses to do at all. Anything skipped is reported, never silently dropped.
+fn locate_withdrawable(
+    projection: &DomainProjection,
+    context_id: ContextId,
+) -> Option<WithdrawalTarget> {
+    projection.spaces.iter().find_map(|(space_id, space)| {
+        let context = space.contexts.get(&context_id)?;
+        let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance else {
+            return None;
+        };
+        Some(WithdrawalTarget {
+            space_id: *space_id,
+            context_id,
+            revision_id,
+            previous_publication_ids: context.publication_heads.iter().copied().collect(),
+        })
+    })
+}
+
+fn run_recall(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        println!("Usage: sctx recall stats");
+        return Ok(());
+    }
+    let [command, rest @ ..] = args else {
+        return Err(invalid("Usage: sctx recall stats"));
+    };
+    if command != "stats" {
+        return Err(invalid("Usage: sctx recall stats"));
+    }
+    if is_help(rest) {
+        println!("Usage: sctx recall stats");
+        return Ok(());
+    }
+    let options = Options::parse(rest, &[])?;
+    options.allow_only(&[], &[])?;
+    let stats = sctx_task_runtime::recall_stats::read_recall_stats(installation_root()?)?;
+    emit_lifecycle(
+        &json!({"command": "recall.stats", "data": stats}),
+        json_output,
+    )
+}
+
+/// Reports this installation's own disposition totals, grouped by who decided them.
+fn run_candidate_stats(args: &[String], json_output: bool) -> Result<()> {
+    if is_help(args) {
+        println!("Usage: sctx candidate stats");
+        return Ok(());
+    }
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let root = installation_root()?;
+    let stats = TaskRuntime::initialize(&root)?.candidate_disposition_stats()?;
+    let data = json!({
+        "human": {
+            "confirmed": stats.human.confirmed,
+            "discarded": stats.human.discarded,
+        },
+        "agent_policy": {
+            "confirmed": stats.agent_policy.confirmed,
+            "discarded": stats.agent_policy.discarded,
+        },
+        "relation_decisions": stats.relation_decisions.iter().map(|group| json!({
+            "top_relation": group.top_relation,
+            "decision_source": group.decision_source,
+            "confirmed": group.counts.confirmed,
+            "discarded": group.counts.discarded,
+        })).collect::<Vec<_>>(),
+        "auto_confirm_not_permitted": stats.auto_confirm_not_permitted,
+    });
+    // The counts are Runtime-only, but the envelope stays the one every `candidate` command
+    // shares, so a caller reads one shape across the group.
+    let metadata = Runtime::open_at(&root)?.index.synchronize()?.metadata;
+    emit("candidate.stats", &metadata, data, json_output)
 }
 
 fn run_semantic(args: &[String], json_output: bool) -> Result<()> {
@@ -1864,8 +4319,8 @@ fn run_conflict_resolve(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_search(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &[])?;
-    allow_search_options(&options, &[])?;
+    let options = Options::parse(args, &["--exact"])?;
+    allow_search_options(&options, &["--exact"])?;
     let request = search_request(&options)?;
     let runtime = Runtime::open()?;
     let response = SearchEngine::new(runtime.index).search(&request)?;
@@ -1947,7 +4402,7 @@ fn run_task(args: &[String], json_output: bool) -> Result<()> {
 }
 
 fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
-    let options = Options::parse(args, &[])?;
+    let options = Options::parse(args, &["--compact"])?;
     options.allow_only(
         &[
             "--agent-kind",
@@ -1955,13 +4410,15 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
             "--token-budget",
             "--max-spaces",
         ],
-        &[],
+        &["--compact"],
     )?;
     let input = TaskContextReadInput {
         agent_kind: options.required("--agent-kind")?.to_owned(),
         external_session_id: options.required("--external-session-id")?.to_owned(),
+        // Mirrors `default_token_budget()` in `crates/mcp/src/lib.rs`; the two entry points read
+        // the same Pack and must not disagree about how much of it the caller gets.
         token_budget: parse_usize(
-            options.optional("--token-budget")?.unwrap_or("2000"),
+            options.optional("--token-budget")?.unwrap_or("8000"),
             "token budget",
         )?,
         max_spaces: parse_usize(
@@ -1969,22 +4426,38 @@ fn run_task_context(args: &[String], json_output: bool) -> Result<()> {
             "max spaces",
         )?,
     };
-    let response = sctx_mcp::task_context_readonly_at_root(installation_root()?, &input)?;
-    let data =
-        serde_json::to_value(&response).map_err(json_error("serialize Task Context response"))?;
-    emit_raw(
-        "task.context",
-        &response.tree,
-        response.generation,
-        &data,
-        json_output,
-    )
+    // `--compact` mirrors the MCP `detail_level: "compact"` selector: the Full Rust entry point
+    // stays the default so existing behavior is unchanged when the flag is absent.
+    let detail_level = if options.has("--compact") {
+        ContextPackDetailLevel::Compact
+    } else {
+        ContextPackDetailLevel::Full
+    };
+    let response = sctx_mcp::task_context_readonly_with_detail_at_root(
+        installation_root()?,
+        &input,
+        detail_level,
+    )?;
+    let (tree, generation, data) = match detail_level {
+        ContextPackDetailLevel::Compact => {
+            let compact = response.compact();
+            let data = serde_json::to_value(&compact)
+                .map_err(json_error("serialize compact Task Context response"))?;
+            (compact.tree.clone(), compact.generation, data)
+        }
+        ContextPackDetailLevel::Full => {
+            let data = serde_json::to_value(&response)
+                .map_err(json_error("serialize Task Context response"))?;
+            (response.tree.clone(), response.generation, data)
+        }
+    };
+    emit_raw("task.context", &tree, generation, &data, json_output)
 }
 
 fn run_repository(args: &[String], json_output: bool) -> Result<()> {
     let [command, rest @ ..] = args else {
         return Err(invalid(
-            "Usage: sctx repository add|list|doctor|scan [OPTIONS]",
+            "Usage: sctx repository add|list|doctor|rename|scan [OPTIONS]",
         ));
     };
     let root = installation_root()?;
@@ -1992,10 +4465,8 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
         "add" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--repository-id", "--path"], &[])?;
-            let repository_id = options
-                .optional("--repository-id")?
-                .map(|value| parse_id::<RepositoryId>(value, "Repository ID"))
-                .transpose()?;
+            let repository_id =
+                parse_id::<RepositoryId>(options.required("--repository-id")?, "Repository ID")?;
             let paths = options
                 .many("--path")
                 .into_iter()
@@ -2004,50 +4475,22 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             let outcome =
                 UserConfigStore::initialize(&root)?.add_repository(repository_id, &paths)?;
             let sync = sctx_mcp::sync_repository_catalog_at_root(&root)?;
+            // A Repository nothing ever scanned is indistinguishable from a broken one: every
+            // Reference naming it resolves against "not registered" until somebody happens to run
+            // a rebuild. Registration is explicit and a person is watching it, so it pays for the
+            // first read here rather than leaving the Graph dark and silent about why.
+            let first_scan = sctx_mcp::repository_first_scan_at_root(&root)?;
             let metadata = repository_command_metadata(&root)?;
             emit(
                 "repository.add",
                 &metadata,
-                json!({"catalog": outcome, "registry": sync}),
+                json!({"catalog": outcome, "registry": sync, "first_scan": first_scan}),
                 json_output,
             )
         }
-        "list" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&[], &[])?;
-            let config = UserConfigStore::initialize(&root)?;
-            let catalog = config.repository_catalog()?;
-            let sync = sctx_mcp::sync_repository_catalog_at_root(&root)?;
-            let metadata = repository_command_metadata(&root)?;
-            emit(
-                "repository.list",
-                &metadata,
-                json!({"repositories": catalog.repositories, "registry": sync}),
-                json_output,
-            )
-        }
-        "doctor" => {
-            let options = Options::parse(rest, &[])?;
-            options.allow_only(&[], &[])?;
-            let config = UserConfigStore::initialize(&root)?;
-            let report = config.doctor_repository_catalog()?;
-            let syncable = report.checkouts.iter().all(|checkout| {
-                matches!(
-                    checkout.status,
-                    CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
-                )
-            });
-            let sync = syncable
-                .then(|| sctx_mcp::sync_repository_catalog_at_root(&root))
-                .transpose()?;
-            let metadata = repository_command_metadata(&root)?;
-            emit(
-                "repository.doctor",
-                &metadata,
-                json!({"catalog": report, "registry": sync}),
-                json_output,
-            )
-        }
+        "list" => run_repository_list(rest, json_output, &root),
+        "doctor" => run_repository_doctor(rest, json_output, &root),
+        "rename" => run_repository_rename(rest, json_output, &root),
         "scan" => {
             let options = Options::parse(rest, &[])?;
             options.allow_only(&["--checkout-path", "--path", "--max-artifacts"], &[])?;
@@ -2075,14 +4518,115 @@ fn run_repository(args: &[String], json_output: bool) -> Result<()> {
             )
         }
         _ => Err(invalid(
-            "repository command must be add, list, doctor, or scan",
+            "repository command must be add, list, doctor, rename, or scan",
         )),
     }
 }
 
+fn run_repository_list(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let catalog = UserConfigStore::open_existing(root)?.inspect_repository_catalog()?;
+    let sync = sctx_mcp::sync_repository_catalog_at_root(root)?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.list",
+        &metadata,
+        json!({
+            "repositories": catalog.repositories,
+            "activation": catalog.activation,
+            "registry": sync,
+        }),
+        json_output,
+    )
+}
+
+fn run_repository_doctor(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&[], &[])?;
+    let report = UserConfigStore::open_existing(root)?.doctor_repository_catalog()?;
+    let syncable = report.checkouts.iter().all(|checkout| {
+        matches!(
+            checkout.status,
+            CatalogCheckoutStatus::Available | CatalogCheckoutStatus::Missing
+        )
+    });
+    let sync = syncable
+        .then(|| sctx_mcp::sync_repository_catalog_at_root(root))
+        .transpose()?;
+    let legacy_engineering_reference_counts =
+        legacy_repository_engineering_reference_counts(root, &report.diagnostics)?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.doctor",
+        &metadata,
+        json!({
+            "catalog": report,
+            "registry": sync,
+            "legacy_repository_engineering_reference_counts": legacy_engineering_reference_counts,
+        }),
+        json_output,
+    )
+}
+
+/// Counts, per legacy (pre-ADR-0001) `RepositoryId`, how many locally indexed
+/// `EngineeringReference` events still name it. This is informational only: it
+/// never rewrites Git history and a missing/uninitialized Store simply reports
+/// zero counts rather than failing `sctx repository doctor`.
+fn legacy_repository_engineering_reference_counts(
+    root: &Path,
+    diagnostics: &[RepositoryCatalogDiagnostic],
+) -> Result<BTreeMap<String, usize>> {
+    let mut counts = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let RepositoryCatalogDiagnostic::LegacyRepositoryId { repository_id, .. } = diagnostic;
+            (repository_id.to_string(), 0usize)
+        })
+        .collect::<BTreeMap<_, _>>();
+    if counts.is_empty() || !root.join("repository").exists() {
+        return Ok(counts);
+    }
+    let projection =
+        ProjectionIndex::new(root.join("repository"), root.join("state")).domain_snapshot()?;
+    for reference in projection.projection.engineering_references.values() {
+        if let Some(count) = counts.get_mut(reference.reference.repository_id.as_str()) {
+            *count += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn run_repository_rename(args: &[String], json_output: bool, root: &Path) -> Result<()> {
+    let options = Options::parse(args, &[])?;
+    options.allow_only(&["--from", "--to"], &[])?;
+    let from = parse_id::<RepositoryId>(options.required("--from")?, "Repository ID")?;
+    let to = parse_id::<RepositoryId>(options.required("--to")?, "Repository ID")?;
+    let outcome = UserConfigStore::open_existing(root)?.rename_repository(&from, &to)?;
+    let sync = sctx_mcp::sync_repository_catalog_at_root(root)?;
+    let metadata = repository_repair_command_metadata(root)?;
+    emit(
+        "repository.rename",
+        &metadata,
+        json!({"catalog": outcome, "registry": sync}),
+        json_output,
+    )
+}
+
 fn repository_command_metadata(root: &Path) -> Result<IndexMetadata> {
-    let store = GitStore::initialize(root)?;
+    let store = GitStore::open_existing(root)?;
     Ok(ProjectionIndex::for_store(&store).synchronize()?.metadata)
+}
+
+fn repository_repair_command_metadata(root: &Path) -> Result<IndexMetadata> {
+    if !root.join("repository").exists() {
+        return repository_command_metadata(root);
+    }
+    Ok(
+        ProjectionIndex::new(root.join("repository"), root.join("state"))
+            .synchronize()?
+            .metadata,
+    )
 }
 
 fn run_engineering_reference(args: &[String], json_output: bool) -> Result<()> {
@@ -2248,6 +4792,10 @@ struct ContextDraftInput {
     kind: ContextKind,
     #[serde(default)]
     topic_key: Option<String>,
+    /// Optional restatement of the problem this Context answers (WP-E1's
+    /// `ContextRevisionDraft::problem_view`), passed through verbatim when supplied.
+    #[serde(default)]
+    problem_view: Option<String>,
     statement: String,
     rationale: String,
     #[serde(default)]
@@ -2256,6 +4804,11 @@ struct ContextDraftInput {
     assumptions: Vec<String>,
     #[serde(default)]
     recheck_when: Vec<String>,
+    /// Unresolved locator hints (paths, basenames, identifiers) kept as searchable text only.
+    #[serde(default)]
+    hints: Vec<String>,
+    #[serde(default)]
+    relations: Vec<sctx_domain::ContextRelation>,
     evidence: Vec<EvidenceInput>,
 }
 
@@ -2275,12 +4828,14 @@ impl From<ContextDraftInput> for ContextRevisionDraft {
         Self {
             kind: input.kind,
             topic_key: input.topic_key,
+            problem_view: input.problem_view,
+            hints: input.hints,
             statement: input.statement,
             rationale: input.rationale,
             applicability: input.applicability,
             assumptions: input.assumptions,
             recheck_when: input.recheck_when,
-            relations: Vec::new(),
+            relations: input.relations,
             evidence: input.evidence.into_iter().map(Into::into).collect(),
         }
     }
@@ -2354,6 +4909,11 @@ fn context_draft(options: &Options) -> Result<ContextRevisionDraft> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(ContextRevisionDraft {
+        // The individual-flag form of `context revise` has no flag for a derived problem
+        // framing or unresolved locator hints; use `--input` with `problem_view`/`hints` to set
+        // them (WP-E1's `ContextRevisionDraft` fields).
+        problem_view: None,
+        hints: Vec::new(),
         kind: parse_kind(options.required("--kind")?)?,
         topic_key: options.optional("--topic-key")?.map(ToOwned::to_owned),
         statement: options.required("--statement")?.to_owned(),
@@ -2376,6 +4936,13 @@ fn applicability(options: &Options) -> Applicability {
 
 fn search_request(options: &Options) -> Result<SearchRequest> {
     Ok(SearchRequest {
+        // `--exact` keeps the strict all-token lookup; the default recalls a known fact that the
+        // caller phrased differently.
+        match_mode: if options.has("--exact") {
+            SearchMatchMode::Exact
+        } else {
+            SearchMatchMode::Ranked
+        },
         query: options.optional("--query")?.unwrap_or_default().to_owned(),
         filters: SearchFilters {
             space_ids: parse_many_ids(options, "--space-id", "space ID")?,
@@ -2450,7 +5017,7 @@ fn allow_search_options(options: &Options, extra: &[&str]) -> Result<()> {
     ];
     let mut switches = Vec::new();
     for option in extra {
-        if *option == "--automatic" {
+        if matches!(*option, "--automatic" | "--exact") {
             switches.push(*option);
         } else {
             allowed.push(*option);
@@ -2482,6 +5049,29 @@ fn require_context(
                 "Context {context_id} does not belong to Space {space_id}"
             ))
         })
+}
+
+fn validate_context_relation_targets(
+    projection: &DomainProjection,
+    source_context_id: ContextId,
+    draft: &ContextRevisionDraft,
+) -> Result<()> {
+    for relation in &draft.relations {
+        if relation.target_context_id == source_context_id {
+            return Err(invalid("Context Relation cannot target its source Context"));
+        }
+        let exists = projection
+            .spaces
+            .values()
+            .any(|space| space.contexts.contains_key(&relation.target_context_id));
+        if !exists {
+            return Err(invalid(format!(
+                "Context Relation target does not exist: {}",
+                relation.target_context_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn require_revision(
@@ -2573,6 +5163,18 @@ fn parse_status(value: &str) -> Result<ContextStatus> {
         "superseded" => Ok(ContextStatus::Superseded),
         "governance_conflict" => Ok(ContextStatus::GovernanceConflict),
         _ => Err(invalid(format!("invalid Context status: {value}"))),
+    }
+}
+
+/// Mirrors the MCP `scope` selector: `task` is the Task-local default, `session` widens the
+/// listing to every Task of the Session read-only.
+fn parse_candidate_review_scope(value: &str) -> Result<sctx_domain::CandidateReviewScope> {
+    match value {
+        "task" => Ok(sctx_domain::CandidateReviewScope::Task),
+        "session" => Ok(sctx_domain::CandidateReviewScope::Session),
+        other => Err(invalid(format!(
+            "unsupported Candidate Review scope: {other}"
+        ))),
     }
 }
 
@@ -2761,8 +5363,32 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::External => "external_error",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
+        ErrorKind::Conflict => "conflict",
         ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
+        ErrorKind::MaintenanceBusy => "maintenance_busy",
         _ => "unknown_error",
+    }
+}
+
+const fn telemetry_error_code(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::StaleState => "stale_state",
+        ErrorKind::PrivacyRejected => "privacy_rejected",
+        _ => error_code(kind),
+    }
+}
+
+const fn error_family(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::InvalidInput | ErrorKind::Unsupported => "request",
+        ErrorKind::InvariantViolation => "invariant",
+        ErrorKind::Io => "io",
+        ErrorKind::External => "external",
+        ErrorKind::Conflict | ErrorKind::StaleState | ErrorKind::IdempotencyKeyConflict => "state",
+        ErrorKind::PrivacyRejected => "privacy",
+        ErrorKind::RepositoryNotConfigured => "repository",
+        ErrorKind::MaintenanceBusy => "maintenance",
+        _ => "unknown",
     }
 }
 
@@ -2771,6 +5397,12 @@ fn installation_root() -> Result<PathBuf> {
         .map(PathBuf::from)
         .map(|home| home.join(".shared-context"))
         .ok_or_else(|| invalid("HOME is not set"))
+}
+
+fn home_directory() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn is_help(args: &[String]) -> bool {

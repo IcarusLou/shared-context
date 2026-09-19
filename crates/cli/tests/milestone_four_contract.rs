@@ -1,17 +1,16 @@
 use sctx_domain::{
-    Applicability, CandidateAnalysisStatus, CandidateReviewStatus, CandidateSpaceRecommendation,
-    ContextKind, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits,
-    WorkingIntentSnapshot,
+    CandidateAnalysisStatus, CandidateReviewStatus, CandidateSpaceRecommendation, ContextKind,
+    DecisionSource, EvidenceType, IntentSnapshot, OptionalCandidateEdits, WorkingIntentSnapshot,
 };
 use sctx_event_schema::{Event, EventPayload};
 use sctx_git_store::{AppendRequest, GitStore};
 use sctx_mcp::{
     CandidateConfirmInput, CandidateConfirmPrimaryInput, CandidateConfirmResponseStatus,
     CandidateGetInput, CandidateListInput, ExistingCandidatePrimaryInput, ExpectedRevisionId,
-    NewCandidatePrimaryInput, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
-    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput,
-    candidate_confirm_at_root, candidate_get_at_root, candidate_list_at_root,
-    task_checkpoint_at_root, task_context_readonly_at_root, task_intent_update_at_root,
+    NewCandidatePrimaryInput, TaskBoundary, TaskCheckpointClaimInput, TaskCheckpointEvidenceInput,
+    TaskCheckpointInput, TaskContextReadInput, TaskIntentUpdateInput, candidate_confirm_at_root,
+    candidate_get_at_root, candidate_list_at_root, task_checkpoint_at_root,
+    task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::{ContextStatus, ScopeFilter, SearchEngine, SearchFilters, SearchRequest};
 use serde::Deserialize;
@@ -33,7 +32,6 @@ struct Claim {
     statement: String,
     rationale: String,
     supports: String,
-    interpretation: String,
     limitations: Vec<String>,
 }
 
@@ -48,28 +46,15 @@ struct Expected {
 
 fn checkpoint_claim(claim: &Claim) -> TaskCheckpointClaimInput {
     TaskCheckpointClaimInput {
-        context_kind_hint: Some(ContextKind::Contract),
-        topic_key_hint: Some("m4/fixed-oracle".to_owned()),
+        context_kind: ContextKind::Contract,
         statement: claim.statement.clone(),
         rationale: claim.rationale.clone(),
-        applicability: Applicability {
-            domains: vec!["search".to_owned()],
-            platforms: vec!["fe".to_owned(), "ios".to_owned(), "android".to_owned()],
-            conditions: Vec::new(),
-        },
-        assumptions: Vec::new(),
-        recheck_when: vec!["the shared result contract changes".to_owned()],
-        evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
-            evidence: EvidenceSnapshotDraft {
-                kind: EvidenceType::ExperimentRecord,
-                supports: claim.supports.clone(),
-                content: json!({"fixture": "m4-fixed-oracle", "actual": "passed"}),
-                interpretation: claim.interpretation.clone(),
-                limitations: claim.limitations.clone(),
-            },
+        conditions: Vec::new(),
+        evidence: vec![TaskCheckpointEvidenceInput {
+            evidence_type: EvidenceType::ExperimentRecord,
+            summary: claim.supports.clone(),
+            limitations: claim.limitations.clone(),
         }],
-        artifact_refs: Vec::new(),
-        related_contexts: Vec::new(),
     }
 }
 
@@ -101,19 +86,32 @@ fn build_review(
         &TaskCheckpointInput {
             agent_kind: agent_kind.to_owned(),
             external_session_id: session.to_owned(),
-            expected_task_id: task.context.task_id.to_string(),
-            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
-            expected_episode_version: 0,
-            boundary: TaskCheckpointBoundary::Close,
             claims: vec![checkpoint_claim(claim)],
             unknowns: Vec::new(),
         },
     )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    assert_eq!(
+        closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let recovered = candidate_list_at_root(
+        root,
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: agent_kind.to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
     .unwrap();
-    let build = closed.candidate_build.as_ref().unwrap();
-    assert_eq!(build.items.len(), expected_builder_items);
-    let item = &build.items[0];
-    (task, item.candidate_id.unwrap(), closed.episode_id)
+    assert_eq!(recovered.reviews.len(), expected_builder_items);
+    (task, recovered.reviews[0].0.candidate_id, closed.episode_id)
 }
 
 #[test]
@@ -124,7 +122,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     assert_eq!(oracle.version, 1);
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path().join("m4 fixed oracle");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let space = Event::space_created(
         IntentSnapshot {
             title: "Shared result contract".to_owned(),
@@ -155,6 +153,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     let list = candidate_list_at_root(
         &root,
         &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
             agent_kind: "codex".to_owned(),
             external_session_id: oracle.existing_session.clone(),
             status: CandidateReviewStatus::Pending,
@@ -181,7 +180,11 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     assert_eq!(review.content.rationale, oracle.existing_claim.rationale);
     assert_eq!(
         review.content.evidence[0].supports,
-        oracle.existing_claim.supports
+        oracle.existing_claim.statement
+    );
+    assert_eq!(
+        review.content.evidence[0].content,
+        json!({"summary": oracle.existing_claim.supports})
     );
     assert_eq!(review.analysis.status, CandidateAnalysisStatus::Complete);
     assert!(review.ready_for_review && review.untrusted_data);
@@ -204,6 +207,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     );
 
     let existing_input = CandidateConfirmInput {
+        decision_source: DecisionSource::Human,
         agent_kind: "codex".to_owned(),
         external_session_id: oracle.existing_session.clone(),
         expected_task_id: existing_task.context.task_id.to_string(),
@@ -237,7 +241,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
                 ..SearchFilters::default()
             },
             page_size: 10,
-            cursor: None,
+            ..SearchRequest::default()
         })
         .unwrap();
     assert!(
@@ -280,6 +284,7 @@ fn fixed_milestone_four_builder_review_confirm_oracle() {
     let new_confirmed = candidate_confirm_at_root(
         &root,
         &CandidateConfirmInput {
+            decision_source: DecisionSource::Human,
             agent_kind: "cursor".to_owned(),
             external_session_id: oracle.new_session,
             expected_task_id: new_task.context.task_id.to_string(),

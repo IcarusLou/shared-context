@@ -6,6 +6,6 @@
 - `events/v1/invalid/`：缺失必填字段、未知权威字段、非法 ID 与 payload 局部不变量。
 - `events/unknown/`：Reader 必须原样保留并隔离的未知 Schema 输入。
 - `reducer/v1/`：纯内存 Reducer 的 Intent/Context 分支合并、Review 聚合和 Publication 生命周期事件集。
-- `privacy/`：Capture 与 Git append 隐私边界共享的 Secret/PII 测试输入。
+- `privacy/`：direct Checkpoint 与 Git append 隐私边界共享的 Secret/PII 测试输入。
 
 后续协议演进应新增版本目录，不得改写已经发布的 fixture 合同。

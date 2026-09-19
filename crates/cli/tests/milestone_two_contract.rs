@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -22,7 +22,8 @@ use sctx_mcp::{
     TaskIntentUpdateInput, task_context_readonly_at_root, task_intent_update_at_root,
 };
 use sctx_search::{
-    ContextPackMode, ContextStatus, SearchEngine, TaskContextRequest, TaskRetrievalPath,
+    ContextPackMode, ContextStatus, SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS, SearchEngine,
+    TaskContextRequest, TaskRetrievalPath,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
@@ -37,7 +38,6 @@ struct MilestoneTwoFixture {
     index: ProjectionIndex,
     feature_spaces: [SpaceId; 4],
     feature_contexts: [ContextId; 4],
-    unsafe_spaces: [SpaceId; 4],
     unassigned_candidate_id: String,
 }
 
@@ -71,10 +71,13 @@ impl MilestoneTwoFixture {
         assert!(status.success());
         let workspace = fs::canonicalize(workspace).unwrap();
 
-        let store = GitStore::initialize(&root).unwrap();
+        let store = GitStore::bootstrap_local(&root).unwrap();
         UserConfigStore::initialize(&root)
             .unwrap()
-            .add_repository(None, std::slice::from_ref(&workspace))
+            .add_repository(
+                sctx_domain::RepositoryId::new(),
+                std::slice::from_ref(&workspace),
+            )
             .unwrap();
         let page_space = add_space(
             &store,
@@ -264,14 +267,20 @@ impl MilestoneTwoFixture {
                 compatibility_context,
                 analytics_context,
             ],
-            unsafe_spaces: [
-                candidate_space,
-                deprecated_space,
-                conflict_space,
-                incomplete_space,
-            ],
             unassigned_candidate_id,
         }
+    }
+
+    /// One scenario whose Session footprint is exactly `files`.
+    fn input_touching(
+        &self,
+        external_session_id: &str,
+        goal: &str,
+        files: &[&str],
+    ) -> TaskScenario {
+        let mut scenario = self.input(external_session_id, goal);
+        scenario.intent.artifact_hints = files.iter().map(|file| (*file).to_owned()).collect();
+        scenario
     }
 
     fn input(&self, external_session_id: &str, goal: &str) -> TaskScenario {
@@ -359,6 +368,8 @@ fn applicability(domain: &str, platform: &str, condition: &str) -> Applicability
 
 fn complete_context(statement: &str, applicability: Applicability) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Contract,
         topic_key: Some("milestone-two/acceptance".to_owned()),
         statement: statement.to_owned(),
@@ -417,6 +428,34 @@ fn add_context(
     ids
 }
 
+/// The Repository every M2 fixture Context is anchored in.
+const M2_REPOSITORY: &str = "Quartz";
+
+/// The file a fixture Context is recorded against: the one its own statement names, when it names
+/// one, and a name derived from the statement otherwise.
+///
+/// These fixtures already wrote the path into the statement -- the retrieval that preceded ADR-0007
+/// matched it as text -- so reading the same spelling as a coordinate is the smallest change that
+/// keeps each test saying what it was written to say.
+fn m2_anchor(statement: &str) -> String {
+    statement
+        .split_whitespace()
+        .find(|token| token.contains('/') && token.contains('.'))
+        .map_or_else(
+            || {
+                format!(
+                    "src/{}.ts",
+                    statement
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("context")
+                        .to_lowercase()
+                )
+            },
+            ToOwned::to_owned,
+        )
+}
+
 fn add_accepted_context(
     store: &GitStore,
     space_id: SpaceId,
@@ -425,6 +464,26 @@ fn add_accepted_context(
 ) -> ContextId {
     let (context_id, revision_id) =
         add_context(store, space_id, complete_context(statement, applicability));
+    store
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: M2_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(m2_anchor(statement)).unwrap(),
+                    },
+                    supports: "the M2 fixture anchors this Context to the file it names".to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
     publish(
         store,
         space_id,
@@ -508,47 +567,42 @@ fn establish_task(root: &Path, input: &TaskScenario) -> TaskContextResponse {
     task_intent_update_at_root(root, &update).unwrap().context
 }
 
+/// Every Retrieval Path an automatic Pack can carry, and the fact each one has to be able to name.
+///
+/// ADR-0007 is what makes this list two entries long. Automatic injection used to reach a Context
+/// through any of nine routes -- Intent text, Context text, hint text, exact scope, a focus text
+/// fallback, a Graph Artifact, a Relation hop, a Space association, a query-side cosine -- and the
+/// Pack's job was to fuse nine opinions into one ranking. It now reaches a Context two ways: the
+/// Session opened a file this Context is recorded against, or a Context the Session already reached
+/// admitted this one on the two documents' cosine. The remaining variants are still part of the
+/// enum because an explicit Pack read still produces them; an automatic Pack that produced one
+/// would mean the lanes had been bypassed, so they fail here rather than being wildcarded away.
 fn assert_typed_m2_path(path: &TaskRetrievalPath) {
     match path {
-        TaskRetrievalPath::IntentFts {
-            matched_fields,
-            matched_tokens,
+        TaskRetrievalPath::FileAnchor {
+            location,
+            anchor_count,
+            ..
         } => {
-            assert!(!matched_fields.is_empty());
-            assert!(!matched_tokens.is_empty());
+            assert!(
+                location.contains(':'),
+                "a Lane A path names the Repository-qualified coordinate that justifies it: \
+                 {location}"
+            );
+            assert!(*anchor_count >= 1);
         }
-        TaskRetrievalPath::ContextFts {
-            matched_fields,
-            matched_tokens,
+        TaskRetrievalPath::SeedAssociation {
+            seed_context_id,
+            score_basis_points,
+            ..
         } => {
-            assert!(!matched_fields.is_empty());
-            assert!(!matched_tokens.is_empty());
+            assert!(seed_context_id.to_string().starts_with("ctx_"));
+            assert!(
+                *score_basis_points >= SEMANTIC_HOP2_ADMISSION_FLOOR_BASIS_POINTS,
+                "a Lane B path carries the score that admitted it, never one below the floor"
+            );
         }
-        TaskRetrievalPath::WorkingIntentHintText { explanation } => {
-            assert!(!explanation.matched_tokens.is_empty());
-            assert!(explanation.query_token_coverage_basis_points > 0);
-            assert!(explanation.fusion_contribution_micros > 0);
-        }
-        TaskRetrievalPath::ExactScope { dimension, value } => {
-            assert!(!dimension.is_empty());
-            assert!(!value.is_empty());
-        }
-        TaskRetrievalPath::EngineeringGraph {
-            path,
-            relation_hops,
-        } => {
-            assert!(!path.resolved_focus.locator.canonical_key().is_empty());
-            assert!(!path.artifact_generation.is_empty());
-            assert!(relation_hops.len() <= 2);
-        }
-        TaskRetrievalPath::ContextRelation { hops } => {
-            assert!(!hops.is_empty());
-            assert!(hops.len() <= 2);
-        }
-        TaskRetrievalPath::GraphDiagnostic { diagnostic } => {
-            assert!(!diagnostic.resolved_focus.locator.canonical_key().is_empty());
-            assert!(!diagnostic.artifact_generation.is_empty());
-        }
+        other => panic!("automatic injection produced a path outside the two lanes: {other:?}"),
     }
 }
 
@@ -587,14 +641,41 @@ fn git_tree(repository: &Path) -> String {
 fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     let fixture = MilestoneTwoFixture::new();
 
-    let zero_input = fixture.input("zero-session", "lonelyunrelatedtoken");
-    let one_input = fixture.input("page-session", "quartzpageintent");
-    let server_input = fixture.input("server-session", "cobaltserverintent");
-    let many_input = fixture.feature_input("feature-session");
+    // Each scenario says which files its Session is working on. That is the whole of what decides
+    // its Pack now: `zero` names a file no Context is recorded against, `page` and `server` name
+    // one each, and `feature` names three across three Spaces.
+    let zero_input = fixture.input_touching(
+        "zero-session",
+        "lonelyunrelatedtoken",
+        &["src/nobody_wrote_about_this.ts"],
+    );
+    let one_input = fixture.input_touching(
+        "page-session",
+        "quartzpageintent",
+        &["src/search_results_page.tsx"],
+    );
+    let server_input = fixture.input_touching(
+        "server-session",
+        "cobaltserverintent",
+        &["src/searchv2endpoint.ts"],
+    );
+    let mut many_input = fixture.feature_input("feature-session");
+    many_input.intent.artifact_hints = [
+        "src/search_results_page.tsx",
+        "src/searchv2endpoint.ts",
+        "src/legacycompatibilitytest.ts",
+    ]
+    .map(ToOwned::to_owned)
+    .to_vec();
     let read_input = TaskContextReadInput {
         agent_kind: many_input.agent_kind.clone(),
         external_session_id: many_input.external_session_id.clone(),
-        token_budget: 2_000,
+        // The same budget the establishing call takes, because this input is compared Pack-for-Pack
+        // against it below. It used to be 2000 and the comparison still held, which said more about
+        // how little `estimated_tokens` was charging than about the two routes agreeing: once the
+        // charge became the wire size (caliber v2), 2000 stopped carrying the third Space and the
+        // read route looked like it disagreed with the write route about retrieval. It never did.
+        token_budget: 8_000,
         max_spaces: many_input.max_spaces,
     };
     let serialized_input = serde_json::to_value(&read_input).unwrap();
@@ -652,12 +733,17 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     }));
 
     let association_spaces = response_spaces(&many);
-    let flattened = many
-        .retrieval_paths
+    // One entry per (Space, Context): the Pack never lists one Context twice under one Space, so
+    // an item is addressable by that pair. This used to be asserted against a flattened top-level
+    // copy of every item's `retrieval_paths`; the copy was byte-for-byte identical to what the
+    // items already carry, cost a quarter of the wire and had no consumer, so it is gone and the
+    // property is asserted where it lives.
+    let addressed = many
+        .items
         .iter()
-        .map(|entry| ((entry.association_space_id, entry.context_id), &entry.paths))
-        .collect::<BTreeMap<_, _>>();
-    assert_eq!(flattened.len(), many.items.len());
+        .map(|item| (item.association_space_id, item.context.context_id))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(addressed.len(), many.items.len());
     for item in &many.items {
         assert_eq!(item.association_space_id, item.context.space_id);
         assert!(association_spaces.contains(&item.association_space_id));
@@ -666,10 +752,6 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
         assert!(!item.context.evidence.is_empty());
         assert!(item.context.conflicts.is_empty());
         assert!(!item.retrieval_paths.is_empty());
-        assert_eq!(
-            flattened[&(item.association_space_id, item.context.context_id)],
-            &item.retrieval_paths
-        );
         item.retrieval_paths.iter().for_each(assert_typed_m2_path);
     }
     assert!(
@@ -693,13 +775,25 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
     assert_eq!(repeated.generation, many.generation);
     assert_eq!(repeated.candidate_spaces, many.candidate_spaces);
     assert_eq!(repeated.items, many.items);
-    assert_eq!(repeated.retrieval_paths, many.retrieval_paths);
 
-    let unsafe_input = fixture.input("unsafe-session", "hazardpackintent");
+    // Every hazard Context is recorded against a file, and the Session opens all of them. This is
+    // a stronger statement than the relevance-floor ranking it replaces: the four hazard Spaces are
+    // not absent because a floor dropped the tail of a one-channel ranking, they are absent because
+    // the lane retrieved every one of their Contexts and the safety rules refused all four states --
+    // a Candidate, a withdrawn Context, both sides of an open conflict, and incomplete Evidence.
+    let unsafe_input = fixture.input_touching(
+        "unsafe-session",
+        "hazardpackintent",
+        &[
+            "src/hazardpackcontext.ts",
+            "src/hazardpackcontext_deprecated.ts",
+        ],
+    );
     let automatic_unsafe = establish_task(&fixture.root, &unsafe_input);
-    assert_eq!(
-        response_spaces(&automatic_unsafe),
-        fixture.unsafe_spaces.into_iter().collect()
+    assert!(
+        response_spaces(&automatic_unsafe).is_empty(),
+        "a Space exists in a Pack because one of its Contexts is in the Pack: {:#?}",
+        automatic_unsafe.candidate_spaces
     );
     assert!(automatic_unsafe.items.is_empty());
     assert!(
@@ -713,6 +807,7 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
             task_id: TaskId::new(),
             working_intent: task_intent("hazardpackintent"),
             task_signals: Vec::new(),
+            signal_history: Vec::new(),
             resolved_focus: None,
             token_budget: 100_000,
             max_spaces: sctx_search::DEFAULT_TASK_MAX_SPACES,
@@ -749,9 +844,26 @@ fn task_runtime_retrieval_closes_the_m2_cross_crate_contract() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
+fn post_tool_file_is_non_factual_signal_only_and_test_outcome_refreshes_active_task() {
     let fixture = MilestoneTwoFixture::new();
     let session_id = "hook-signal-session";
+    let activation = fixture.hook(&serde_json::json!({
+        "session_id": session_id,
+        "transcript_path": null,
+        "cwd": fixture.workspace,
+        "hook_event_name": "SessionStart",
+        "model": "gpt-5.6-sol",
+        "permission_mode": "default",
+        "source": "startup"
+    }));
+    assert!(
+        activation["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|message| {
+                message.contains("<shared-context-active external_session_id=")
+                    && message.contains(session_id)
+            })
+    );
     let update = |boundary: TaskBoundary, expected: Option<String>| TaskIntentUpdateInput {
         agent_kind: "codex".to_owned(),
         external_session_id: session_id.to_owned(),
@@ -767,7 +879,7 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
             platforms: vec![],
             constraints: vec![],
             acceptance_conditions: vec![],
-            artifact_hints: vec![],
+            artifact_hints: vec!["src/search_results_page.tsx".to_owned()],
             interface_hints: vec![],
             open_questions: vec![],
         },
@@ -801,9 +913,13 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
         "model": "gpt-5.6-sol",
         "permission_mode": "default",
         "turn_id": "m2-turn",
-        "tool_name": "LegacyCompatibilityTest",
+        "tool_name": "Shell",
         "tool_use_id": "m2-tool",
-        "tool_input": {"file_path": fixture.workspace.join("src/search_results_page.tsx")},
+        "tool_input": {
+            "command": "cargo test",
+            "working_directory": fixture.workspace,
+            "ignored_file_path": fixture.workspace.join("src/search_results_page.tsx")
+        },
         "tool_response": {"output": "passed"}
     }));
     assert_eq!(post_tool, serde_json::json!({}));
@@ -848,7 +964,6 @@ fn post_tool_file_is_breadcrumb_only_and_test_outcome_refreshes_active_task() {
             .any(|signal| signal.content == "src/search_results_page.tsx")
     );
     assert!(snapshot.task_signals.iter().any(|signal| {
-        signal.kind == TaskSignalKind::TestOutcome
-            && signal.content == "LegacyCompatibilityTest succeeded"
+        signal.kind == TaskSignalKind::TestOutcome && signal.content == "test runner succeeded"
     }));
 }

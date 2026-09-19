@@ -4,16 +4,17 @@ use sctx_domain::{
     Applicability, ArtifactKey, ArtifactRef, AutomaticCandidateStatus, CandidateAnalysis,
     CandidateAnalysisStatus, CandidateAssessmentPath, CandidateAssessmentRelation,
     CandidateConfidence, CandidateRelationAssessment, CandidateSpaceRecommendation,
-    CandidateSpaceRecommendationPath, ContextCandidate, ContextRevision, ContextRevisionDraft,
-    ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot, RecommendedSpaceRole,
-    RevisionLifecycle, SpaceId, TaskId, TaskSignal, TaskSpaceAssociation, WorkingIntentSnapshot,
+    CandidateSpaceRecommendationPath, ContextCandidate, ContextId, ContextRevision,
+    ContextRevisionDraft, ContextRevisionRef, EvidenceSnapshotDraft, IntentSnapshot,
+    ProposedSpaceGroupKey, RecommendedSpaceRole, RevisionId, RevisionLifecycle, SpaceId, TaskId,
+    TaskIntentRevisionId, TaskSignal, TaskSpaceAssociation, WorkingIntentSnapshot, hints,
 };
 use sctx_engineering_graph::EngineeringProjectionSnapshot;
 use sctx_index::{DomainSnapshot, normalize_search_text, search_tokens};
 
 use crate::{
-    ContextStatus, Error, ErrorKind, Result, ScopeFilter, SearchEngine, SearchFilters,
-    SearchRequest,
+    ContextStatus, ContextTtlSettings, Error, ErrorKind, Result, ScopeFilter, SearchEngine,
+    SearchFilters, SearchRequest,
 };
 
 pub const MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET: usize = 1_024;
@@ -21,16 +22,66 @@ pub const MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET: usize = 32_768;
 pub const MAX_CANDIDATE_ANALYSIS_TOP_K: usize = 32;
 const PRIMARY_SPACE_THRESHOLD: u64 = 90_000;
 const RRF_K: u64 = 60;
+const PROPOSED_SPACE_GROUP_SCORE: u64 = 1_000_000;
+/// Maximum `char` length of a proposed Space title before elision.
+///
+/// A proposed title is a short handle a reviewer scans in a Candidate list, not a restatement of
+/// the goal: the whole goal already reaches the Space as `desired_outcome`.
+const PROPOSED_SPACE_TITLE_MAX_CHARS: usize = 40;
+/// Normalized statement token Jaccard at or above which two Claims state the same fact.
+pub const STATEMENT_SIMILARITY_STRONG_BASIS_POINTS: u64 = 8_000;
+/// Lower bound of the band where two Claims are close enough to need human contradiction review.
+pub const STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS: u64 = 5_000;
+/// Normalized statement overlap at or above which a Claim restates an accepted Context.
+///
+/// Measured against this repository's own accepted Contexts: pairs that restate one conclusion in
+/// different words score `5_400` to `10_000` basis points, while pairs about different conclusions
+/// stay at or below `1_100`. The band between this bound and
+/// [`STATEMENT_SIMILARITY_STRONG_BASIS_POINTS`] is where a rewrite of one conclusion used to fall
+/// through as merely related, because the strongest duplicate path needs a topic key and the topic
+/// key is optional.
+pub const STATEMENT_NEAR_DUPLICATE_BASIS_POINTS: u64 = 5_000;
+/// Adjacent-token (bigram) Jaccard at or above which two same-topic, differently worded
+/// statements read as one conclusion paraphrased rather than two independent, potentially
+/// opposed ones.
+///
+/// This only gates the topic-key path to `potential_contradiction` ([`assess_target`]): a shared
+/// topic key with a differing statement used to send every such pair to human contradiction
+/// review, including a Claim that only reworded a Context the knowledge base already held from a
+/// different angle. Word order recovers what unigram overlap cannot see — a paraphrase still
+/// reproduces most of its neighbor-token pairs after synonym substitution and light
+/// restructuring, while two independently written statements about the same topic rarely share
+/// more than a scattered few. Below this bound the pair still reaches
+/// `unresolved_related`, not `supports`: nothing here promotes it as confirmed agreement, it only
+/// stops treating a rewrite as evidence of disagreement. A negation or polarity marker mismatch
+/// overrides this bound in either direction, because "reached" and "not reached" can otherwise
+/// look like the same phrase reused.
+pub const STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS: u64 = 3_000;
+/// Shared repository identifiers at or above which two Claims are about the same code.
+///
+/// One shared identifier is a coincidence of vocabulary; two independently written spellings of
+/// the same type, service or symbol are not. This is the only strong-association path that
+/// survives a Claim being written in a different natural language from its target.
+pub const SHARED_IDENTIFIER_STRONG_OVERLAP: usize = 2;
+/// Shared identifiers at or above which the two Claims restate one another regardless of wording.
+pub const SHARED_IDENTIFIER_SUPPORT_OVERLAP: usize = 3;
 
 /// Complete, Task-owned input to one rebuildable Candidate analysis.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateAnalysisRequest {
     pub candidate: ContextCandidate,
     pub source_task_id: TaskId,
+    /// The Intent revision the source Episode closed under. Kept as provenance only: the proposed
+    /// Space group is derived from `source_task_id` alone, so the recommendation stays confirmable
+    /// after later governance turns advance the Intent head.
+    pub source_intent_revision_id: TaskIntentRevisionId,
     pub source_working_intent: WorkingIntentSnapshot,
     pub source_task_signals: Vec<TaskSignal>,
+    /// Evidence gaps derived from the source Checkpoint, never from relationship confidence.
+    pub has_blocking_unknowns: bool,
     pub explicit_related_contexts: Vec<ContextRevisionRef>,
     pub artifact_refs: Vec<ArtifactRef>,
+    pub proposed_space_group_space_id: Option<SpaceId>,
     pub token_budget: usize,
     pub top_k: usize,
 }
@@ -44,14 +95,35 @@ pub struct CandidateAnalysisResult {
     pub candidate_status: AutomaticCandidateStatus,
 }
 
+// Four independent yes-or-no answers about one retrieval target, not a state machine: each is
+// read on its own by the relation rules and none constrains another, so folding them into an enum
+// would only hide which question was asked.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone)]
 struct TargetState {
     revision: ContextRevision,
     safe: bool,
+    /// True when the target revision is accepted and the knowledge base still holds it.
+    ///
+    /// Duplicate review asks only whether the conclusion is already accepted, but a retired
+    /// Context is no longer a conclusion this installation holds: confirming a Claim against one
+    /// would send the reviewer to a fact that has a successor.
+    accepted: bool,
+    /// Why this target is retired, when the local derivation retired it.
+    ///
+    /// `superseded_by` and the `[context_ttl]` verdict are derived in the index, never in Git (see
+    /// [`ContextRetirement`]), so nothing in the reduced domain projection carries them.
+    retirement_reason: Option<String>,
     space_conflicted: bool,
     channels: BTreeMap<&'static str, usize>,
     paths: Vec<CandidateAssessmentPath>,
     score: u64,
+    /// Normalized statement token Jaccard against the Candidate, in basis points.
+    statement_similarity: u64,
+    /// True when a near-duplicate statement negates the Candidate instead of restating it.
+    negation_conflict: bool,
+    /// Normalized repository identifiers this accepted, safe target shares with the Candidate.
+    shared_identifiers: Vec<String>,
 }
 
 #[derive(Default)]
@@ -78,7 +150,18 @@ impl SearchEngine {
         request.candidate.content.validate()?;
         request.source_working_intent.validate()?;
         TaskSignal::validate_collection(&request.source_task_signals)?;
-        let snapshot = self.index.domain_snapshot()?;
+        // The index reuses the snapshot it already reduced for this Tree, so the Builder's own
+        // read and every per-Candidate analysis of the same commit share one reduction.
+        let snapshot = self.index.shared_domain_snapshot()?;
+        if request
+            .proposed_space_group_space_id
+            .is_some_and(|space_id| !snapshot.projection.spaces.contains_key(&space_id))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Proposed Space group mapping points to an unavailable Space",
+            ));
+        }
         let graph = self
             .engineering_graph
             .as_ref()
@@ -102,6 +185,9 @@ impl SearchEngine {
             },
             page_size: request.top_k.saturating_mul(4).clamp(1, 128),
             cursor: None,
+            // The Candidate query is a single token, so ranked and exact matching agree; ranked
+            // keeps the coverage explanation consistent with every other search caller.
+            match_mode: crate::SearchMatchMode::Ranked,
         })?;
         let source_spaces = self.task_space_associations(
             request.source_task_id,
@@ -111,7 +197,12 @@ impl SearchEngine {
         let candidate_intent = candidate_working_intent(&request.candidate.content);
         let candidate_spaces =
             self.task_space_associations(request.source_task_id, &candidate_intent, &[])?;
+        let retirements = self.context_retirements()?;
         for (tree, generation) in [
+            (
+                &retirements.metadata.indexed_tree_oid,
+                retirements.metadata.projection_generation,
+            ),
             (&bm25.indexed_tree_oid, bm25.projection_generation),
             (
                 &source_spaces.indexed_tree_oid,
@@ -132,8 +223,9 @@ impl SearchEngine {
             }
         }
 
-        let mut targets = collect_targets(&snapshot);
+        let mut targets = collect_targets(&snapshot, &retirements.data, self.context_ttl);
         add_exact_channels(&request.candidate.content, &mut targets);
+        add_identifier_channel(&request.candidate.content, &mut targets);
         add_explicit_channel(&request.explicit_related_contexts, &mut targets);
         add_graph_channel(graph.as_ref(), &request.artifact_refs, &mut targets)?;
         add_bm25_channel(&bm25.results, &mut targets);
@@ -169,7 +261,9 @@ impl SearchEngine {
             &safe_targets,
             &source_spaces.associations,
             &candidate_spaces.associations,
-            &request.candidate.content,
+            &request.source_working_intent,
+            ProposedSpaceGroupKey::from_task(request.source_task_id),
+            request.proposed_space_group_space_id,
             request.top_k,
         );
         let confidence = aggregate_confidence(&assessments);
@@ -190,13 +284,58 @@ impl SearchEngine {
             error_code: None,
         };
         enforce_budget(&mut analysis, &mut recommendations)?;
-        let candidate_status = review_status(&analysis, &recommendations, &confidence);
+        let candidate_status =
+            review_status(&analysis, &recommendations, request.has_blocking_unknowns);
         analysis.validate()?;
         Ok(CandidateAnalysisResult {
             analysis,
             space_recommendations: recommendations,
             confidence,
             candidate_status,
+        })
+    }
+
+    /// Reads the locally derived retirement state of every projected Context.
+    ///
+    /// One statement over `context_item` rather than a per-target lookup: the evaluation set is
+    /// every Context in the projection, and the generation this read saw is checked against the
+    /// snapshot alongside every other retrieval input.
+    fn context_retirements(
+        &self,
+    ) -> Result<sctx_index::QuerySnapshot<BTreeMap<ContextId, ContextRetirement>>> {
+        self.index.query_snapshot(|connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT context_id, superseded_by, accepted_at_unix_seconds
+                     FROM context_item
+                     WHERE superseded_by IS NOT NULL OR accepted_at_unix_seconds IS NOT NULL",
+                )
+                .map_err(crate::sql_error("prepare Context retirement read"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                })
+                .map_err(crate::sql_error("query Context retirement state"))?;
+            let mut retirements = BTreeMap::new();
+            for row in rows {
+                let (context_id, superseded_by, accepted_at_unix_seconds) =
+                    row.map_err(crate::sql_error("collect Context retirement state"))?;
+                retirements.insert(
+                    crate::parse_id::<ContextId>(&context_id)?,
+                    ContextRetirement {
+                        superseded_by: superseded_by
+                            .as_deref()
+                            .map(crate::parse_id::<ContextId>)
+                            .transpose()?,
+                        accepted_at_unix_seconds,
+                    },
+                );
+            }
+            Ok(retirements)
         })
     }
 }
@@ -223,17 +362,93 @@ fn validate_request(request: &CandidateAnalysisRequest) -> Result<()> {
     Ok(())
 }
 
-fn collect_targets(snapshot: &DomainSnapshot) -> BTreeMap<ContextRevisionRef, TargetState> {
+/// Locally derived retirement state of one projected Context.
+///
+/// Neither field exists in Git. `superseded_by` is recomputed in the index from the `supersedes`
+/// Relations another *accepted* revision declares (`refresh_superseded_by`), and the
+/// `[context_ttl]` verdict is an evaluation of the operator's policy against the wall clock. The
+/// reduced domain projection therefore cannot carry them: `AutoInjectionEligibility` only knows
+/// the three Git-side blockers (not accepted, governance conflict, unresolved semantic conflict),
+/// and `RevisionLifecycle::Superseded` means "an older revision of this same Context", which is a
+/// different question from "another Context retired this one".
+///
+/// Retrieval elsewhere folds both into the same bit through
+/// [`ContextDerivedState::blocks_automatic_injection`](crate::ContextDerivedState::blocks_automatic_injection);
+/// Candidate analysis reads them here so its safety verdict means the same thing as the Pack's.
+#[derive(Clone, Copy, Debug, Default)]
+struct ContextRetirement {
+    superseded_by: Option<ContextId>,
+    accepted_at_unix_seconds: Option<i64>,
+}
+
+impl ContextRetirement {
+    /// Why automatic factual promotion must refuse this Context, or `None` when nothing retired it.
+    fn reason(
+        &self,
+        kind: sctx_domain::ContextKind,
+        context_ttl: ContextTtlSettings,
+    ) -> Option<String> {
+        if let Some(successor) = self.superseded_by {
+            return Some(format!(
+                "Target Context is superseded by {successor}; its conclusion has a successor"
+            ));
+        }
+        context_ttl.historical_reason(kind, self.accepted_at_unix_seconds)
+    }
+}
+
+/// The revisions of one Context that Candidate review may be shown, which is normally exactly one.
+///
+/// A Context is a revision DAG, and every node of it used to become its own retrieval target. So
+/// one Context competed with its own history for the `top_k` slots and a reviewer was shown the
+/// same conclusion twice — observed on the real installation, where `ctx_68b87734` entered the
+/// evaluation set as both its accepted revision and a superseded one, and only the superseded copy
+/// carried the safety diagnostic that explained the difference.
+///
+/// Governance names the revision the knowledge base holds, so that is the one revision to assess;
+/// it is also the revision `SAFE_ACCEPTED_CONTEXT_PREDICATE` joins on everywhere else. Reading the
+/// DAG heads instead would answer a different question — an unpublished newer draft is a head, and
+/// letting it displace the accepted revision would hide the accepted fact from duplicate review.
+/// The DAG heads are the fallback for the two states where governance names nothing: a Context
+/// that was never published, and one whose publication heads conflict (never safe either way).
+fn current_revision_ids(context: &sctx_domain::ContextProjection) -> BTreeSet<RevisionId> {
+    match context.governance {
+        sctx_domain::ContextGovernanceStatus::Accepted { revision_id, .. }
+        | sctx_domain::ContextGovernanceStatus::Deprecated { revision_id, .. } => {
+            BTreeSet::from([revision_id])
+        }
+        sctx_domain::ContextGovernanceStatus::Unpublished
+        | sctx_domain::ContextGovernanceStatus::GovernanceConflict { .. } => {
+            context.revision_heads.clone()
+        }
+    }
+}
+
+fn collect_targets(
+    snapshot: &DomainSnapshot,
+    retirements: &BTreeMap<ContextId, ContextRetirement>,
+    context_ttl: ContextTtlSettings,
+) -> BTreeMap<ContextRevisionRef, TargetState> {
     snapshot
         .projection
         .spaces
         .values()
         .flat_map(|space| {
             space.contexts.values().flat_map(move |context| {
+                let retirement = retirements
+                    .get(&context.context_id)
+                    .copied()
+                    .unwrap_or_default();
+                let current = current_revision_ids(context);
                 context
                     .revisions
                     .iter()
+                    .filter(move |(revision_id, _)| current.contains(*revision_id))
                     .map(move |(revision_id, revision)| {
+                        let retirement_reason =
+                            retirement.reason(revision.revision.kind, context_ttl);
+                        let accepted = revision.lifecycle == RevisionLifecycle::Accepted
+                            && retirement_reason.is_none();
                         (
                             ContextRevisionRef {
                                 context_id: context.context_id,
@@ -241,12 +456,16 @@ fn collect_targets(snapshot: &DomainSnapshot) -> BTreeMap<ContextRevisionRef, Ta
                             },
                             TargetState {
                                 revision: revision.revision.clone(),
-                                safe: revision.lifecycle == RevisionLifecycle::Accepted
-                                    && context.auto_injection.eligible,
+                                safe: accepted && context.auto_injection.eligible,
+                                accepted,
+                                retirement_reason,
                                 space_conflicted: space.intent.heads.len() > 1,
                                 channels: BTreeMap::new(),
                                 paths: Vec::new(),
                                 score: 0,
+                                statement_similarity: 0,
+                                negation_conflict: false,
+                                shared_identifiers: Vec::new(),
                             },
                         )
                     })
@@ -260,6 +479,8 @@ fn add_exact_channels(
     targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
 ) {
     let candidate_statement = normalize_search_text(&candidate.statement);
+    let candidate_tokens = token_set(&candidate_statement);
+    let candidate_negations = negation_markers(&candidate.statement);
     let candidate_topic = candidate
         .topic_key
         .as_deref()
@@ -270,13 +491,37 @@ fn add_exact_channels(
     let mut topics = Vec::new();
     let mut scopes = Vec::new();
     for (target, state) in targets.iter_mut() {
-        let draft = revision_draft(&state.revision);
-        if &draft == candidate {
-            canonical.push(*target);
-            add_path(state, CandidateAssessmentPath::CanonicalDraftEquality);
-        } else if normalize_search_text(&state.revision.statement) == candidate_statement {
-            statements.push(*target);
-            add_path(state, CandidateAssessmentPath::StatementEquality);
+        let target_statement = normalize_search_text(&state.revision.statement);
+        let equal_statement = target_statement == candidate_statement;
+        state.statement_similarity = if equal_statement {
+            10_000
+        } else {
+            jaccard_basis_points(&candidate_tokens, &token_set(&target_statement))
+        };
+        // A near-duplicate statement is the same fact stated differently. Aligning the statement
+        // before comparing the rest of the draft keeps "same fact, same evidence" an exact
+        // duplicate and "same fact, different evidence" a supporting Claim, instead of letting the
+        // wording difference fall through to a contradiction review.
+        if state.statement_similarity >= STATEMENT_SIMILARITY_STRONG_BASIS_POINTS {
+            // Token overlap cannot see a negation: "is reached" and "is not reached" share every
+            // other token. Differing negation markers mean the two Claims disagree about the same
+            // fact, which is a contradiction to review, never a duplicate or supporting Claim.
+            state.negation_conflict =
+                negation_markers(&state.revision.statement) != candidate_negations;
+            if state.negation_conflict {
+                // Still retrieved and ranked as a near-duplicate, but no equality path is claimed.
+                statements.push((state.statement_similarity, *target));
+            } else {
+                let mut aligned = revision_draft(&state.revision);
+                aligned.statement.clone_from(&candidate.statement);
+                if &aligned == candidate {
+                    canonical.push((state.statement_similarity, *target));
+                    add_path(state, CandidateAssessmentPath::CanonicalDraftEquality);
+                } else {
+                    statements.push((state.statement_similarity, *target));
+                    add_path(state, CandidateAssessmentPath::StatementEquality);
+                }
+            }
         }
         if let (Some(candidate_topic), Some(target_topic)) = (
             candidate_topic.as_ref(),
@@ -287,7 +532,9 @@ fn add_exact_channels(
                 .map(normalize_search_text),
         ) && &target_topic == candidate_topic
         {
-            topics.push(*target);
+            // Topic equality is a yes-or-no fact with nothing behind it to grade, so every
+            // member is measured identically and [`add_measured_channel`] gives them one rank.
+            topics.push((0, *target));
             add_path(
                 state,
                 CandidateAssessmentPath::TopicEquality {
@@ -297,7 +544,7 @@ fn add_exact_channels(
         }
         let overlap = scope_overlap(&candidate.applicability, &state.revision.applicability);
         if !overlap.domains.is_empty() {
-            scopes.push(*target);
+            scopes.push((overlap.domains.len() as u64, *target));
             add_path(
                 state,
                 CandidateAssessmentPath::ScopeOverlap {
@@ -308,10 +555,74 @@ fn add_exact_channels(
             );
         }
     }
-    add_ranked_channel(targets, "canonical", canonical);
-    add_ranked_channel(targets, "statement", statements);
-    add_ranked_channel(targets, "topic", topics);
-    add_ranked_channel(targets, "scope", scopes);
+    add_measured_channel(targets, "canonical", canonical);
+    add_measured_channel(targets, "statement", statements);
+    add_measured_channel(targets, "topic", topics);
+    add_measured_channel(targets, "scope", scopes);
+}
+
+/// Intersects the repository identifiers the Candidate and each target spell out in their prose.
+///
+/// Only accepted, automatically injectable revisions are considered: a shared identifier is a
+/// strong association path, and a strong path must never be drawn to a fact the Task is not
+/// allowed to inherit. The target's identifiers are read from its own text, so a Context recorded
+/// long before server-side derivation existed participates without any Engineering Reference.
+fn add_identifier_channel(
+    candidate: &ContextRevisionDraft,
+    targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
+) {
+    let candidate_identifiers =
+        hints::normalized_identifiers(draft_prose(candidate).iter().map(String::as_str));
+    if candidate_identifiers.len() < SHARED_IDENTIFIER_STRONG_OVERLAP {
+        return;
+    }
+    let mut ranked = Vec::new();
+    for (target, state) in targets.iter_mut() {
+        if !state.safe {
+            continue;
+        }
+        let target_identifiers = hints::normalized_identifiers(
+            revision_prose(&state.revision).iter().map(String::as_str),
+        );
+        let shared = candidate_identifiers
+            .intersection(&target_identifiers)
+            .cloned()
+            .collect::<Vec<_>>();
+        if shared.len() < SHARED_IDENTIFIER_STRONG_OVERLAP {
+            continue;
+        }
+        state.shared_identifiers.clone_from(&shared);
+        ranked.push((shared.len() as u64, *target));
+        add_path(
+            state,
+            CandidateAssessmentPath::SharedIdentifier {
+                identifiers: shared,
+            },
+        );
+    }
+    add_measured_channel(targets, "identifier", ranked);
+}
+
+/// Free prose of one Candidate draft: statement, rationale and every Evidence text leaf.
+fn draft_prose(draft: &ContextRevisionDraft) -> Vec<String> {
+    let mut texts = vec![draft.statement.clone(), draft.rationale.clone()];
+    for evidence in &draft.evidence {
+        texts.push(evidence.supports.clone());
+        texts.push(evidence.interpretation.clone());
+        hints::json_string_leaves(&evidence.content, &mut texts);
+    }
+    texts
+}
+
+/// Free prose of one immutable revision, read exactly the way [`draft_prose`] reads a draft.
+fn revision_prose(revision: &ContextRevision) -> Vec<String> {
+    let mut texts = vec![revision.statement.clone(), revision.rationale.clone()];
+    for evidence in &revision.evidence {
+        texts.push(evidence.supports.clone());
+        texts.push(evidence.interpretation.clone());
+        hints::json_string_leaves(&evidence.content, &mut texts);
+    }
+    texts
 }
 
 fn add_explicit_channel(
@@ -353,7 +664,7 @@ fn add_graph_channel(
         .collect::<BTreeMap<_, _>>();
     let mut ranked = Vec::new();
     for artifact in artifacts {
-        let key = ArtifactKey::derive(artifact.repository_id, artifact.locator.clone())?;
+        let key = ArtifactKey::derive(artifact.repository_id.clone(), artifact.locator.clone())?;
         for reference in &graph.projection.references {
             if reference.resolution.resolved_artifact.as_ref() != Some(&key)
                 || reference.association.is_none()
@@ -384,9 +695,11 @@ fn add_graph_channel(
                             CandidateAssessmentPath::ContextRelationHop { relation, depth },
                         );
                     }
-                    if let Some(graph_context) = graph_contexts.get(&target) {
-                        state.safe |= graph_context.safety.automatic_injection_eligible;
-                    }
+                    // The Graph snapshot's own eligibility bit is deliberately *not* merged in
+                    // here. It maps the same three Git-side blockers the domain projection
+                    // already gave [`collect_targets`] and is blind to supersession and the
+                    // `[context_ttl]` verdict, so merging it with `|=` could only raise a
+                    // verdict the authoritative read had lowered.
                 }
                 if depth < 2
                     && let Some(context) = graph_contexts.get(&target)
@@ -405,8 +718,6 @@ fn add_graph_channel(
             }
         }
     }
-    ranked.sort();
-    ranked.dedup();
     add_ranked_channel(targets, "graph", ranked);
     Ok(())
 }
@@ -431,7 +742,12 @@ fn add_bm25_channel(
                     },
                 );
             }
-            state.safe &= result.auto_injection_eligible;
+            // `result.auto_injection_eligible` is deliberately not merged in. It used to be the
+            // only place the index-derived retirement state reached the safety bit, which left
+            // `safe` meaning two different things inside one ranked list: "Git-side and not
+            // retired" for the targets that happened to land on the single-token FTS page, and
+            // "Git-side only" for every other target. [`collect_targets`] now computes the
+            // authoritative value for all of them, before any channel draws a line.
         }
     }
     add_ranked_channel(targets, "bm25", ranked);
@@ -440,13 +756,59 @@ fn add_bm25_channel(
 fn add_ranked_channel(
     targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
     channel: &'static str,
-    mut values: Vec<ContextRevisionRef>,
+    values: Vec<ContextRevisionRef>,
 ) {
-    values.sort();
-    values.dedup();
-    for (rank, target) in values.into_iter().enumerate() {
+    // The caller owns relevance order; repeated hits keep their first position.
+    let mut seen = BTreeSet::new();
+    for (rank, target) in values
+        .into_iter()
+        .filter(|target| seen.insert(*target))
+        .enumerate()
+    {
         if let Some(state) = targets.get_mut(&target) {
             state.channels.entry(channel).or_insert(rank + 1);
+        }
+    }
+}
+
+/// Ranks one *set* channel by the measurement that put each member in it.
+///
+/// [`add_ranked_channel`] hands the order to its caller, which is right for the three channels
+/// that have one — `explicit` is a caller-supplied list, `graph` a traversal order, `bm25` a
+/// relevance ranking. The five channels here have no order of their own: they are built by
+/// walking `targets`, which is a `BTreeMap` keyed by `ContextRevisionRef`, and both of its ID
+/// fields are `Uuid::new_v4`. Their iteration order is therefore sixteen random bytes, and
+/// feeding it to `add_ranked_channel` spent the channel's whole RRF spread on it — measured on
+/// the real installation, the `scope` channel's random swing (about 9,200 with eleven
+/// same-domain revisions) exceeded the full spread of `bm25`, the one channel whose order means
+/// something (about 3,400 over eight hits).
+///
+/// So each member arrives with the number that qualified it — statement similarity for
+/// `canonical`/`statement`, shared identifier count for `identifier`, overlapping domain count
+/// for `scope` — and equal measurements share one rank. Sharing is the honest half: two targets
+/// the channel cannot tell apart must not be separated by their IDs, and `topic` (a yes-or-no
+/// match with nothing behind it to grade) measures every member identically and so ranks them
+/// all first. The one remaining arbitrary choice, which of two equally scored targets is listed
+/// first, stays where it already was: the `left.0.cmp(&right.0)` tie-break on the final ranking.
+fn add_measured_channel(
+    targets: &mut BTreeMap<ContextRevisionRef, TargetState>,
+    channel: &'static str,
+    mut values: Vec<(u64, ContextRevisionRef)>,
+) {
+    values.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut seen = BTreeSet::new();
+    let mut rank = 0;
+    let mut previous = None;
+    for (measurement, target) in values
+        .into_iter()
+        .filter(|(_, target)| seen.insert(*target))
+    {
+        if previous != Some(measurement) {
+            rank += 1;
+            previous = Some(measurement);
+        }
+        if let Some(state) = targets.get_mut(&target) {
+            state.channels.entry(channel).or_insert(rank);
         }
     }
 }
@@ -466,6 +828,7 @@ fn channel_weight(channel: &str) -> u64 {
         "canonical" => 1_000,
         "explicit" | "graph" => 900,
         "statement" => 850,
+        "identifier" => 800,
         "topic" => 700,
         "scope" => 400,
         "bm25" => 200,
@@ -477,6 +840,7 @@ fn rrf(weight: u64, rank: usize) -> u64 {
     weight.saturating_mul(10_000) / (RRF_K + u64::try_from(rank).unwrap_or(u64::MAX))
 }
 
+#[allow(clippy::too_many_lines)]
 fn assess_target(
     candidate: &ContextRevisionDraft,
     target: ContextRevisionRef,
@@ -487,28 +851,153 @@ fn assess_target(
     let topic = state.channels.contains_key("topic");
     let explicit_or_graph =
         state.channels.contains_key("explicit") || state.channels.contains_key("graph");
-    let strong_scope = state.paths.iter().any(|path| {
-        matches!(
-            path,
-            CandidateAssessmentPath::ScopeOverlap { domains, .. } if !domains.is_empty()
-        )
-    });
-    let relation = if canonical {
+    // Sharing at least one exact Artifact is the engineering-strength scope signal. A bare
+    // applicability domain overlap is not: every Claim of one Task inherits the same Intent
+    // domains, so it used to make unrelated Claims contradict each other.
+    let shared_artifact = state
+        .paths
+        .iter()
+        .any(|path| matches!(path, CandidateAssessmentPath::ExactArtifactGraph { .. }));
+    let similarity = state.statement_similarity;
+    let statement_differs = normalize_search_text(&state.revision.statement)
+        != normalize_search_text(&candidate.statement);
+    let negation_conflict = state.negation_conflict;
+    // `state.negation_conflict` only fires above `STATEMENT_SIMILARITY_STRONG_BASIS_POINTS`
+    // ([`add_exact_channels`]), which the topic-key path below is never reached above (that
+    // similarity band already resolves as `supports` at the `statement` channel check). A
+    // differing negation or polarity marker is still decisive at any similarity, so it is
+    // recomputed here without that gate.
+    let topic_negation_conflict =
+        negation_markers(&candidate.statement) != negation_markers(&state.revision.statement);
+    // See [`STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS`]: word-order overlap tells a paraphrase of
+    // one topic-matched fact from an independently written, potentially opposed one.
+    let topic_bigram_paraphrase =
+        statement_bigram_jaccard_basis_points(&candidate.statement, &state.revision.statement)
+            >= STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS;
+    // A topic-key match with a differing statement is worth a human contradiction review only
+    // when the wording is not itself explainable as a paraphrase: a clear negation/polarity
+    // mismatch, or bigram overlap low enough that the two statements are not simply the same
+    // conclusion reworded (see [`STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS`]).
+    let topic_statement_conflict =
+        topic && statement_differs && (topic_negation_conflict || !topic_bigram_paraphrase);
+    // A shared identifier set is only strong within one Context kind: an `issue` and the
+    // `validation` that exercises the same class are related, not the same fact.
+    let shared_identifiers = state.shared_identifiers.len();
+    let same_kind = state.revision.kind == candidate.kind;
+    let strong_identifier = shared_identifiers >= SHARED_IDENTIFIER_STRONG_OVERLAP && same_kind;
+    let identifier_restates = similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS
+        || shared_identifiers >= SHARED_IDENTIFIER_SUPPORT_OVERLAP;
+    // The same statement on the same topic is the same fact, whatever else the two drafts carry:
+    // two Tasks recording one finding differ in Evidence identity, `problem_view` and rationale
+    // wording, none of which makes the second a new fact. Whole-draft equality still wins first so
+    // the stronger path keeps its own trigger text.
+    let restates_topic = topic && !statement_differs;
+    // One conclusion written a second time against a Context the knowledge base already accepted.
+    // The topic key is optional, so without this path a Task that restated an accepted conclusion
+    // in its own words and typed no topic reached only `supports` or `unresolved_related`, and the
+    // reviewer confirmed the same fact again. It is deliberately confined to a rewritten
+    // statement: an identical statement filed under a different topic key stays `supports`, which
+    // is the "same statement, new Evidence" case, and a differing statement under a matching topic
+    // key stays a contradiction to review. A shared exact Artifact is also left alone: that is
+    // proof the two Claims are about the same code, and the existing path sends a differing
+    // statement over shared code to contradiction review, which is the stronger, evidence-backed
+    // reading. The restatements this catches carry no shared Artifact — they predate server-side
+    // Reference derivation, which is exactly why nothing but their wording connects them.
+    let near_duplicate = state.accepted
+        && !topic
+        && !shared_artifact
+        && statement_differs
+        && !negation_conflict
+        && similarity >= STATEMENT_NEAR_DUPLICATE_BASIS_POINTS;
+    if near_duplicate {
+        add_path(
+            &mut state,
+            CandidateAssessmentPath::NearDuplicateStatement {
+                similarity_basis_points: similarity,
+            },
+        );
+    }
+    let relation = if negation_conflict {
+        CandidateAssessmentRelation::PotentialContradiction
+    } else if canonical || restates_topic || near_duplicate {
         CandidateAssessmentRelation::ExactDuplicate
     } else if statement {
         CandidateAssessmentRelation::Supports
     } else if topic && explicit_or_graph {
         CandidateAssessmentRelation::Revises
-    } else if (topic || strong_scope)
-        && normalize_search_text(&state.revision.statement)
-            != normalize_search_text(&candidate.statement)
+    } else if strong_identifier {
+        if identifier_restates {
+            CandidateAssessmentRelation::Supports
+        } else {
+            CandidateAssessmentRelation::PotentialContradiction
+        }
+    } else if topic_statement_conflict
+        || (statement_differs
+            && shared_artifact
+            && similarity >= STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS)
     {
         CandidateAssessmentRelation::PotentialContradiction
     } else {
         CandidateAssessmentRelation::UnresolvedRelated
     };
+    let trigger = if negation_conflict {
+        format!("Path: statement similarity {similarity} basis points but negation markers differ")
+    } else if canonical {
+        format!("Path: canonical draft equality at statement similarity {similarity} basis points")
+    } else if restates_topic {
+        "Path: normalized statement equality on one topic key".to_owned()
+    } else if near_duplicate {
+        format!(
+            "Path: statement similarity {similarity} basis points against an accepted Context at or above the {STATEMENT_NEAR_DUPLICATE_BASIS_POINTS} near-duplicate threshold"
+        )
+    } else if statement {
+        if similarity >= 10_000 {
+            "Path: normalized statement equality".to_owned()
+        } else {
+            format!(
+                "Path: statement similarity {similarity} basis points at or above the {STATEMENT_SIMILARITY_STRONG_BASIS_POINTS} threshold"
+            )
+        }
+    } else if topic && explicit_or_graph {
+        "Path: topic equality with an explicit Context or exact Artifact Graph link".to_owned()
+    } else if strong_identifier {
+        if identifier_restates {
+            format!(
+                "Path: {shared_identifiers} shared repository identifiers on the same Context kind, statement similarity {similarity} basis points"
+            )
+        } else {
+            format!(
+                "Path: {shared_identifiers} shared repository identifiers on the same Context kind while the statement differs, similarity {similarity} basis points"
+            )
+        }
+    } else if topic && statement_differs {
+        if topic_negation_conflict {
+            "Path: topic equality with a differing statement and a negation/polarity marker mismatch".to_owned()
+        } else if topic_statement_conflict {
+            format!(
+                "Path: topic equality with a differing statement, bigram overlap below the {STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS} paraphrase threshold"
+            )
+        } else {
+            format!(
+                "Path: topic equality with a differing statement read as a paraphrase at or above the {STATEMENT_BIGRAM_PARAPHRASE_BASIS_POINTS} bigram threshold"
+            )
+        }
+    } else if matches!(
+        relation,
+        CandidateAssessmentRelation::PotentialContradiction
+    ) {
+        format!("Path: a shared exact Artifact with statement similarity {similarity} basis points")
+    } else if shared_artifact {
+        format!(
+            "Path: a shared exact Artifact with statement similarity {similarity} basis points below the {STATEMENT_SIMILARITY_REVIEW_BASIS_POINTS} review threshold"
+        )
+    } else {
+        format!("Path: retrieval proximity only, statement similarity {similarity} basis points")
+    };
     if !state.safe {
-        let reason = if state.space_conflicted {
+        let reason = if let Some(retirement_reason) = state.retirement_reason.clone() {
+            retirement_reason
+        } else if state.space_conflicted {
             "Target Space Intent is conflicted; no winner was selected".to_owned()
         } else {
             "Target Context is not safe for automatic factual promotion".to_owned()
@@ -519,9 +1008,17 @@ fn assess_target(
         );
     }
     let (points, relation_reason) = match relation {
-        CandidateAssessmentRelation::ExactDuplicate => (
+        CandidateAssessmentRelation::ExactDuplicate if canonical => (
             10_000,
             "The complete canonical Candidate draft equals the immutable Context revision",
+        ),
+        CandidateAssessmentRelation::ExactDuplicate if near_duplicate => (
+            9_500,
+            "The statement restates a conclusion the knowledge base already accepted; confirming it again needs an explicit supersedes or contradicts decision",
+        ),
+        CandidateAssessmentRelation::ExactDuplicate => (
+            10_000,
+            "The statement and the topic key both equal the immutable Context revision; this restates a fact the knowledge base already holds",
         ),
         CandidateAssessmentRelation::Supports => (
             9_000,
@@ -549,10 +1046,144 @@ fn assess_target(
             rationale: relation_reason.to_owned(),
         },
         paths: state.paths,
-        reasons: vec![relation_reason.to_owned()],
+        reasons: identifier_reason(&state.shared_identifiers, same_kind)
+            .into_iter()
+            .fold(
+                vec![relation_reason.to_owned(), trigger],
+                |mut reasons, reason| {
+                    reasons.push(reason);
+                    reasons
+                },
+            ),
     }
 }
 
+/// Names the shared identifiers so a reviewer can see why two differently worded Claims met.
+///
+/// A cross-kind overlap stays `unresolved_related`, but the reviewer still learns which code the
+/// two Claims have in common, which is the whole reason the target was retrieved.
+fn identifier_reason(shared: &[String], same_kind: bool) -> Option<String> {
+    if shared.len() < SHARED_IDENTIFIER_STRONG_OVERLAP {
+        return None;
+    }
+    let named = shared.join(", ");
+    Some(if same_kind {
+        format!("Shared repository identifiers: {named}")
+    } else {
+        format!("Shared repository identifiers on a different Context kind: {named}")
+    })
+}
+
+/// English negation words compared as whole tokens.
+const ENGLISH_NEGATION_MARKERS: &[&str] = &["not", "no", "never", "cannot", "without", "fails"];
+/// Chinese negation markers compared as substrings of the raw statement.
+const CHINESE_NEGATION_MARKERS: &[&str] = &["没有", "不会", "不能", "不", "无", "未"];
+
+/// Collects the negation markers of one raw statement.
+///
+/// This reads the raw statement rather than the normalized token stream so a Chinese marker is
+/// found regardless of how the tokenizer segments the surrounding characters.
+fn negation_markers(statement: &str) -> BTreeSet<&'static str> {
+    let lowered = statement.to_lowercase();
+    let mut markers = BTreeSet::new();
+    for word in lowered.split(|character: char| !character.is_alphanumeric()) {
+        if let Some(marker) = ENGLISH_NEGATION_MARKERS
+            .iter()
+            .find(|marker| **marker == word)
+        {
+            markers.insert(*marker);
+        }
+    }
+    for marker in CHINESE_NEGATION_MARKERS {
+        if statement.contains(marker) {
+            markers.insert(*marker);
+        }
+    }
+    markers
+}
+
+/// Splits one already normalized statement into its deduplicated search token set.
+fn token_set(normalized: &str) -> BTreeSet<&str> {
+    normalized.split_whitespace().collect()
+}
+
+/// Jaccard overlap of two token sets in basis points; two empty sets never overlap.
+fn jaccard_basis_points(left: &BTreeSet<&str>, right: &BTreeSet<&str>) -> u64 {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let intersection = left.intersection(right).count() as u64;
+    let union = left.union(right).count() as u64;
+    if union == 0 {
+        return 0;
+    }
+    intersection.saturating_mul(10_000) / union
+}
+
+/// Adjacent-token bigrams of one already-normalized, whitespace-joined statement.
+///
+/// A bag of tokens cannot see order: a Claim that reuses another one's vocabulary in a different
+/// arrangement scores identically to a verbatim rewrite. Pairing each token with its neighbor
+/// recovers enough sequence to tell a paraphrase of one fact — which still reproduces most of its
+/// neighbor pairs after synonym substitution and light restructuring — from an independently
+/// written Claim that merely shares a topic, whose neighbor pairs rarely coincide. A statement of
+/// fewer than two tokens carries no bigram, so it never counts as a paraphrase of anything.
+fn token_bigrams(normalized: &str) -> BTreeSet<String> {
+    let tokens = normalized.split_whitespace().collect::<Vec<_>>();
+    tokens
+        .windows(2)
+        .map(|pair| format!("{} {}", pair[0], pair[1]))
+        .collect()
+}
+
+/// Bigram Jaccard of two raw statements, normalized and tokenized the same way as
+/// [`token_set`]. Reuses [`jaccard_basis_points`] over the bigram vocabulary instead of the
+/// unigram one.
+fn statement_bigram_jaccard_basis_points(left: &str, right: &str) -> u64 {
+    let left_bigrams = token_bigrams(&normalize_search_text(left));
+    let right_bigrams = token_bigrams(&normalize_search_text(right));
+    let left_refs = left_bigrams.iter().map(String::as_str).collect();
+    let right_refs = right_bigrams.iter().map(String::as_str).collect();
+    jaccard_basis_points(&left_refs, &right_refs)
+}
+
+/// The one legal representation of "retrieval returned nothing", not a proof of novelty.
+///
+/// A `Complete` analysis must carry at least one assessment (`CandidateAnalysis::validate`), and
+/// `novel` is the only relation allowed to carry no target, so a Candidate whose eight channels
+/// all came up empty can only be written down this way. The `6_000` basis points are a constant
+/// of the relation like every other rung of the ladder in [`assess_target`]; they are not a
+/// measure of how novel anything is, and they are not a token budget.
+///
+/// **`novel` is reachable.** A 2026-09-08 analysis
+/// (`docs/refactor-r1-r4/candidate-noise-plan.md`, hard finding ①) concluded it was
+/// *structurally* unreachable on any populated installation, reasoning that the `scope` channel
+/// fires on any non-empty `domains` intersection and that a Claim's `domains` are inherited from
+/// the Task Working Intent, so some neighbour always survives. That conclusion is withdrawn. It
+/// was already contradicted by the same audit's own count (one `novel` in 207 rows, via
+/// `no_sufficient_candidate`), it is asserted as a pass criterion by the paired real-host smoke
+/// (`tests/scripts/real_host_smoke_pair.py` expects `[["novel"]]` on a fresh installation), and it
+/// was observed again on 2026-09-12 with `relation: "novel"`, `paths:
+/// [no_sufficient_candidate]`, `6000bp`.
+///
+/// What the withdrawn argument missed is that the evaluation set shrank underneath it.
+/// [`current_revision_ids`] now admits one revision per Context -- the governance revision -- where
+/// every node of every revision DAG used to be its own target. The three externally-ordered
+/// channels (`bm25`, `graph`, `explicit`) attach by exact `ContextRevisionRef` lookup and drop a
+/// hit whose revision is no longer in the map, silently. BM25 is the broadest of them and searches
+/// retired statuses, so a full-text hit that landed only on an older wording now evaporates. The
+/// `scope` channel is untouched, so the argument's mechanism is still real -- it just is not
+/// exhaustive, and a Claim whose inherited `domains` intersect nothing still reaches zero
+/// neighbours.
+///
+/// The consequence for ADR-0005's second disposition tier: automatic confirmation of a `novel`
+/// Candidate is **not** a dead clause. It is narrow for a different reason than the withdrawn one.
+/// `review_status` below returns `NeedsSpaceReview` unless some recommendation is
+/// `Existing { role: Primary }`, and Primary election requires `safe_strong_target`, which a
+/// `novel` analysis cannot set through a target (it has none) and therefore only gets from a
+/// resolved `proposed_space_group_space_id`. So a `novel` Candidate reaches `ready_for_review`
+/// exactly when its Task's proposed Space group has already resolved onto a real Space -- the
+/// second gate, which that same document identified as hard finding ② without connecting it to ①.
 fn novel_assessment() -> CandidateRelationAssessment {
     CandidateRelationAssessment {
         relation: CandidateAssessmentRelation::Novel,
@@ -569,14 +1200,16 @@ fn novel_assessment() -> CandidateRelationAssessment {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn recommend_spaces(
     snapshot: &DomainSnapshot,
     assessments: &[CandidateRelationAssessment],
     safe_targets: &BTreeMap<ContextRevisionRef, bool>,
     source_associations: &[TaskSpaceAssociation],
     candidate_associations: &[TaskSpaceAssociation],
-    candidate: &ContextRevisionDraft,
+    source_working_intent: &WorkingIntentSnapshot,
+    proposed_space_group_key: ProposedSpaceGroupKey,
+    proposed_space_group_space_id: Option<SpaceId>,
     top_k: usize,
 ) -> Vec<CandidateSpaceRecommendation> {
     let owners = snapshot
@@ -630,6 +1263,17 @@ fn recommend_spaces(
     }
     add_association_spaces(&mut spaces, source_associations, 500, false);
     add_association_spaces(&mut spaces, candidate_associations, 600, true);
+    if let Some(space_id) = proposed_space_group_space_id {
+        let state = spaces.entry(space_id).or_default();
+        state.score = state.score.saturating_add(PROPOSED_SPACE_GROUP_SCORE);
+        state.safe_strong_target = true;
+        push_space_path(
+            state,
+            CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved {
+                proposed_space_group_key,
+            },
+        );
+    }
     for (space_id, state) in &mut spaces {
         if snapshot
             .projection
@@ -687,17 +1331,25 @@ fn recommend_spaces(
             )
         })
         .collect::<Vec<_>>();
-    if primary.is_none() {
-        recommendations.push(CandidateSpaceRecommendation::proposed_new_with_paths(
-            proposed_intent(candidate),
-            "System suggestion: no safe existing Space exceeded the Primary threshold",
-            CandidateConfidence {
-                basis_points: 6_000,
-                rationale: "No safe fused existing-Space candidate reached the Primary threshold"
-                    .to_owned(),
-            },
-            vec![CandidateSpaceRecommendationPath::ProposedFromCandidate],
-        ));
+    if primary.is_none() && proposed_space_group_space_id.is_none() {
+        recommendations.push(
+            CandidateSpaceRecommendation::proposed_new_for_group_with_paths(
+                proposed_space_group_key,
+                proposed_intent(source_working_intent),
+                "No safe existing Space exceeded the Primary threshold; confirming here opens a provisional Space named from the Task goal",
+                CandidateConfidence {
+                    basis_points: 6_000,
+                    rationale:
+                        "No safe fused existing-Space candidate reached the Primary threshold"
+                            .to_owned(),
+                },
+                vec![
+                    CandidateSpaceRecommendationPath::ProposedFromTaskIntentRevision {
+                        proposed_space_group_key,
+                    },
+                ],
+            ),
+        );
     }
     recommendations
 }
@@ -729,36 +1381,74 @@ fn add_association_spaces(
     }
 }
 
-fn proposed_intent(candidate: &ContextRevisionDraft) -> IntentSnapshot {
-    let title_source = candidate
-        .topic_key
-        .as_deref()
-        .unwrap_or(&candidate.statement);
-    let title = title_source.chars().take(80).collect::<String>();
-    let mut in_scope = candidate
-        .applicability
-        .domains
-        .iter()
-        .chain(&candidate.applicability.platforms)
-        .chain(&candidate.applicability.conditions)
-        .cloned()
-        .collect::<Vec<_>>();
+fn proposed_intent(source: &WorkingIntentSnapshot) -> IntentSnapshot {
+    let mut in_scope = source.in_scope.clone();
     if in_scope.is_empty() {
-        in_scope.push(candidate.statement.clone());
+        in_scope.push(source.goal.clone());
+    }
+    let mut acceptance_conditions = source.acceptance_conditions.clone();
+    if acceptance_conditions.is_empty() {
+        acceptance_conditions.push(source.goal.clone());
     }
     IntentSnapshot {
-        title: format!("System suggestion: {title}"),
-        problem: candidate.rationale.clone(),
-        desired_outcome: candidate.statement.clone(),
+        title: proposed_space_title(&source.goal),
+        problem: source
+            .current_direction
+            .clone()
+            .unwrap_or_else(|| source.goal.clone()),
+        desired_outcome: source.goal.clone(),
         in_scope,
-        out_of_scope: candidate.assumptions.clone(),
-        acceptance_conditions: candidate
-            .evidence
-            .iter()
-            .map(|evidence| evidence.supports.clone())
-            .collect(),
-        domain_terms: candidate.applicability.domains.clone(),
+        out_of_scope: source.out_of_scope.clone(),
+        acceptance_conditions,
+        domain_terms: source.domains.clone(),
     }
+}
+
+fn proposed_space_title(goal: &str) -> String {
+    let words = strip_system_suggestion_prefix(goal);
+    let normalized = words.join(" ");
+    if normalized.is_empty() {
+        return FALLBACK_PROPOSED_SPACE_TITLE.to_owned();
+    }
+    if normalized.chars().count() <= PROPOSED_SPACE_TITLE_MAX_CHARS {
+        return normalized;
+    }
+    let mut title = normalized
+        .chars()
+        .take(PROPOSED_SPACE_TITLE_MAX_CHARS)
+        .collect::<String>();
+    // Elide at the exact character bound rather than a word bound: a goal can be written in a
+    // script without spaces, where word truncation either keeps everything or nothing.
+    while title.ends_with(char::is_whitespace) {
+        title.pop();
+    }
+    title.push('\u{2026}');
+    title
+}
+
+/// Title used when a Working Intent goal carries nothing but the historical prefix.
+const FALLBACK_PROPOSED_SPACE_TITLE: &str = "Task intent";
+
+/// Splits a goal into whitespace-collapsed words with any historical `System suggestion:` prefix
+/// removed. Older goals were written with that prefix, and it says nothing about the work.
+fn strip_system_suggestion_prefix(goal: &str) -> Vec<&str> {
+    let words = goal.split_whitespace().collect::<Vec<_>>();
+    let mut start = 0;
+    if words.len() >= 2
+        && words[0].eq_ignore_ascii_case("system")
+        && words[1]
+            .trim_end_matches([':', '-', '\u{2014}'])
+            .eq_ignore_ascii_case("suggestion")
+    {
+        start = 2;
+        if words.get(start).is_some_and(|word| {
+            word.chars()
+                .all(|character| matches!(character, ':' | '-' | '\u{2014}'))
+        }) {
+            start += 1;
+        }
+    }
+    words[start..].to_vec()
 }
 
 fn enforce_budget(
@@ -808,7 +1498,7 @@ fn estimate_tokens(value: &impl serde::Serialize) -> Result<usize> {
 fn review_status(
     analysis: &CandidateAnalysis,
     recommendations: &[CandidateSpaceRecommendation],
-    confidence: &CandidateConfidence,
+    has_blocking_unknowns: bool,
 ) -> AutomaticCandidateStatus {
     if analysis
         .assessments
@@ -830,7 +1520,7 @@ fn review_status(
         )
     }) {
         AutomaticCandidateStatus::NeedsSpaceReview
-    } else if confidence.basis_points < 5_000 {
+    } else if has_blocking_unknowns || analysis.status == CandidateAnalysisStatus::Failed {
         AutomaticCandidateStatus::NeedsEvidence
     } else {
         AutomaticCandidateStatus::ReadyForReview
@@ -857,6 +1547,22 @@ fn candidate_query(candidate: &ContextRevisionDraft) -> String {
 }
 
 fn candidate_working_intent(candidate: &ContextRevisionDraft) -> WorkingIntentSnapshot {
+    let mut seen_acceptance_conditions = BTreeSet::new();
+    let acceptance_conditions = candidate
+        .evidence
+        .iter()
+        .filter_map(|evidence| {
+            let canonical = evidence
+                .supports
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            seen_acceptance_conditions
+                .insert(canonical)
+                .then(|| evidence.supports.clone())
+        })
+        .collect();
     WorkingIntentSnapshot {
         goal: candidate.statement.clone(),
         current_direction: Some(candidate.rationale.clone()),
@@ -865,11 +1571,7 @@ fn candidate_working_intent(candidate: &ContextRevisionDraft) -> WorkingIntentSn
         domains: candidate.applicability.domains.clone(),
         platforms: candidate.applicability.platforms.clone(),
         constraints: candidate.assumptions.clone(),
-        acceptance_conditions: candidate
-            .evidence
-            .iter()
-            .map(|evidence| evidence.supports.clone())
-            .collect(),
+        acceptance_conditions,
         artifact_hints: Vec::new(),
         interface_hints: Vec::new(),
         open_questions: Vec::new(),
@@ -880,11 +1582,13 @@ fn revision_draft(revision: &ContextRevision) -> ContextRevisionDraft {
     ContextRevisionDraft {
         kind: revision.kind,
         topic_key: revision.topic_key.clone(),
+        problem_view: revision.problem_view.clone(),
         statement: revision.statement.clone(),
         rationale: revision.rationale.clone(),
         applicability: revision.applicability.clone(),
         assumptions: revision.assumptions.clone(),
         recheck_when: revision.recheck_when.clone(),
+        hints: revision.hints.clone(),
         relations: revision.relations.clone(),
         evidence: revision
             .evidence
@@ -930,5 +1634,205 @@ fn add_path(state: &mut TargetState, path: CandidateAssessmentPath) {
 fn push_space_path(state: &mut SpaceState, path: CandidateSpaceRecommendationPath) {
     if !state.paths.contains(&path) {
         state.paths.push(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_status_uses_evidence_gaps_not_relation_confidence() {
+        let analysis = CandidateAnalysis {
+            status: CandidateAnalysisStatus::Complete,
+            assessments: vec![CandidateRelationAssessment {
+                relation: CandidateAssessmentRelation::UnresolvedRelated,
+                target: Some(ContextRevisionRef {
+                    context_id: sctx_domain::ContextId::new(),
+                    revision_id: sctx_domain::RevisionId::new(),
+                }),
+                confidence: CandidateConfidence {
+                    basis_points: 4_000,
+                    rationale: "Relation remains unresolved".to_owned(),
+                },
+                paths: vec![CandidateAssessmentPath::ContextFullText {
+                    matched_terms: vec!["budget".to_owned()],
+                }],
+                reasons: vec!["Retrieval is not a lack of evidence".to_owned()],
+            }],
+            context_tree_oid: Some("a".repeat(40)),
+            context_generation: Some(1),
+            token_budget: 4096,
+            estimated_tokens: 128,
+            ..CandidateAnalysis::default()
+        };
+        analysis.validate().unwrap();
+        let recommendations = vec![CandidateSpaceRecommendation::existing(
+            SpaceId::new(),
+            RecommendedSpaceRole::Primary,
+            "Current owner",
+            CandidateConfidence {
+                basis_points: 9_000,
+                rationale: "Verified owner".to_owned(),
+            },
+        )];
+        assert_eq!(
+            review_status(&analysis, &recommendations, false),
+            AutomaticCandidateStatus::ReadyForReview
+        );
+        assert_eq!(
+            review_status(&analysis, &recommendations, true),
+            AutomaticCandidateStatus::NeedsEvidence
+        );
+        let failed = CandidateAnalysis {
+            status: CandidateAnalysisStatus::Failed,
+            error_code: Some("analysis_invalid_input".to_owned()),
+            ..CandidateAnalysis::default()
+        };
+        failed.validate().unwrap();
+        assert_eq!(
+            review_status(&failed, &recommendations, false),
+            AutomaticCandidateStatus::NeedsEvidence
+        );
+        assert_eq!(
+            review_status(&analysis, &[], false),
+            AutomaticCandidateStatus::NeedsSpaceReview
+        );
+    }
+
+    fn ranked_target() -> (ContextRevisionRef, TargetState) {
+        let revision = ContextRevision {
+            revision_id: sctx_domain::RevisionId::new(),
+            parent_revision_ids: Vec::new(),
+            kind: sctx_domain::ContextKind::Discovery,
+            topic_key: None,
+            problem_view: None,
+            statement: "A ranking target".to_owned(),
+            rationale: "Only channel rank is under test".to_owned(),
+            applicability: Applicability::default(),
+            assumptions: Vec::new(),
+            recheck_when: Vec::new(),
+            hints: Vec::new(),
+            relations: Vec::new(),
+            evidence: Vec::new(),
+        };
+        let target = ContextRevisionRef {
+            context_id: sctx_domain::ContextId::new(),
+            revision_id: revision.revision_id,
+        };
+        (
+            target,
+            TargetState {
+                revision,
+                safe: true,
+                accepted: true,
+                retirement_reason: None,
+                space_conflicted: false,
+                channels: BTreeMap::new(),
+                paths: Vec::new(),
+                score: 0,
+                statement_similarity: 0,
+                negation_conflict: false,
+                shared_identifiers: Vec::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn ranked_channel_keeps_input_order_and_first_duplicate_position() {
+        let mut targets = BTreeMap::from([ranked_target(), ranked_target(), ranked_target()]);
+        let ids = targets.keys().copied().collect::<Vec<_>>();
+        add_ranked_channel(
+            &mut targets,
+            "bm25",
+            vec![ids[2], ids[0], ids[2], ids[1], ids[0]],
+        );
+        assert_eq!(targets[&ids[2]].channels["bm25"], 1);
+        assert_eq!(targets[&ids[0]].channels["bm25"], 2);
+        assert_eq!(targets[&ids[1]].channels["bm25"], 3);
+
+        // Explicit references are an unordered set and retain their canonical ID order.
+        add_explicit_channel(&[ids[2], ids[0], ids[2], ids[1]], &mut targets);
+        for (rank, id) in ids.iter().enumerate() {
+            assert_eq!(targets[id].channels["explicit"], rank + 1);
+        }
+    }
+
+    #[test]
+    fn a_measured_channel_ranks_by_its_measurement_and_never_by_context_id() {
+        let mut targets = BTreeMap::from([ranked_target(), ranked_target(), ranked_target()]);
+        let ids = targets.keys().copied().collect::<Vec<_>>();
+        // Adversarial ID order: the weakest measurement carries the lowest `ContextRevisionRef`,
+        // which is the position the `BTreeMap` walk used to hand it.
+        add_measured_channel(
+            &mut targets,
+            "scope",
+            vec![(1, ids[0]), (3, ids[1]), (3, ids[2])],
+        );
+        assert_eq!(targets[&ids[1]].channels["scope"], 1);
+        assert_eq!(
+            targets[&ids[2]].channels["scope"], 1,
+            "two targets the channel measured identically share one rank"
+        );
+        assert_eq!(targets[&ids[0]].channels["scope"], 2);
+
+        // A channel with nothing to grade measures every member identically, so every member
+        // ranks first and the channel contributes its weight without ordering anything. This is
+        // the `topic` channel's shape.
+        add_measured_channel(
+            &mut targets,
+            "topic",
+            vec![(0, ids[2]), (0, ids[0]), (0, ids[1])],
+        );
+        for id in &ids {
+            assert_eq!(targets[id].channels["topic"], 1);
+        }
+    }
+
+    #[test]
+    fn a_short_goal_is_its_own_title_after_normalization() {
+        assert_eq!(
+            proposed_space_title("  Repair   association   recall  "),
+            "Repair association recall"
+        );
+    }
+
+    #[test]
+    fn the_historical_system_suggestion_prefix_is_stripped() {
+        assert_eq!(
+            proposed_space_title("System suggestion: Repair association recall"),
+            "Repair association recall"
+        );
+        assert_eq!(
+            proposed_space_title("System Suggestion — Repair association recall"),
+            "Repair association recall"
+        );
+    }
+
+    #[test]
+    fn a_long_goal_is_elided_at_the_character_bound_in_any_script() {
+        let latin = proposed_space_title(
+            "Build grouped checkout compatibility knowledge for every supported client",
+        );
+        assert_eq!(latin, "Build grouped checkout compatibility kno\u{2026}");
+        assert_eq!(latin.chars().count(), PROPOSED_SPACE_TITLE_MAX_CHARS + 1);
+
+        // A goal written without spaces must still be elided; word truncation could not do this.
+        let han = proposed_space_title(&"评论底栏".repeat(20));
+        assert_eq!(han.chars().count(), PROPOSED_SPACE_TITLE_MAX_CHARS + 1);
+        assert!(han.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn elision_never_leaves_a_dangling_space_before_the_ellipsis() {
+        // The 40th `char` of this goal is the space after "or", which must not be kept.
+        let title = proposed_space_title("Repair association recall in Chinese or English queries");
+        assert_eq!(title, "Repair association recall in Chinese or\u{2026}");
+    }
+
+    #[test]
+    fn a_goal_carrying_only_the_prefix_falls_back_to_a_named_title() {
+        assert_eq!(proposed_space_title("System suggestion:"), "Task intent");
+        assert_eq!(proposed_space_title("   "), "Task intent");
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -46,6 +47,8 @@ fn intent(title: &str) -> IntentSnapshot {
 
 fn context(statement: &str) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Decision,
         topic_key: Some("projection/source-of-truth".to_owned()),
         statement: statement.to_owned(),
@@ -176,7 +179,7 @@ fn submit_candidate(store: &GitStore, request: CandidateSubmissionRequest) -> Pa
 
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let base_store = GitStore::initialize(temporary.path().join("installation")).unwrap();
+    let base_store = GitStore::bootstrap_local(temporary.path().join("installation")).unwrap();
     let index = ProjectionIndex::for_store(&base_store);
     let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
 
@@ -420,7 +423,9 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
         })
         .unwrap();
     assert_eq!(foreign_key_violations, 0);
-    assert_eq!(count_fts_matches(&connection, "context_fts", "SQLite"), 2);
+    // context_fts.title now carries the Context statement title, so the Space Intent title only
+    // matches through space_fts and cannot lift every Context of the Space.
+    assert_eq!(count_fts_matches(&connection, "context_fts", "SQLite"), 1);
     assert_eq!(count_fts_matches(&connection, "space_fts", "SQLite"), 1);
     assert_core_tables(&connection);
 
@@ -435,7 +440,7 @@ fn deletion_rebuilds_complete_projection_and_dirty_tree_is_never_read() {
 #[allow(clippy::too_many_lines)]
 fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad_targets() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("reference-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("reference-installation")).unwrap();
     let space_event = Event::space_created(intent("Reference projection"), None).unwrap();
     let (space_id, _) = space_ids(&space_event);
     append(&store, space_event);
@@ -562,7 +567,7 @@ fn engineering_reference_incremental_projection_matches_scratch_and_isolates_bad
 #[test]
 fn context_relations_keep_cross_space_history_and_fts_across_incremental_and_scratch() {
     let temporary = tempfile::tempdir().unwrap();
-    let store = GitStore::initialize(temporary.path().join("relation-installation")).unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("relation-installation")).unwrap();
     let target_space_event = Event::space_created(intent("Target Space"), None).unwrap();
     let (target_space_id, _) = space_ids(&target_space_event);
     append(&store, target_space_event);
@@ -1024,17 +1029,104 @@ fn manual_modify_delete_and_rename_force_full_equivalent_rebuilds() {
             "APPEND_PROTOCOL_BYPASSED"
         );
 
+        // WP-V6 fix 4: the bypass this synchronize() call just found is persisted, not only
+        // returned -- `sctx doctor` reads exactly this back later, long after the call that
+        // detected it has returned and exited.
+        let persisted = fixture.index.last_rebuild_operational_warnings().unwrap();
+        assert_eq!(persisted.len(), 1, "{operation} must persist the warning");
+        assert_eq!(persisted[0].code, "APPEND_PROTOCOL_BYPASSED");
+        assert_eq!(
+            persisted[0].paths, synchronized.operational_warnings[0].paths,
+            "{operation} persisted paths must match the returned warning"
+        );
+
         let scratch_state = fixture
             .temporary
             .path()
             .join(format!("scratch-{operation}"));
         let scratch = ProjectionIndex::new(fixture.store.repository(), scratch_state);
         scratch.rebuild().unwrap();
+        // The scratch database never went through an incremental attempt that found a bypass --
+        // it has nothing to persist a warning about, which is exactly the asymmetry
+        // `projection_dump` excludes `last_rebuild_operational_warnings` to tolerate.
+        assert!(
+            scratch
+                .last_rebuild_operational_warnings()
+                .unwrap()
+                .is_empty(),
+            "{operation}: a scratch rebuild has no history to warn about"
+        );
         assert_eq!(
             projection_dump(fixture.index.database_path()),
             projection_dump(scratch.database_path()),
             "{operation} projection diverged from scratch"
         );
+    }
+}
+
+/// The persisted warning (WP-V6 fix 4) survives every ordinary incremental sync that follows the
+/// rebuild that found it: an incremental update is not itself a rebuild, and a Session that keeps
+/// working normally after one historical bypass must not make `sctx doctor` forget it happened by
+/// the next time an Agent's automatic retrieval happens to call `synchronize()`.
+#[test]
+fn operational_warning_survives_every_incremental_sync_that_follows_it() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+    assert!(
+        fixture
+            .index
+            .last_rebuild_operational_warnings()
+            .unwrap()
+            .is_empty(),
+        "nothing has bypassed the append protocol yet"
+    );
+
+    let relative = fixture
+        .committed_event_path
+        .strip_prefix(fixture.store.repository())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let replacement = Event::space_created(intent("manual replacement"), None).unwrap();
+    fs::write(
+        &fixture.committed_event_path,
+        serde_json::to_vec(&replacement).unwrap(),
+    )
+    .unwrap();
+    git(fixture.store.repository(), ["add", "--", &relative]);
+    git(
+        fixture.store.repository(),
+        ["commit", "-m", "Bypass append protocol for index test"],
+    );
+    let bypassed = fixture.index.synchronize().unwrap();
+    assert_eq!(bypassed.update_kind, IndexUpdateKind::FullRebuild);
+    let persisted = fixture.index.last_rebuild_operational_warnings().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].code, "APPEND_PROTOCOL_BYPASSED");
+
+    // Three ordinary, purely-additive commits and synchronizations follow -- exactly the shape a
+    // Session working normally after the one bypass produces. `append` writes directly through
+    // `GitStore` without going through the index-aware candidate-submission path, so the
+    // `synchronize()` below always has real, genuinely incremental work to do.
+    for index in 0..3 {
+        append(
+            &fixture.store,
+            Event::space_created(intent(&format!("addition {index} after the bypass")), None)
+                .unwrap(),
+        );
+        let synchronized = fixture.index.synchronize().unwrap();
+        assert_eq!(
+            synchronized.update_kind,
+            IndexUpdateKind::Incremental,
+            "addition {index} must be a clean incremental update, not another rebuild"
+        );
+        let persisted = fixture.index.last_rebuild_operational_warnings().unwrap();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "addition {index}: the warning from the earlier rebuild must still be visible"
+        );
+        assert_eq!(persisted[0].code, "APPEND_PROTOCOL_BYPASSED");
     }
 }
 
@@ -1279,6 +1371,7 @@ fn assert_core_tables(connection: &Connection) {
         "diagnostic",
         "context_fts",
         "space_fts",
+        "token_alias",
     ];
     for table in expected {
         let exists: bool = connection
@@ -1324,7 +1417,8 @@ fn count_fts_matches(connection: &Connection, table: &str, query: &str) -> i64 {
 #[allow(clippy::too_many_lines)]
 fn candidate_confirmation_projection_is_incremental_scratch_and_deletion_equivalent() {
     let temporary = tempfile::tempdir().unwrap();
-    let base_store = GitStore::initialize(temporary.path().join("confirmation-index")).unwrap();
+    let base_store =
+        GitStore::bootstrap_local(temporary.path().join("confirmation-index")).unwrap();
     let index = ProjectionIndex::for_store(&base_store);
     let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
     let request = candidate("Confirmed Candidate content");
@@ -1401,6 +1495,7 @@ fn candidate_confirmation_projection_is_incremental_scratch_and_deletion_equival
                 context_revision_event_id: revision_event_id,
                 space_association_event_id: association_event.event_id(),
                 publication_event_id: publication_event.event_id(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000811",
@@ -1550,10 +1645,138 @@ fn candidate_confirmation_projection_is_incremental_scratch_and_deletion_equival
     assert_eq!(projection_dump(index.database_path()), expected);
 }
 
+/// Reuse must never become a second answer: what one synchronization publishes has to be exactly
+/// what a cold index would reduce from the same Tree, on the full and the incremental path alike.
+#[test]
+fn published_snapshot_equals_a_cold_reduction_of_the_same_tree() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+
+    let published = fixture.index.domain_snapshot().unwrap();
+    let cold = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.temporary.path().join("cold-full"),
+    )
+    .domain_snapshot()
+    .unwrap();
+    assert_eq!(published.projection, cold.projection);
+    assert_eq!(published.diagnostics, cold.diagnostics);
+    assert_eq!(
+        published.metadata.indexed_tree_oid,
+        cold.metadata.indexed_tree_oid
+    );
+    assert_eq!(
+        published,
+        fixture.index.domain_snapshot().unwrap(),
+        "an unchanged Tree keeps answering with the snapshot it already reduced"
+    );
+
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    let space_id: String = connection
+        .query_row("SELECT space_id FROM space_projection", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    drop(connection);
+    append(
+        &fixture.store,
+        Event::context_revision_added(
+            space_id.parse().unwrap(),
+            context("an appended revision invalidates the published snapshot"),
+            None,
+        )
+        .unwrap(),
+    );
+    let incremental = fixture.index.synchronize().unwrap();
+    assert_eq!(incremental.update_kind, IndexUpdateKind::Incremental);
+
+    let appended = fixture.index.domain_snapshot().unwrap();
+    assert_ne!(
+        appended.metadata.indexed_tree_oid,
+        published.metadata.indexed_tree_oid
+    );
+    let cold_appended = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.temporary.path().join("cold-appended"),
+    )
+    .domain_snapshot()
+    .unwrap();
+    assert_eq!(appended.projection, cold_appended.projection);
+    assert_eq!(appended.diagnostics, cold_appended.diagnostics);
+}
+
+/// The introducing-commit memo is a rebuildable Git fact, so a full rebuild must leave it in place
+/// and a process that starts from it must project the same commits a history walk would.
+#[test]
+fn event_commit_memo_matches_projected_commits_and_survives_a_full_rebuild() {
+    let fixture = fixture();
+    fixture.index.synchronize().unwrap();
+
+    let projected = introducing_commits_from(fixture.index.database_path(), "candidate_submission");
+    assert!(
+        !projected.is_empty(),
+        "the fixture submits at least one Candidate"
+    );
+    let memo = event_commit_memo(fixture.index.database_path());
+    for (event_path, commit_oid) in &projected {
+        assert_eq!(
+            memo.get(event_path),
+            Some(commit_oid),
+            "memo disagrees with the projection for {event_path}"
+        );
+    }
+
+    fixture.index.rebuild().unwrap();
+    assert_eq!(
+        event_commit_memo(fixture.index.database_path()),
+        memo,
+        "a full rebuild must not drop the memo"
+    );
+    assert_eq!(
+        introducing_commits_from(fixture.index.database_path(), "candidate_submission"),
+        projected
+    );
+
+    let reopened = ProjectionIndex::new(
+        fixture.store.repository(),
+        fixture.index.database_path().parent().unwrap(),
+    );
+    assert_eq!(
+        reopened.domain_snapshot().unwrap().projection,
+        fixture.index.domain_snapshot().unwrap().projection,
+        "a process warmed from the memo projects the same facts"
+    );
+}
+
+fn introducing_commits_from(database: &Path, table: &str) -> BTreeMap<String, String> {
+    let connection = Connection::open(database).unwrap();
+    let mut statement = connection
+        .prepare(&format!("SELECT event_path, commit_oid FROM {table}"))
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+fn event_commit_memo(database: &Path) -> BTreeMap<String, String> {
+    introducing_commits_from(database, "event_commit")
+}
+
 fn projection_dump(database: &Path) -> Vec<String> {
     let connection = Connection::open(database).unwrap();
     [
-        "SELECT key, value FROM meta WHERE key <> 'projection_generation' ORDER BY key",
+        // `projection_generation` counts how many times this database was synchronized, and
+        // `last_rebuild_operational_warnings` remembers whether a *past* rebuild found committed
+        // history modified outside the append protocol (WP-V6 fix 4): both are properties of this
+        // database's own history, not of the Tree it currently indexes, so two databases that
+        // reach the identical Tree by different paths are allowed to disagree about them without
+        // the projection itself having diverged.
+        "SELECT key, value FROM meta \
+         WHERE key NOT IN ('projection_generation', 'last_rebuild_operational_warnings') \
+         ORDER BY key",
         "SELECT * FROM source_file ORDER BY path",
         "SELECT * FROM context_candidate ORDER BY candidate_id",
         "SELECT * FROM space_projection ORDER BY space_id",
@@ -1577,8 +1800,9 @@ fn projection_dump(database: &Path) -> Vec<String> {
         "SELECT * FROM conflict_resolution ORDER BY resolution_id",
         "SELECT * FROM conflict ORDER BY conflict_key",
         "SELECT * FROM diagnostic ORDER BY diagnostic_key",
-        "SELECT context_id, revision_id, title, statement, rationale, evidence FROM context_fts ORDER BY context_id, revision_id",
+        "SELECT context_id, revision_id, title, statement, rationale, evidence, problem_view, hint_text FROM context_fts ORDER BY context_id, revision_id",
         "SELECT space_id, revision_id, title, problem, desired_outcome, in_scope, out_of_scope, acceptance_conditions, domain_terms FROM space_fts ORDER BY space_id, revision_id",
+        "SELECT * FROM token_alias ORDER BY token, alias, source, group_key",
     ]
     .into_iter()
     .map(|query| dump_query(&connection, query))
@@ -1630,4 +1854,373 @@ fn file_identity(path: &Path) -> u64 {
 #[cfg(not(unix))]
 fn file_identity(path: &Path) -> u64 {
     fs::metadata(path).unwrap().len()
+}
+
+#[test]
+fn topic_key_is_searchable_text_and_seeds_its_own_alias_group() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base_store = GitStore::bootstrap_local(temporary.path().join("topic-key")).unwrap();
+    let index = ProjectionIndex::for_store(&base_store);
+    let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
+
+    let space_event = Event::space_created(intent("Topic key projection"), None).unwrap();
+    let (space_id, _) = space_ids(&space_event);
+    append(&store, space_event);
+
+    let mut content = context("The reviewed branch keeps the fallback bar rendered");
+    // The shape Candidate Build derives: kind, the Repository that placed the spelling, and the
+    // coordinate itself.
+    content.topic_key = Some("decision:Server:app/src/main/kotlin/SampleTopicAssem.kt".to_owned());
+    let revision_event = Event::context_revision_added(space_id, content, None).unwrap();
+    let (_, revision_id) = context_ids(&revision_event);
+    append(&store, revision_event);
+
+    index.rebuild().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+
+    let hint_text: String = connection
+        .query_row(
+            "SELECT hint_text FROM context_revision WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // The coordinate the topic names becomes retrieval text; the kind and the Repository segment
+    // are identity, not words a question is asked in, and stay out of it.
+    let terms = hint_text.split_whitespace().collect::<Vec<_>>();
+    assert!(terms.contains(&"sampletopicassem"), "{hint_text}");
+    assert!(terms.contains(&"kotlin"), "{hint_text}");
+    assert!(!terms.contains(&"server"), "{hint_text}");
+    assert!(!terms.contains(&"decision"), "{hint_text}");
+    assert_eq!(
+        count_fts_matches(&connection, "context_fts", "sampletopicassem"),
+        1
+    );
+
+    let topic_aliases: Vec<String> = connection
+        .prepare(
+            "SELECT alias FROM token_alias
+             WHERE token = 'sampletopicassem' AND source = 'identifier_split'
+             ORDER BY alias",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(topic_aliases, ["assem", "sample", "topic"]);
+    assert_eq!(
+        count_where(
+            &connection,
+            "token_alias",
+            "source = 'identifier_split' AND group_key = 'sample-topic-assem'"
+        ),
+        12
+    );
+    drop(connection);
+
+    let expected = projection_dump(index.database_path());
+    let scratch = ProjectionIndex::new(store.repository(), temporary.path().join("scratch"));
+    scratch.rebuild().unwrap();
+    assert_eq!(projection_dump(scratch.database_path()), expected);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn problem_view_hints_and_alias_groups_project_deterministically() {
+    let temporary = tempfile::tempdir().unwrap();
+    let base_store = GitStore::bootstrap_local(temporary.path().join("problem-view")).unwrap();
+    let index = ProjectionIndex::for_store(&base_store);
+    let store = base_store.with_candidate_submission_index(Arc::new(index.clone()));
+
+    let mut candidate_request = candidate("A Candidate also carries a problem view and hints");
+    candidate_request.content.problem_view =
+        Some("Which Candidate answers the missing input box?".to_owned());
+    candidate_request.content.hints = vec!["SampleCandidateProbe".to_owned()];
+    submit_candidate(&store, candidate_request);
+
+    let mut space_intent = intent("Association repair projection");
+    space_intent
+        .domain_terms
+        .push("BottomBarProtocolManager".to_owned());
+    let space_event = Event::space_created(space_intent, None).unwrap();
+    let (space_id, _) = space_ids(&space_event);
+    append(&store, space_event);
+
+    let mut content = context(
+        "The reviewed branch keeps the default comment input visible whenever the vertical domain \
+         service is absent, so the fallback bar still renders",
+    );
+    content.problem_view =
+        Some("Why does the comment detail page lose its default input box?".to_owned());
+    content.hints = vec![
+        "SampleUnresolvedProbe".to_owned(),
+        "app/src/SampleEntranceAssem.kt".to_owned(),
+    ];
+    let revision_event = Event::context_revision_added(space_id, content.clone(), None).unwrap();
+    let (context_id, revision_id) = context_ids(&revision_event);
+    append(&store, revision_event);
+    append(
+        &store,
+        engineering_reference(
+            context_id,
+            revision_id,
+            "app/src/main/java/com/example/SampleBottomBarManager.kt",
+        ),
+    );
+
+    index.rebuild().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+
+    let (stored_problem_view, stored_hints): (Option<String>, String) = connection
+        .query_row(
+            "SELECT problem_view, hints_json FROM context_revision WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_problem_view, content.problem_view);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&stored_hints).unwrap(),
+        content.hints
+    );
+
+    let fts_title: String = connection
+        .query_row(
+            "SELECT title FROM context_fts WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let expected_title = normalize_search_text(&format!(
+        "{}\u{2026}",
+        content.statement.chars().take(60).collect::<String>()
+    ));
+    assert_eq!(fts_title, expected_title);
+    assert!(!fts_title.contains("association"));
+
+    // problem_view-only and hint-only tokens are reachable through context_fts.
+    assert_eq!(count_fts_matches(&connection, "context_fts", "box"), 1);
+    assert_eq!(
+        count_fts_matches(&connection, "context_fts", "sampleunresolvedprobe"),
+        1
+    );
+    assert_eq!(
+        count_fts_matches(&connection, "context_fts", "samplebottombarmanager"),
+        1
+    );
+
+    let identifier_aliases: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM token_alias
+             WHERE source = 'identifier_split' AND group_key = 'sample-bottom-bar-manager'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(identifier_aliases, 20);
+    let bottom_aliases: Vec<String> = connection
+        .prepare(
+            "SELECT alias FROM token_alias
+             WHERE token = 'samplebottombarmanager' AND source = 'identifier_split'
+             ORDER BY alias",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(bottom_aliases, ["bar", "bottom", "manager", "sample"]);
+    assert_eq!(
+        count_where(
+            &connection,
+            "token_alias",
+            "source = 'domain_term' AND group_key = 'bottom-bar-protocol-manager'"
+        ),
+        20
+    );
+    let (candidate_problem_view, candidate_hint_text): (Option<String>, String) = connection
+        .query_row(
+            "SELECT problem_view, hint_text FROM context_candidate",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        candidate_problem_view.as_deref(),
+        Some("Which Candidate answers the missing input box?")
+    );
+    assert_eq!(
+        candidate_hint_text,
+        normalize_search_text("SampleCandidateProbe")
+    );
+    drop(connection);
+
+    let expected = projection_dump(index.database_path());
+    let scratch = ProjectionIndex::new(store.repository(), temporary.path().join("scratch"));
+    scratch.rebuild().unwrap();
+    assert_eq!(projection_dump(scratch.database_path()), expected);
+}
+
+#[test]
+fn provisional_space_projects_its_flag_and_a_human_intent_revision_clears_it() {
+    let fixture = fixture();
+    // Only Candidate Confirmation writes a provisional Space, so the flag is added to the
+    // serialized event and parsed back: that also proves the wire form round-trips.
+    let human = Event::space_created(intent("Human named Space"), None).unwrap();
+    let mut provisional_json = serde_json::to_value(&human).unwrap();
+    provisional_json["event_id"] =
+        serde_json::json!(format!("{}", sctx_event_schema::EventId::new()));
+    provisional_json["space_id"] =
+        serde_json::json!(format!("{}", sctx_event_schema::SpaceId::new()));
+    provisional_json["intent_revision"]["revision_id"] =
+        serde_json::json!(format!("{}", RevisionId::new()));
+    provisional_json["intent_revision"]["provisional"] = serde_json::json!(true);
+    let provisional =
+        sctx_event_schema::parse_event(&serde_json::to_vec(&provisional_json).unwrap())
+            .unwrap()
+            .known()
+            .expect("provisional Space event stays a known V1 event")
+            .clone();
+    let (provisional_space_id, provisional_revision_id) = space_ids(&provisional);
+    let (human_space_id, _) = space_ids(&human);
+    append(&fixture.store, human);
+    append(&fixture.store, provisional);
+    fixture.index.synchronize().unwrap();
+
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    let flag = |space_id: &sctx_event_schema::SpaceId| -> i64 {
+        connection
+            .query_row(
+                "SELECT provisional FROM space_projection WHERE space_id = ?1",
+                [space_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(flag(&provisional_space_id), 1);
+    assert_eq!(flag(&human_space_id), 0);
+    drop(connection);
+
+    // A human revising the Intent is exactly how a provisional Space stops being provisional.
+    append(
+        &fixture.store,
+        Event::intent_revision_added(
+            provisional_space_id,
+            vec![provisional_revision_id],
+            intent("Named by a human reviewer"),
+            None,
+        )
+        .unwrap(),
+    );
+    fixture.index.synchronize().unwrap();
+    let connection = Connection::open(fixture.index.database_path()).unwrap();
+    let (title, provisional_flag): (String, i64) = connection
+        .query_row(
+            "SELECT title, provisional FROM space_projection WHERE space_id = ?1",
+            [provisional_space_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, "Named by a human reviewer");
+    assert_eq!(provisional_flag, 0);
+}
+
+#[test]
+fn prose_identifiers_and_paths_become_hint_text_and_alias_groups_without_any_reference() {
+    let temporary = tempfile::tempdir().unwrap();
+    let store = GitStore::bootstrap_local(temporary.path().join("prose-hints")).unwrap();
+    let space_event = Event::space_created(intent("Legacy accepted Context"), None).unwrap();
+    let (space_id, _) = space_ids(&space_event);
+    append(&store, space_event);
+
+    // An accepted Context recorded before server-side derivation existed: no Engineering
+    // Reference, no authored hints, and every repository coordinate written in free prose.
+    let mut draft = context(
+        "当 ISampleLiveEntryService 无真实实现时，SampleProductAnchorAssem.kt:202 会提前返回。",
+    );
+    draft.hints = Vec::new();
+    draft.rationale = "调用链停在 addParamsForSampleAnchor，因此配置分发被跳过。".to_owned();
+    draft.evidence[0].content = serde_json::json!({
+        "summary": "对照 app/src/main/kotlin/sample/SampleBottomBarProbe.kt 的注册顺序复现。",
+        "source_kind": "manual",
+    });
+    let event = Event::context_revision_added(space_id, draft, None).unwrap();
+    let (context_id, revision_id) = context_ids(&event);
+    append(&store, event);
+    append(
+        &store,
+        Event::publication_changed(
+            space_id,
+            context_id,
+            PublicationDraft {
+                previous_publication_ids: Vec::new(),
+                action: PublicationAction::Publish,
+                revision_id,
+                review_event_ids: Vec::new(),
+            },
+            None,
+        )
+        .unwrap(),
+    );
+
+    let index = ProjectionIndex::for_store(&store);
+    index.synchronize().unwrap();
+    let connection = Connection::open(index.database_path()).unwrap();
+
+    let hint_text: String = connection
+        .query_row(
+            "SELECT hint_text FROM context_revision WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    for expected in [
+        "isampleliveentryservice",
+        "sampleproductanchorassem",
+        "addparamsforsampleanchor",
+        "samplebottombarprobe",
+    ] {
+        assert!(
+            hint_text.contains(expected),
+            "derived hint_text must carry `{expected}`: {hint_text}"
+        );
+    }
+    // Prose identifiers are indexed whole. Their split parts, the line span, the directory
+    // spelling, and Evidence object keys are all schema or incidental wording, never hints.
+    assert!(!hint_text.split_whitespace().any(|token| token == "sample"));
+    assert!(!hint_text.contains("app src main kotlin"));
+    assert!(!hint_text.contains("202"));
+    assert!(!hint_text.contains("source_kind") && !hint_text.contains("source kind"));
+
+    for token in [
+        "isampleliveentryservice",
+        "addparamsforsampleanchor",
+        "samplebottombarprobe",
+    ] {
+        assert_eq!(
+            count_fts_matches(&connection, "context_fts", token),
+            1,
+            "`{token}` must be reachable through context_fts"
+        );
+    }
+
+    let aliases: Vec<String> = connection
+        .prepare(
+            "SELECT alias FROM token_alias
+             WHERE token = 'sampleproductanchorassem' AND source = 'identifier_split'
+             ORDER BY alias",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(aliases, ["anchor", "assem", "product", "sample"]);
+
+    drop(connection);
+    let expected = projection_dump(index.database_path());
+    let scratch = ProjectionIndex::new(store.repository(), temporary.path().join("prose-scratch"));
+    scratch.rebuild().unwrap();
+    assert_eq!(projection_dump(scratch.database_path()), expected);
 }

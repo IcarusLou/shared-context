@@ -34,7 +34,8 @@
     "candidate_get",
     "candidate_discard",
     "candidate_confirm",
-    "space_list"
+    "space_list",
+    "space_create"
   ],
   "mcp_clients": ["cursor", "codex"]
 }

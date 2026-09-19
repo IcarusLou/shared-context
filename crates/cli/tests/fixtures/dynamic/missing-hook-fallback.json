@@ -1,0 +1,116 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "missing_hook_empty_close_fallback",
+  "agent": {"vendor": "codex", "version": "0.147.0", "framing": "content_length"},
+  "actors": [
+    {"id": "session", "kind": {"type": "session"}},
+    {"id": "task", "kind": {"type": "task", "session": "session"}}
+  ],
+  "actions": [
+    {
+      "id": "repository-add", "actor": "task", "after": [],
+      "action": {"type": "cli_json", "arguments": [
+        {"type": "string", "value": "repository"},
+        {"type": "string", "value": "add"},
+        {"type": "string", "value": "--repository-id"},
+        {"type": "string", "value": "FE"},
+        {"type": "string", "value": "--path"},
+        {"type": "builtin", "builtin": {"type": "resource_root", "resource": "activation-repo"}}
+      ]}
+    },
+    {
+      "id": "session-start", "actor": "session", "after": ["repository-add"],
+      "action": {"type": "hook_event", "event": "SessionStart", "payload": {"type": "object", "fields": {
+        "cwd": {"type": "builtin", "builtin": {"type": "resource_root", "resource": "activation-repo"}},
+        "source": {"type": "string", "value": "startup"}
+      }}}
+    },
+    {
+      "id": "intent-new", "actor": "task", "after": ["session-start"],
+      "action": {"type": "mcp_request", "method": "task_intent_update", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "task_boundary": {"type": "string", "value": "new"},
+        "expected_revision_id": {"type": "null"},
+        "intent": {"type": "object", "fields": {"goal": {"type": "string", "value": "exercise the missing Hook fallback"}}}
+      }}}
+    },
+    {
+      "id": "checkpoint-continue", "actor": "task", "after": ["intent-new"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "claims": {"type": "array", "items": [{"type": "object", "fields": {
+          "context_kind": {"type": "string", "value": "validation"},
+          "statement": {"type": "string", "value": "The empty close fallback preserves checkpoint content"},
+          "rationale": {"type": "string", "value": "The explicit close follows a successful continue"},
+          "conditions": {"type": "array", "items": []},
+          "evidence": {"type": "array", "items": [{"type": "object", "fields": {
+            "evidence_type": {"type": "string", "value": "experiment_record"},
+            "summary": {"type": "string", "value": "the checkpoint completed and closed directly"},
+            "limitations": {"type": "array", "items": [{"type": "string", "value": "synthetic offline fixture"}]}
+          }}]}
+        }}]},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "episode-observe", "actor": "task", "after": ["checkpoint-continue"],
+      "action": {"type": "observe", "source": "runtime", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "work_episode"},
+        "identity": {"type": "variable", "name": "episode-id"}
+      }}}
+    },
+    {
+      "id": "candidate-zero", "actor": "task", "after": ["episode-observe"],
+      "action": {"type": "observe", "source": "index", "selector": {"type": "object", "fields": {
+        "entity": {"type": "string", "value": "index_candidate_for_episode"},
+        "identity": {"type": "variable", "name": "episode-id"}
+      }}}
+    },
+    {
+      "id": "empty-close", "actor": "task", "after": ["candidate-zero"],
+      "action": {"type": "mcp_request", "method": "task_checkpoint", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "claims": {"type": "array", "items": []},
+        "unknowns": {"type": "array", "items": []}
+      }}}
+    },
+    {
+      "id": "candidate-list", "actor": "task", "after": ["empty-close"],
+      "action": {"type": "mcp_request", "method": "candidate_list", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}}
+      }}}
+    },
+    {
+      "id": "candidate-get", "actor": "task", "after": ["candidate-list"],
+      "action": {"type": "mcp_request", "method": "candidate_get", "params": {"type": "object", "fields": {
+        "agent_kind": {"type": "string", "value": "codex"},
+        "external_session_id": {"type": "builtin", "builtin": {"type": "actor_session_key", "actor": "session"}},
+        "candidate_id": {"type": "variable", "name": "built-candidate-id"}
+      }}}
+    }
+  ],
+  "resources": [{
+    "id": "activation-repo", "synthetic_git": true,
+    "files": [{"path": "README.md", "content": "activation fixture\n"}]
+  }],
+  "variables": [
+    {"name": "task-id", "value_type": "task_id", "capture": {"step": "intent-new", "pointer": "/task_id"}},
+    {"name": "intent-revision-id", "value_type": "intent_revision_id", "capture": {"step": "intent-new", "pointer": "/intent_revision_id"}},
+    {"name": "episode-id", "value_type": "work_episode_id", "capture": {"step": "checkpoint-continue", "pointer": "/episode_id"}},
+    {"name": "built-candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-list", "pointer": "/reviews/0/candidate_id"}},
+    {"name": "candidate-id", "value_type": "candidate_id", "capture": {"step": "candidate-get", "pointer": "/candidate_id"}},
+    {"name": "candidate-episode-id", "value_type": "work_episode_id", "capture": {"step": "candidate-get", "pointer": "/source_episode/episode_id"}}
+  ],
+  "faults": [],
+  "assertions": [
+    {"id": "fallback-candidate-source", "invariant": {"type": "candidate_source_episode", "response": "candidate-get", "candidate": "candidate-id", "episode": "candidate-episode-id"}}
+  ],
+  "events": [
+    {"event": "SessionStart", "classification": "supported", "product_action": "session_start"}
+  ]
+}

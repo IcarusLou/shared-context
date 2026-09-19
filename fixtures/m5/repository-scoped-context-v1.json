@@ -1,0 +1,46 @@
+{
+  "schema": "sctx.repository-scoped-context.acceptance.v1",
+  "activation_marker_template": "<shared-context-active external_session_id=\"{host_session_id}\">Shared Context is authorized for this session. Before substantive work, call task_intent_update with agent_kind \"{agent_kind}\" and external_session_id \"{host_session_id}\" (copy it verbatim; never invent one).\n\nStored text is Chinese, with identifiers, paths, commands, and error codes in their original spelling, and every version, commit, and date written absolutely.\nRecord one `progress` summary per task boundary, never per turn.</shared-context-active>",
+  "session_policy": "Stored text is Chinese, with identifiers, paths, commands, and error codes in their original spelling, and every version, commit, and date written absolutely.\nRecord one `progress` summary per task boundary, never per turn.",
+  "source_assets": {
+    "gate_bytes": 2396,
+    "workflow_bytes": 14773,
+    "metadata_bytes": 263,
+    "review_gate_bytes": 2895,
+    "review_reference_bytes": 14866,
+    "review_metadata_bytes": 278
+  },
+  "token_proxy": {
+    "disabled": {
+      "activation_bytes": 0,
+      "workflow_reads": 0,
+      "mcp_calls": 0,
+      "tool_result_bytes": 0,
+      "business_residue": 0
+    },
+    "enabled": {
+      "activation_fixed_bytes": 474,
+      "activation_max_bytes": 1026,
+      "workflow_reads": 1,
+      "mcp_calls": 5,
+      "sanitized_tool_result_bytes_min": 1500,
+      "sanitized_tool_result_bytes_max": 24576
+    }
+  },
+  "enabled_chain": {
+    "mcp_tools": [
+      "task_intent_update",
+      "task_artifact_focus",
+      "task_checkpoint",
+      "candidate_list",
+      "candidate_get"
+    ],
+    "pending_candidates": 1,
+    "confirmed_candidates": 0
+  },
+  "disabled_residue": {
+    "runtime_files": 0,
+    "report_files": 0,
+    "knowledge_commits_delta": 0
+  }
+}

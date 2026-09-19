@@ -1,12 +1,19 @@
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    fmt::Write as _,
+    fs,
+    path::Path,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use sctx_domain::{
     ArtifactKind, ArtifactLocator, RepoRelativePath, RepositoryId, RepositoryIdentity,
 };
 use sctx_engineering_graph::{
     ArtifactSourceState, MAX_REPOSITORY_SCAN_PLAN_PATHS, RepositoryScanOutcome, RepositoryScanPlan,
-    RepositoryScanner, RepositoryScannerLimits, RepositorySnapshot, SkippedFileReason,
-    SourceLanguage,
+    RepositoryScanner, RepositoryScannerLimits, RepositorySnapshot, ScanCoverage,
+    SkippedFileReason, SourceLanguage,
 };
 use tempfile::TempDir;
 
@@ -56,7 +63,7 @@ fn identity(name: &str) -> RepositoryIdentity {
 
 fn plan(repository: &RepositoryIdentity, paths: &[&str]) -> RepositoryScanPlan {
     RepositoryScanPlan::new(
-        repository.repository_id,
+        repository.repository_id.clone(),
         paths
             .iter()
             .map(|path| RepoRelativePath::new(*path).unwrap())
@@ -565,7 +572,7 @@ fn sparse_plan_reads_only_deduplicated_reference_paths() {
     commit_all(&repo);
     let repository = identity("sparse");
     let scan_plan = RepositoryScanPlan::new(
-        repository.repository_id,
+        repository.repository_id.clone(),
         vec![
             RepoRelativePath::new("src/referenced.rs").unwrap(),
             RepoRelativePath::new("src/referenced.rs").unwrap(),
@@ -613,10 +620,10 @@ fn empty_or_missing_plan_never_falls_back_to_repository_enumeration() {
     );
     commit_all(&repo);
     let repository = identity("missing-plan");
-    assert!(RepositoryScanPlan::new(repository.repository_id, Vec::new()).is_err());
+    assert!(RepositoryScanPlan::new(repository.repository_id.clone(), Vec::new()).is_err());
     assert!(
         RepositoryScanPlan::new(
-            repository.repository_id,
+            repository.repository_id.clone(),
             (0..=MAX_REPOSITORY_SCAN_PLAN_PATHS)
                 .map(|index| RepoRelativePath::new(format!("src/path_{index}.rs")).unwrap())
                 .collect(),
@@ -636,4 +643,269 @@ fn empty_or_missing_plan_never_falls_back_to_repository_enumeration() {
     assert_eq!(snapshot.skipped_files[0].path, "src/missing.rs");
     assert_eq!(snapshot.skipped_files[0].reason, SkippedFileReason::Missing);
     assert!(!format!("{snapshot:?}").contains("forbidden_fallback"));
+}
+
+/// Wall-clock budget a Confirmation-time rescan is allowed to spend, mirrored from the MCP server.
+const AUTO_SCAN_BUDGET: Duration = Duration::from_secs(2);
+/// Plan size a real monorepo Confirmation was observed to produce.
+const LARGE_PLAN_PATHS: usize = 1_000;
+
+fn seed_large_plan(repo: &Path, files: usize, declarations: usize) -> Vec<String> {
+    let mut paths = Vec::with_capacity(files);
+    for index in 0..files {
+        let relative = format!("module{:03}/src/unit{index:04}.rs", index % 64);
+        let mut body = String::new();
+        for item in 0..declarations {
+            writeln!(body, "pub fn unit_{index}_{item}() -> u32 {{ {item} }}").unwrap();
+        }
+        write(repo, &relative, &body);
+        paths.push(relative);
+    }
+    paths
+}
+
+#[test]
+fn a_thousand_planned_paths_scan_inside_the_confirmation_budget() {
+    // The per-path shape of this scan used to spawn two local Git processes per planned path, and
+    // on a Repository large enough for either process to cost real time the budget was spent
+    // before the first handful of files, so a Confirmation-time rescan produced nothing at all.
+    // Batching the tracked-state questions makes the plan size stop multiplying the fixed cost.
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("monorepo");
+    init_repo(&repo);
+    let paths = seed_large_plan(&repo, LARGE_PLAN_PATHS, 4);
+    commit_all(&repo);
+    let repository = identity("monorepo");
+    let scan_plan = plan(
+        &repository,
+        &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+
+    let started = Instant::now();
+    let outcome = RepositoryScanner::default()
+        .scan_before(
+            &repository,
+            &repo,
+            &scan_plan,
+            Instant::now().checked_add(AUTO_SCAN_BUDGET),
+        )
+        .unwrap()
+        .expect("a budgeted scan of a thousand planned paths must produce a snapshot");
+    let elapsed = started.elapsed();
+
+    let snapshot = available(outcome);
+    assert_eq!(
+        snapshot.scanned_files, LARGE_PLAN_PATHS,
+        "every planned path must be read inside the budget"
+    );
+    assert!(
+        snapshot.coverage.is_complete(),
+        "a scan that finishes inside its budget is complete, not partial"
+    );
+    assert!(
+        elapsed < AUTO_SCAN_BUDGET,
+        "scanning {LARGE_PLAN_PATHS} planned paths took {elapsed:?}, over the \
+         {AUTO_SCAN_BUDGET:?} Confirmation budget"
+    );
+    eprintln!("scanned {LARGE_PLAN_PATHS} planned paths in {elapsed:?}");
+}
+
+#[test]
+fn an_expired_budget_commits_the_scanned_subset_and_names_what_it_never_reached() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("partial");
+    init_repo(&repo);
+    let paths = seed_large_plan(&repo, 300, 200);
+    commit_all(&repo);
+    let repository = identity("partial");
+    let scan_plan = plan(
+        &repository,
+        &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+
+    // A budget that expires while the plan is still being read used to throw the whole scan away.
+    let complete = available(
+        RepositoryScanner::default()
+            .scan(&repository, &repo, &scan_plan)
+            .unwrap(),
+    );
+    let full_scan = {
+        let started = Instant::now();
+        let _ = RepositoryScanner::default()
+            .scan(&repository, &repo, &scan_plan)
+            .unwrap();
+        started.elapsed()
+    };
+    // The exact wall-clock point a budget lands on is machine-dependent, so the fraction of one
+    // full scan is widened until it lands inside the plan rather than before or after it.
+    let mut partial = None;
+    for percent in [40, 50, 60, 70, 75, 80, 85, 90, 95] {
+        let Some(outcome) = RepositoryScanner::default()
+            .scan_before(
+                &repository,
+                &repo,
+                &scan_plan,
+                Instant::now().checked_add(full_scan * percent / 100),
+            )
+            .unwrap()
+        else {
+            continue;
+        };
+        let candidate = available(outcome);
+        if !candidate.coverage.is_complete() {
+            partial = Some(candidate);
+            break;
+        }
+    }
+    let snapshot = partial.expect("a budget that expires mid-plan still commits what it read");
+
+    let ScanCoverage::Partial {
+        covered,
+        unfinished,
+    } = &snapshot.coverage
+    else {
+        panic!("a scan cut short by its budget must record partial coverage");
+    };
+    assert!(!covered.is_empty(), "the scanned subset must be committed");
+    assert!(
+        !unfinished.is_empty(),
+        "the unread range must be named, not silently dropped"
+    );
+    assert_eq!(
+        covered.len() + unfinished.len(),
+        scan_plan.paths().len(),
+        "coverage must account for every planned path exactly once"
+    );
+    assert!(
+        !snapshot.artifacts.is_empty(),
+        "the committed subset must carry the Artifacts it did read"
+    );
+    assert_ne!(
+        snapshot.generation, complete.generation,
+        "a partial snapshot must not claim the generation of a complete one"
+    );
+    assert!(
+        !snapshot.coverage.unfinished_prefixes().is_empty(),
+        "the projection needs directory prefixes for the unread range"
+    );
+    let first_covered = covered.first().unwrap().as_str().to_owned();
+    assert!(snapshot.coverage.covers_path(&first_covered));
+    assert!(
+        !snapshot
+            .coverage
+            .covers_path(unfinished.first().unwrap().as_str())
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn android_java_and_xml_artifacts_are_scanned_rather_than_skipped() {
+    // Fifteen of nineteen unresolved References in one real installation named Android artifacts
+    // the language table did not recognise, so every one of them was skipped as an unsupported
+    // language and then reported as missing from the Repository.
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("android");
+    init_repo(&repo);
+    write(
+        repo.as_path(),
+        "app/src/main/java/com/example/live/AvatarImageWithLive.java",
+        r#"package com.example.live;
+
+public class AvatarImageWithLive extends FrameLayout {
+    private static final String TAG = "AvatarImageWithLive";
+
+    public AvatarImageWithLive(Context context) {
+        super(context);
+    }
+
+    public void bindAvatar(User user) {
+        setUser(user);
+    }
+
+    protected int measureAvatarSize(int spec) {
+        return spec;
+    }
+
+    interface LiveStatusListener {
+        void onLiveStatusChanged(boolean live);
+    }
+}
+"#,
+    );
+    write(
+        repo.as_path(),
+        "app/src/main/res/layout/avatar_image_with_live.xml",
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<merge xmlns:android="http://schemas.android.com/apk/res/android">
+    <ImageView android:id="@+id/avatar" />
+</merge>
+"#,
+    );
+    write(
+        repo.as_path(),
+        "app/src/main/res/drawable/live_ring.xml",
+        r#"<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" />
+"#,
+    );
+    commit_all(&repo);
+    let repository = identity("android");
+    let scan_plan = plan(
+        &repository,
+        &[
+            "app/src/main/java/com/example/live/AvatarImageWithLive.java",
+            "app/src/main/res/drawable/live_ring.xml",
+            "app/src/main/res/layout/avatar_image_with_live.xml",
+        ],
+    );
+    let snapshot = available(
+        RepositoryScanner::default()
+            .scan(&repository, &repo, &scan_plan)
+            .unwrap(),
+    );
+
+    assert_eq!(snapshot.scanned_files, 3);
+    assert!(
+        snapshot.skipped_files.is_empty(),
+        "no Android artifact may be skipped as an unsupported language: {:?}",
+        snapshot.skipped_files
+    );
+    for relative in [
+        "app/src/main/java/com/example/live/AvatarImageWithLive.java",
+        "app/src/main/res/drawable/live_ring.xml",
+        "app/src/main/res/layout/avatar_image_with_live.xml",
+    ] {
+        assert!(
+            snapshot.artifacts.iter().any(|artifact| {
+                artifact.artifact.artifact_key.kind() == ArtifactKind::File
+                    && artifact.artifact.artifact_key.locator().path().as_str() == relative
+            }),
+            "{relative} must resolve as a File Artifact"
+        );
+    }
+    let symbols = snapshot
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact.artifact_key.kind() == ArtifactKind::Symbol)
+        .map(|artifact| artifact.artifact.display_name.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(symbols.contains("AvatarImageWithLive"), "{symbols:?}");
+    assert!(symbols.contains("bindAvatar"), "{symbols:?}");
+    assert!(symbols.contains("measureAvatarSize"), "{symbols:?}");
+    let schemas = snapshot
+        .artifacts
+        .iter()
+        .filter(|artifact| artifact.artifact.artifact_key.kind() == ArtifactKind::Schema)
+        .map(|artifact| artifact.artifact.display_name.clone())
+        .collect::<BTreeSet<_>>();
+    assert!(schemas.contains("LiveStatusListener"), "{schemas:?}");
+    assert!(
+        !snapshot.artifacts.iter().any(|artifact| {
+            std::path::Path::new(artifact.artifact.artifact_key.locator().path().as_str())
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("xml"))
+                && artifact.artifact.artifact_key.kind() == ArtifactKind::Symbol
+        }),
+        "XML carries no symbol a deterministic locator could name"
+    );
 }

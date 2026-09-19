@@ -6,8 +6,8 @@ const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 
 const PLATFORM_PACKAGES = Object.freeze({
-  'darwin-arm64': '@company/shared-context-darwin-arm64',
-  'darwin-x64': '@company/shared-context-darwin-x64',
+  'darwin-arm64': '@bytedance-dev/shared-context-darwin-arm64',
+  'darwin-x64': '@bytedance-dev/shared-context-darwin-x64',
 });
 
 class LauncherError extends Error {
@@ -42,7 +42,7 @@ function resolveBinary({
     if (error && error.code === 'MODULE_NOT_FOUND') {
       throw new LauncherError(
         `Missing optional platform package ${packageName} for ${platform}/${arch}. ` +
-          'Reinstall @company/shared-context with optional dependencies enabled, or use the matching offline bundle.',
+          'Reinstall @bytedance-dev/shared-context with optional dependencies enabled, or use the matching offline bundle.',
       );
     }
     throw error;

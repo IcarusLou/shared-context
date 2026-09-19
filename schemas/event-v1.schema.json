@@ -165,7 +165,9 @@
     },
     "repository_id": {
       "type": "string",
-      "pattern": "^rpo_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
     },
     "reference_id": {
       "type": "string",
@@ -352,7 +354,8 @@
           "maxItems": 0,
           "items": { "$ref": "#/$defs/revision_id" }
         },
-        "intent": { "$ref": "#/$defs/intent" }
+        "intent": { "$ref": "#/$defs/intent" },
+        "provisional": { "type": "boolean" }
       },
       "additionalProperties": false
     },
@@ -443,6 +446,7 @@
             "implements",
             "validated_by",
             "contradicts",
+            "supersedes",
             "related_to"
           ]
         },
@@ -481,11 +485,13 @@
           ]
         },
         "topic_key": { "$ref": "#/$defs/non_empty_string" },
+        "problem_view": { "$ref": "#/$defs/non_empty_string" },
         "statement": { "$ref": "#/$defs/non_empty_string" },
         "rationale": { "$ref": "#/$defs/non_empty_string" },
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "hints": { "$ref": "#/$defs/string_list" },
         "relations": {
           "type": "array",
           "uniqueItems": true,
@@ -544,11 +550,31 @@
             }
           ]
         },
+        "problem_view": {
+          "oneOf": [
+            {
+              "type": "object",
+              "required": ["action", "value"],
+              "properties": {
+                "action": { "const": "set" },
+                "value": { "$ref": "#/$defs/non_empty_string" }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "required": ["action"],
+              "properties": { "action": { "const": "clear" } },
+              "additionalProperties": false
+            }
+          ]
+        },
         "statement": { "$ref": "#/$defs/non_empty_string" },
         "rationale": { "$ref": "#/$defs/non_empty_string" },
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "hints": { "$ref": "#/$defs/string_list" },
         "relations": {
           "type": "array",
           "uniqueItems": true,
@@ -626,7 +652,12 @@
         },
         "context_revision_event_id": { "$ref": "#/$defs/event_id" },
         "space_association_event_id": { "$ref": "#/$defs/event_id" },
-        "publication_event_id": { "$ref": "#/$defs/event_id" }
+        "publication_event_id": { "$ref": "#/$defs/event_id" },
+        "engineering_reference_event_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/event_id" }
+        }
       },
       "additionalProperties": false
     },
@@ -720,11 +751,13 @@
           ]
         },
         "topic_key": { "$ref": "#/$defs/non_empty_string" },
+        "problem_view": { "$ref": "#/$defs/non_empty_string" },
         "statement": { "$ref": "#/$defs/non_empty_string" },
         "rationale": { "$ref": "#/$defs/non_empty_string" },
         "applicability": { "$ref": "#/$defs/applicability" },
         "assumptions": { "$ref": "#/$defs/string_list" },
         "recheck_when": { "$ref": "#/$defs/string_list" },
+        "hints": { "$ref": "#/$defs/string_list" },
         "relations": {
           "type": "array",
           "uniqueItems": true,

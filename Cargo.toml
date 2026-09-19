@@ -14,11 +14,16 @@ members = [
     "crates/adapter-codex",
     "crates/installer",
     "crates/cli",
+    "crates/scenario-contract",
+    "crates/scenario-runner",
+    "crates/telemetry",
+    "crates/log-service",
+    "crates/log-sync",
 ]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0-dev.8"
 edition = "2024"
 rust-version = "1.85"
 publish = false
@@ -42,7 +47,12 @@ sctx-installer = { path = "crates/installer" }
 sctx-local-state = { path = "crates/local-state" }
 sctx-mcp = { path = "crates/mcp" }
 sctx-search = { path = "crates/search" }
+sctx-scenario-contract = { path = "crates/scenario-contract" }
+sctx-scenario-runner = { path = "crates/scenario-runner" }
 sctx-task-runtime = { path = "crates/task-runtime" }
+sctx-telemetry = { path = "crates/telemetry" }
+sctx-log-service = { path = "crates/log-service" }
+sctx-log-sync = { path = "crates/log-sync" }
 uuid = { version = "1.18", features = ["v4"] }
 toml = "0.9"
 

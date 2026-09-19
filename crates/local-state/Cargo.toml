@@ -1,6 +1,6 @@
 [package]
 name = "sctx-local-state"
-description = "Shared Context local configuration, capture, and privacy boundary"
+description = "Shared Context local configuration, session, maintenance, and privacy boundary"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,7 @@ publish.workspace = true
 fs2 = "0.4"
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sctx-domain.workspace = true
 toml.workspace = true
 uuid.workspace = true

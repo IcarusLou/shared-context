@@ -12,6 +12,7 @@ use sctx_domain::{
     ArtifactLocator, Error, ErrorKind, RepoRelativePath, RepositoryId, ResolvedFocus, Result,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 const CONFIG_VERSION: u32 = 1;
 const MAX_CATALOG_REPOSITORIES: usize = 256;
@@ -24,6 +25,568 @@ struct ConfigDocument {
     store: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     repositories: Vec<RepositoryConfigDocument>,
+    /// Optional activation switches. Absent means the derived defaults below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activation: Option<ActivationConfigDocument>,
+    /// Optional experimental Hook switches. Absent means every switch is off and
+    /// the serialized document keeps its previous bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks: Option<HookConfigDocument>,
+    /// Optional Context time-to-live policy. Absent means no Context ever expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_ttl: Option<ContextTtlConfigDocument>,
+    /// Optional Engineering Graph maintenance switches. Absent means the defaults below, which
+    /// keep the Graph attached to the knowledge that names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engineering: Option<EngineeringConfigDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retrieval: Option<RetrievalConfigDocument>,
+    /// Optional `[policy]` table pointing at the team policy document. Absent means
+    /// `<root>/policy.md`, which is what `sctx setup` writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy: Option<PolicyConfigDocument>,
+    /// Optional periodic maintenance schedule. Absent means the defaults below, which install the
+    /// daily `LaunchAgent` and let a Session that has not seen maintenance for a day start one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    maintenance: Option<MaintenanceConfigDocument>,
+}
+
+/// Optional `[activation]` table: overrides for derived Session activation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationConfigDocument {
+    #[serde(default)]
+    allow_home: bool,
+}
+
+/// Explicit local activation switches, read from the same `config.toml` as the Catalog.
+///
+/// Activation is derived, never registered: a Session is Enabled when it started
+/// inside a registered checkout, or when it started at a directory that contains
+/// at least one registered checkout. `allow_home` is the single escape hatch for
+/// the home-directory guard in [`parent_activation_is_guarded`]; it is off by default.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ActivationSettings {
+    pub allow_home: bool,
+}
+
+impl ActivationSettings {
+    const fn from_document(document: Option<ActivationConfigDocument>) -> Self {
+        match document {
+            Some(activation) => Self {
+                allow_home: activation.allow_home,
+            },
+            None => Self { allow_home: false },
+        }
+    }
+}
+
+/// Optional `[context_ttl]` table: how long an accepted Context of one kind stays current.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContextTtlConfigDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    progress: Option<String>,
+}
+
+/// Configured lifetime per Context kind, in whole seconds.
+///
+/// An absent entry disables expiry for that kind, and the default policy expires nothing. Expiry
+/// is measured from the publication time of the accepted revision. V1 Events carry no timestamp
+/// of their own, so that time is the commit time of the Event that published the revision.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ContextTtlPolicy {
+    pub validation_seconds: Option<i64>,
+    pub progress_seconds: Option<i64>,
+}
+
+impl ContextTtlPolicy {
+    /// Whether any Context kind has a configured lifetime.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.validation_seconds.is_some() || self.progress_seconds.is_some()
+    }
+
+    fn from_document(document: Option<&ContextTtlConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            validation_seconds: document
+                .validation
+                .as_deref()
+                .map(|value| parse_ttl_duration(value, "validation"))
+                .transpose()?,
+            progress_seconds: document
+                .progress
+                .as_deref()
+                .map(|value| parse_ttl_duration(value, "progress"))
+                .transpose()?,
+        })
+    }
+}
+
+/// Parses `<positive integer><s|m|h|d|w>` into whole seconds.
+fn parse_ttl_duration(value: &str, field: &str) -> Result<i64> {
+    let trimmed = value.trim();
+    let split = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .ok_or_else(|| invalid(format!("[context_ttl] {field} requires a unit suffix")))?;
+    let (digits, unit) = trimmed.split_at(split);
+    let amount = digits
+        .parse::<i64>()
+        .map_err(|_| invalid(format!("[context_ttl] {field} is not a positive duration")))?;
+    if amount <= 0 {
+        return Err(invalid(format!(
+            "[context_ttl] {field} must be a positive duration"
+        )));
+    }
+    let multiplier = match unit {
+        "s" => 1_i64,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        _ => {
+            return Err(invalid(format!(
+                "[context_ttl] {field} unit must be one of s, m, h, d, w"
+            )));
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| invalid(format!("[context_ttl] {field} duration overflows")))
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HookConfigDocument {
+    #[serde(default)]
+    artifact_focus_reminder: bool,
+}
+
+/// Retired Hook switches retained for existing configuration compatibility.
+///
+/// Values remain readable, but no longer change Hook execution.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct HookSettings {
+    /// Retired P4.1 switch. Both `true` and `false` are accepted and have no effect.
+    pub artifact_focus_reminder: bool,
+}
+
+impl HookSettings {
+    const fn from_document(document: Option<HookConfigDocument>) -> Self {
+        match document {
+            Some(hooks) => Self {
+                artifact_focus_reminder: hooks.artifact_focus_reminder,
+            },
+            None => Self {
+                artifact_focus_reminder: false,
+            },
+        }
+    }
+}
+
+/// Optional `[engineering]` table: Engineering Graph maintenance switches.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EngineeringConfigDocument {
+    #[serde(default = "enabled")]
+    auto_scan: bool,
+}
+
+const fn enabled() -> bool {
+    true
+}
+
+impl Default for EngineeringConfigDocument {
+    fn default() -> Self {
+        Self { auto_scan: true }
+    }
+}
+
+/// Explicit local Engineering Graph maintenance switches.
+///
+/// Unlike `[hooks]`, these are on by default: an Engineering Reference that nothing ever scans is
+/// an association the installation silently does not have, so the bounded rescan that follows a
+/// Confirmation is the normal behaviour and `auto_scan = false` is the explicit opt-out for an
+/// installation whose checkouts are too expensive to touch on the interactive path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct EngineeringSettings {
+    /// Whether an interactive MCP write that records or names Engineering References may spend
+    /// its bounded time budget rescanning the Repositories those References point into.
+    pub auto_scan: bool,
+}
+
+impl Default for EngineeringSettings {
+    fn default() -> Self {
+        Self { auto_scan: true }
+    }
+}
+
+impl EngineeringSettings {
+    const fn from_document(document: Option<EngineeringConfigDocument>) -> Self {
+        match document {
+            Some(engineering) => Self {
+                auto_scan: engineering.auto_scan,
+            },
+            None => Self { auto_scan: true },
+        }
+    }
+}
+
+/// Optional `[maintenance]` table: when the periodic maintenance cycle runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MaintenanceConfigDocument {
+    #[serde(default = "enabled")]
+    scheduled: bool,
+    #[serde(default = "default_schedule_hour")]
+    schedule_hour: u32,
+    #[serde(default)]
+    schedule_minute: u32,
+    #[serde(default = "default_opportunistic_after_hours")]
+    opportunistic_after_hours: u64,
+}
+
+const fn default_schedule_hour() -> u32 {
+    6
+}
+
+const fn default_opportunistic_after_hours() -> u64 {
+    24
+}
+
+impl Default for MaintenanceConfigDocument {
+    fn default() -> Self {
+        Self {
+            scheduled: true,
+            schedule_hour: default_schedule_hour(),
+            schedule_minute: 0,
+            opportunistic_after_hours: default_opportunistic_after_hours(),
+        }
+    }
+}
+
+/// When the periodic maintenance cycle (`sctx maintain run`) is allowed to start itself.
+///
+/// Two independent tracks read this table. The *scheduled* track is a user `LaunchAgent` installed by
+/// setup, which is the only one that can reach an installation nobody opened that day. The
+/// *opportunistic* track is one detached process a `SessionStart` Hook may spawn when the recorded
+/// last run is older than [`opportunistic_after_hours`](Self::opportunistic_after_hours), which is
+/// what covers a laptop that is asleep at the scheduled hour. Either can be turned off alone: a
+/// machine that is always awake wants only the timer, and one that refuses launchd jobs wants only
+/// the Hook.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct MaintenanceSettings {
+    /// Whether setup installs (and upgrade keeps) the daily `LaunchAgent`. `false` also *removes* an
+    /// agent this installation previously installed, so the switch is reversible in both
+    /// directions rather than only stopping future installs.
+    pub scheduled: bool,
+    /// Local hour of the scheduled run, 0-23.
+    pub schedule_hour: u32,
+    /// Local minute of the scheduled run, 0-59.
+    pub schedule_minute: u32,
+    /// How stale the recorded last run must be before a `SessionStart` may spawn one. `0` disables
+    /// the opportunistic track entirely, which is the one setting that makes a Session's Hook
+    /// byte-identical to the one that shipped before this track existed.
+    pub opportunistic_after_hours: u64,
+}
+
+impl Default for MaintenanceSettings {
+    fn default() -> Self {
+        Self {
+            scheduled: true,
+            schedule_hour: default_schedule_hour(),
+            schedule_minute: 0,
+            opportunistic_after_hours: default_opportunistic_after_hours(),
+        }
+    }
+}
+
+impl MaintenanceSettings {
+    /// The staleness threshold in seconds, or `None` when the opportunistic track is off.
+    #[must_use]
+    pub const fn opportunistic_after_seconds(&self) -> Option<u64> {
+        match self.opportunistic_after_hours {
+            0 => None,
+            hours => Some(hours * 3_600),
+        }
+    }
+
+    fn from_document(document: Option<MaintenanceConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        if document.schedule_hour > 23 {
+            return Err(invalid(
+                "[maintenance] schedule_hour must be between 0 and 23",
+            ));
+        }
+        if document.schedule_minute > 59 {
+            return Err(invalid(
+                "[maintenance] schedule_minute must be between 0 and 59",
+            ));
+        }
+        // A year is the largest interval that still means "run this eventually"; past it the
+        // multiplication into seconds stops being the operator's intent and starts being a typo.
+        if document.opportunistic_after_hours > MAX_OPPORTUNISTIC_AFTER_HOURS {
+            return Err(invalid(format!(
+                "[maintenance] opportunistic_after_hours must be between 0 and {MAX_OPPORTUNISTIC_AFTER_HOURS}"
+            )));
+        }
+        Ok(Self {
+            scheduled: document.scheduled,
+            schedule_hour: document.schedule_hour,
+            schedule_minute: document.schedule_minute,
+            opportunistic_after_hours: document.opportunistic_after_hours,
+        })
+    }
+}
+
+const MAX_OPPORTUNISTIC_AFTER_HOURS: u64 = 24 * 365;
+
+/// Optional `[retrieval]` table: the local embedding recall channel.
+///
+/// Both keys name absolute paths the operator downloaded on purpose. Neither has a default and
+/// neither is ever guessed: a model this installation did not ask for is 2 GB of disk and a
+/// gigabyte of resident memory, so an absent table means the channel does not exist.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+// The field names are the TOML keys operators type, so the shared `embedding_` prefix is the
+// public schema rather than a naming habit; dropping it would rename `[retrieval]` keys that are
+// already documented and written to real `config.toml` files.
+#[allow(clippy::struct_field_names)]
+struct RetrievalConfigDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_model_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_runtime_path: Option<String>,
+    /// Retired: the query encode budget, which nothing reads any more.
+    ///
+    /// ADR-0007 retired the synchronous query path this budget governed -- every comparison
+    /// retrieval makes is now between two vectors the backfill already wrote -- so the key
+    /// controls nothing. It is still *accepted*, because `deny_unknown_fields` is on this
+    /// document and an operator who tuned it must not have their `config.toml` become
+    /// unreadable by an upgrade. It is no longer validated, no longer reported, and no longer
+    /// carried forward when this file rewrites `[retrieval]`, so it disappears on the next
+    /// `sctx embedding install`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embedding_encode_budget_ms: Option<u64>,
+    /// Optional override for the second hop's admission floor. Absent by default, for the same
+    /// reason the budget is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hop2_admission_floor_basis_points: Option<u16>,
+    /// Optional override for the hard wire ceiling on one automatic Pack. Absent by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pack_wire_token_ceiling: Option<usize>,
+}
+
+/// Explicit local embedding recall settings.
+///
+/// The channel is off unless *both* paths are configured. A model without an ONNX Runtime cannot
+/// be executed and a runtime without a model has nothing to execute, so half a configuration is
+/// the same fact as none -- reported by `sctx doctor`, never half-enabled.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+// Mirrors the TOML key names one-for-one on purpose; see `RetrievalConfigDocument`.
+#[allow(clippy::struct_field_names)]
+pub struct RetrievalSettings {
+    /// Directory holding `model.onnx` (plus `model.onnx_data` for an external-data model) and
+    /// `tokenizer.json`.
+    pub embedding_model_path: Option<PathBuf>,
+    /// The ONNX Runtime dynamic library this process loads at run time.
+    pub embedding_runtime_path: Option<PathBuf>,
+    /// Cosine, in basis points, a candidate Context must reach against a seed Context to be
+    /// admitted by the second hop.
+    ///
+    /// Absent means the compiled-in default. The key exists because ADR-0007 pre-registered it:
+    /// that default was derived from one adversarial fixture cross-checked against one
+    /// installation, which is one installation more than any retrieval constant in this repository
+    /// previously had and still not a distribution. Until the recorded admission scores of real
+    /// traffic settle the value, an installation whose corpus separates differently needs a way to
+    /// move it that is not a release -- and the record of what each decision scored is what makes
+    /// moving it an informed act rather than a guess.
+    pub hop2_admission_floor_basis_points: Option<u16>,
+    /// Hard ceiling on what one automatic Context Pack may cost on the wire, in tokens.
+    ///
+    /// Absent means the compiled-in default. Unlike every other retrieval key, this one is not a
+    /// statement about this corpus at all: it is the size of the cell the *host* will render the
+    /// tool result into, and a host that truncates at ten thousand tokens truncates from the
+    /// middle, leaving the model a JSON object that does not close. The compiled-in value is
+    /// derived from one measured desktop host, so an operator whose host holds more -- or whose
+    /// host holds conspicuously less -- has to be able to say so without waiting for a release.
+    pub pack_wire_token_ceiling: Option<usize>,
+}
+
+impl RetrievalSettings {
+    /// True when both halves are present, which is the only state that enables the channel.
+    #[must_use]
+    pub const fn embedding_enabled(&self) -> bool {
+        self.embedding_model_path.is_some() && self.embedding_runtime_path.is_some()
+    }
+
+    /// True when exactly one half is configured, which is always an operator mistake.
+    #[must_use]
+    pub const fn embedding_half_configured(&self) -> bool {
+        self.embedding_model_path.is_some() != self.embedding_runtime_path.is_some()
+    }
+
+    fn from_document(document: Option<&RetrievalConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            embedding_model_path: configured_absolute_path(
+                document.embedding_model_path.as_deref(),
+                "retrieval.embedding_model_path",
+            )?,
+            embedding_runtime_path: configured_absolute_path(
+                document.embedding_runtime_path.as_deref(),
+                "retrieval.embedding_runtime_path",
+            )?,
+            hop2_admission_floor_basis_points: hop2_admission_floor(
+                document.hop2_admission_floor_basis_points,
+                "retrieval.hop2_admission_floor_basis_points",
+            )?,
+            pack_wire_token_ceiling: pack_wire_token_ceiling(
+                document.pack_wire_token_ceiling,
+                "retrieval.pack_wire_token_ceiling",
+            )?,
+        })
+    }
+}
+
+/// Optional `[policy]` table: where this installation keeps its runtime team policy.
+///
+/// One key on purpose. The policy's *content* belongs in Markdown a person edits, not in TOML a
+/// person escapes; the only thing `config.toml` decides is which file that is, so that a team can
+/// point every workstation at one checked-out document instead of copying it around.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyConfigDocument {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+/// Where the runtime team policy is read from. `None` means `<root>/policy.md`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct PolicySettings {
+    pub path: Option<PathBuf>,
+}
+
+impl PolicySettings {
+    fn from_document(document: Option<&PolicyConfigDocument>) -> Result<Self> {
+        let Some(document) = document else {
+            return Ok(Self::default());
+        };
+        Ok(Self {
+            path: configured_absolute_path(document.path.as_deref(), "policy.path")?,
+        })
+    }
+}
+
+/// Bounds a configured second-hop admission floor.
+///
+/// The band is deliberately narrower than "any cosine". Below 3000 the floor stops being an
+/// admission decision at all -- the query-side calibration measured a third of an unrelated corpus
+/// above 2800, and this key exists precisely because a second hop that admits a third of the corpus
+/// is the defect ADR-0007 was written about. Above 9000 nothing but a near-duplicate is admitted,
+/// which silently turns the lane off; an operator who wants it off removes the model. Both ends are
+/// refused rather than clamped, for the same reason the encode budget's are: a typo should be a
+/// message, not a retrieval that quietly stopped working.
+fn hop2_admission_floor(value: Option<u16>, field: &str) -> Result<Option<u16>> {
+    const MIN_FLOOR_BASIS_POINTS: u16 = 3_000;
+    const MAX_FLOOR_BASIS_POINTS: u16 = 9_000;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !(MIN_FLOOR_BASIS_POINTS..=MAX_FLOOR_BASIS_POINTS).contains(&value) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{field} must be between {MIN_FLOOR_BASIS_POINTS} and {MAX_FLOOR_BASIS_POINTS} \
+                 basis points"
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Bounds a configured wire ceiling.
+///
+/// Below 2000 the ceiling stops being a host fact and becomes a way to turn automatic injection
+/// off by degrading every Pack to nothing; an operator who wants it off has `token_budget`, and a
+/// host cell that small would not hold the response frame either. Above 100000 no host this
+/// protocol reaches renders the result in one piece, so the number has stopped describing anything
+/// and the truncation it was written to prevent comes back silently. Both ends are refused rather
+/// than clamped, on the same grounds as the admission floor's: a typo should be a message, not a
+/// Pack that quietly stopped being delivered whole.
+fn pack_wire_token_ceiling(value: Option<usize>, field: &str) -> Result<Option<usize>> {
+    const MIN_WIRE_CEILING_TOKENS: usize = 2_000;
+    const MAX_WIRE_CEILING_TOKENS: usize = 100_000;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if !(MIN_WIRE_CEILING_TOKENS..=MAX_WIRE_CEILING_TOKENS).contains(&value) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{field} must be between {MIN_WIRE_CEILING_TOKENS} and {MAX_WIRE_CEILING_TOKENS} \
+                 tokens"
+            ),
+        ));
+    }
+    Ok(Some(value))
+}
+
+/// Validates one configured absolute path (`[retrieval]` model/runtime, `[policy] path`). A
+/// relative path is rejected rather than resolved against an ambiguous working directory: the MCP
+/// server, the CLI, and the Hooks all run from different ones.
+fn configured_absolute_path(value: Option<&str>, field: &str) -> Result<Option<PathBuf>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must not be empty"),
+        ));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be an absolute path"),
+        ));
+    }
+    Ok(Some(path))
+}
+
+/// Renders one path for storage, applying the same rules a read would enforce.
+///
+/// A writer that accepted a relative path would produce a document its own reader rejects, so the
+/// check happens on the way in rather than being discovered on the next `serve`. The path is not
+/// required to exist: `sctx embedding install` writes it immediately after proving it loads, and a
+/// stale entry is [`super::UserConfigStore`]'s to report, not to prevent.
+fn absolute_retrieval_text(path: &Path, field: &str) -> Result<String> {
+    if !path.is_absolute() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("{field} must be an absolute path, got {}", path.display()),
+        ));
+    }
+    path.to_str()
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("{field} must be non-empty UTF-8"),
+            )
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -40,10 +603,29 @@ pub struct RepositoryCatalogEntry {
     pub checkout_paths: Vec<PathBuf>,
 }
 
-/// Immutable in-memory view used for bounded Repository path mapping.
+/// Immutable in-memory view used for bounded Repository path mapping and for
+/// deriving one Session's activation from its startup directory.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RepositoryCatalogSnapshot {
     pub repositories: Vec<RepositoryCatalogEntry>,
+    pub activation: ActivationSettings,
+}
+
+/// Deterministic local revision of the complete explicit `RepositoryCatalog`.
+///
+/// This is a SHA-256 digest of a canonically ordered serialization of configured
+/// Repository IDs, checkout paths, and the explicit activation switches. Computing
+/// it is pure: it performs no filesystem scan and never invokes Git.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepositoryCatalogRevision(String);
+
+impl RepositoryCatalogRevision {
+    /// Stable textual representation used only by private local state.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Result of an atomic Catalog add operation.
@@ -52,6 +634,54 @@ pub struct RepositoryCatalogAddOutcome {
     pub repository: RepositoryCatalogEntry,
     pub created_identity: bool,
     pub added_paths: usize,
+}
+
+/// Result of one atomic local-only Catalog `RepositoryId` rename (ADR-0001, Mew #235).
+///
+/// Only the local Catalog identity changes. Append-only Git history is never
+/// rewritten, so any `EngineeringReference` recorded under `previous_repository_id`
+/// keeps that spelling; `sctx repository doctor` reports how many such References
+/// remain.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RepositoryCatalogRenameOutcome {
+    pub previous_repository_id: RepositoryId,
+    pub repository: RepositoryCatalogEntry,
+}
+
+/// Local `SessionStart` authorization decision for one canonical startup directory.
+///
+/// The decision is two-state on purpose. `Enabled` names exactly the registered
+/// Repository identities this Session may record for: one identity when the Session
+/// started inside a registered checkout, and every identity with a checkout under the
+/// startup directory when it started at a common parent of several checkouts.
+/// `Disabled` is everything else, including the guarded ancestors in
+/// [`parent_activation_is_guarded`].
+///
+/// No absolute path crosses this type: activation carries identity, never location,
+/// so a decision can be persisted, re-derived, and compared without leaking a
+/// checkout path into a lease, an MCP response, a report, or durable Context.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ActivationScope {
+    Enabled { repository_ids: Vec<RepositoryId> },
+    Disabled,
+}
+
+impl ActivationScope {
+    /// Registered Repository identities this Session may record for; empty when Disabled.
+    #[must_use]
+    pub fn repository_ids(&self) -> &[RepositoryId] {
+        match self {
+            Self::Enabled { repository_ids } => repository_ids,
+            Self::Disabled => &[],
+        }
+    }
+
+    /// Whether Shared Context records anything at all for this Session.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
 }
 
 /// Stable Catalog interpretation of one absolute file path.
@@ -87,6 +717,26 @@ pub enum CatalogCheckoutStatus {
     NotGitRoot,
 }
 
+/// Prefix of the pre-ADR-0001 opaque `RepositoryId` spelling. Values with this
+/// prefix remain valid and readable (ADR-0001 does not rewrite Git history) but
+/// are flagged by `doctor_repository_catalog` for team-name migration via
+/// [`UserConfigStore::rename_repository`].
+pub const LEGACY_REPOSITORY_ID_PREFIX: &str = "rpo_";
+
+/// One typed, JSON-stable Catalog diagnosis finding. Each variant serializes
+/// with a fixed `kind` tag so CLI/MCP callers can match on it without parsing
+/// free text.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RepositoryCatalogDiagnostic {
+    /// A Catalog entry still uses the legacy `rpo_<uuid>` identity spelling.
+    LegacyRepositoryId {
+        repository_id: RepositoryId,
+        message: String,
+        migration_command: String,
+    },
+}
+
 /// Bounded explicit Catalog diagnosis.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RepositoryCatalogDoctorReport {
@@ -94,6 +744,7 @@ pub struct RepositoryCatalogDoctorReport {
     pub repository_count: usize,
     pub checkout_count: usize,
     pub checkouts: Vec<RepositoryCatalogCheckoutCheck>,
+    pub diagnostics: Vec<RepositoryCatalogDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -113,6 +764,37 @@ pub struct UserConfigStore {
 }
 
 impl UserConfigStore {
+    /// Serializes one empty Catalog for the final fixed Store under `root`.
+    ///
+    /// This is a pure staging helper for transactional reset; it does not create
+    /// or modify the installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe root or serialization failure.
+    pub fn empty_document(root: impl AsRef<Path>) -> Result<String> {
+        let root = absolute(root.as_ref())?;
+        let document = ConfigDocument {
+            version: CONFIG_VERSION,
+            store: path_text(&root.join("repository"))?,
+            repositories: Vec::new(),
+            activation: None,
+            hooks: None,
+            context_ttl: None,
+            engineering: None,
+            retrieval: None,
+            policy: None,
+            maintenance: None,
+        };
+        validate_document_structure(&document, &root.join("repository"))?;
+        toml::to_string_pretty(&document).map_err(|error| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("serialize empty config.toml: {error}"),
+            )
+        })
+    }
+
     /// Creates or validates the one user configuration and fixed repository.
     ///
     /// # Errors
@@ -131,17 +813,27 @@ impl UserConfigStore {
             root,
         };
         let lock = manager.lock()?;
-        if manager.config_path.exists() {
-            manager.read_document()?;
-            set_file_mode(&manager.config_path, 0o600)?;
-        } else {
-            manager.write_document(&ConfigDocument {
-                version: CONFIG_VERSION,
-                store: path_text(&manager.repository)?,
-                repositories: Vec::new(),
-            })?;
-        }
-        FileExt::unlock(&lock).map_err(io_error("unlock config.lock"))?;
+        let outcome = (|| {
+            if manager.config_path.exists() {
+                manager.read_document()?;
+                set_file_mode(&manager.config_path, 0o600)?;
+            } else {
+                manager.write_document(&ConfigDocument {
+                    version: CONFIG_VERSION,
+                    store: path_text(&manager.repository)?,
+                    repositories: Vec::new(),
+                    activation: None,
+                    hooks: None,
+                    context_ttl: None,
+                    engineering: None,
+                    retrieval: None,
+                    policy: None,
+                    maintenance: None,
+                })?;
+            }
+            Ok(())
+        })();
+        finish_locked(&lock, outcome)?;
         Ok(manager)
     }
 
@@ -198,9 +890,152 @@ impl UserConfigStore {
     /// Returns typed configuration, locking, or filesystem errors.
     pub fn repository_catalog(&self) -> Result<RepositoryCatalogSnapshot> {
         let lock = self.lock_shared()?;
-        let document = self.read_document()?;
-        FileExt::unlock(&lock).map_err(io_error("unlock config.lock"))?;
-        Ok(catalog_snapshot(&document))
+        let outcome = self
+            .read_document()
+            .map(|document| catalog_snapshot(&document));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads where this installation keeps its runtime team policy.
+    ///
+    /// Non-blocking like [`Self::repository_catalog`]: the Hook hot path asks for this on every
+    /// event that delivers policy text to the model, and a Session must never wait on a
+    /// concurrent `sctx repository add` to find out which Markdown file to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn policy_settings(&self) -> Result<PolicySettings> {
+        let lock = self.lock_shared()?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| PolicySettings::from_document(document.policy.as_ref()));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the Catalog, the explicit Hook switches, and the maintenance schedule from the same
+    /// bounded, non-blocking `config.toml` read.
+    ///
+    /// The Hook hot path uses this instead of a second file open: the disabled
+    /// decision costs exactly the read it already performed. The maintenance schedule rides along
+    /// for the same reason — the `SessionStart` opportunistic gate needs it, and a second open
+    /// would add a lock acquisition to every event that does not.
+    ///
+    /// An unusable `[maintenance]` table degrades to the defaults here rather than failing the
+    /// read: a mistyped schedule must not cost a Session its activation, and `sctx doctor` and
+    /// `sctx setup` both report it through [`Self::maintenance_settings`], which does fail loudly.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn repository_catalog_with_hooks(
+        &self,
+    ) -> Result<(RepositoryCatalogSnapshot, HookSettings, MaintenanceSettings)> {
+        let lock = self.lock_shared()?;
+        let outcome = self.read_document().map(|document| {
+            let hooks = HookSettings::from_document(document.hooks);
+            let maintenance =
+                MaintenanceSettings::from_document(document.maintenance).unwrap_or_default();
+            (catalog_snapshot(&document), hooks, maintenance)
+        });
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[maintenance]` table.
+    ///
+    /// A missing table is the default: the daily `LaunchAgent` is installed and a Session that finds
+    /// maintenance a day stale may start one. Read with the blocking shared lock for the same
+    /// reason as [`Self::engineering_settings`] -- only setup, uninstall, and `sctx doctor` ask,
+    /// never the Hook hot path, which takes the degrading reader above.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn maintenance_settings(&self) -> Result<MaintenanceSettings> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| MaintenanceSettings::from_document(document.maintenance));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the Catalog and the explicit `[context_ttl]` policy from the same
+    /// bounded, non-blocking `config.toml` read.
+    ///
+    /// Public MCP dispatch authorizes every call against a frozen Catalog and
+    /// then serves it under that same Catalog's Context lifetime policy. Both
+    /// come from one file, so they come from one read: a second open would add
+    /// a lock acquisition per call and could observe a newer `config.toml` than
+    /// the one that authorized the call.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn repository_catalog_with_context_ttl(
+        &self,
+    ) -> Result<(RepositoryCatalogSnapshot, ContextTtlPolicy)> {
+        let lock = self.lock_shared()?;
+        let outcome = self.read_document().and_then(|document| {
+            let context_ttl = ContextTtlPolicy::from_document(document.context_ttl.as_ref())?;
+            Ok((catalog_snapshot(&document), context_ttl))
+        });
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[context_ttl]` policy from `config.toml`.
+    ///
+    /// A missing table is the default policy: nothing expires. Invalid durations are a typed
+    /// configuration error rather than a silently ignored setting.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn context_ttl_policy(&self) -> Result<ContextTtlPolicy> {
+        // Request-serving code reads this on every call, so it waits for a concurrent explicit
+        // configuration writer instead of failing the call the way the Hook hot path does.
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| ContextTtlPolicy::from_document(document.context_ttl.as_ref()));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[engineering]` switches from `config.toml`.
+    ///
+    /// A missing table is the default: automatic bounded rescanning is on. Read the same way as
+    /// [`Self::context_ttl_policy`] -- waiting for a concurrent explicit writer rather than
+    /// failing the call -- because only request-serving code asks, never the Hook hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn engineering_settings(&self) -> Result<EngineeringSettings> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .map(|document| EngineeringSettings::from_document(document.engineering));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Reads the explicit `[retrieval]` table.
+    ///
+    /// A missing table is the default: the embedding channel does not exist. Read with the
+    /// blocking shared lock for the same reason as [`Self::engineering_settings`] -- only
+    /// request-serving code and `sctx doctor` ask, never the Hook hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn retrieval_settings(&self) -> Result<RetrievalSettings> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .and_then(|document| RetrievalSettings::from_document(document.retrieval.as_ref()));
+        finish_locked(&lock, outcome)
     }
 
     /// Reads the complete Catalog while waiting for a concurrent explicit
@@ -213,15 +1048,46 @@ impl UserConfigStore {
     pub fn repository_catalog_wait(&self) -> Result<RepositoryCatalogSnapshot> {
         let lock = open_private_file(&self.lock_path)?;
         FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
-        let document = self.read_document()?;
-        FileExt::unlock(&lock).map_err(io_error("unlock config.lock"))?;
-        Ok(catalog_snapshot(&document))
+        let outcome = self
+            .read_document()
+            .map(|document| catalog_snapshot(&document));
+        finish_locked(&lock, outcome)
     }
 
-    /// Atomically creates a `RepositoryId` or attaches checkout paths to an existing one.
+    /// Reads the Catalog for local CLI list, doctor, and repair flows.
     ///
-    /// `repository_id=None` is the only identity-creation path. A supplied ID must
-    /// already exist in this Catalog and therefore cannot inject a new identity.
+    /// Unlike [`Self::repository_catalog`], this waits for a concurrent explicit
+    /// configuration writer instead of failing the read the way the Hook hot path
+    /// does. It is structurally the same Snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or unexpected filesystem errors.
+    pub fn inspect_repository_catalog(&self) -> Result<RepositoryCatalogSnapshot> {
+        let lock = open_private_file(&self.lock_path)?;
+        FileExt::lock_shared(&lock).map_err(io_error("lock config.lock shared"))?;
+        let outcome = self
+            .read_document()
+            .map(|document| catalog_snapshot(&document));
+        finish_locked(&lock, outcome)
+    }
+
+    /// Resolves the local `SessionStart` `ActivationScope` under the Catalog read lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or path validation failures. A
+    /// failure never becomes an inferred authorization decision.
+    pub fn resolve_activation_scope(
+        &self,
+        canonical_startup_cwd: &Path,
+    ) -> Result<ActivationScope> {
+        self.repository_catalog()?
+            .resolve_activation_scope(canonical_startup_cwd)
+    }
+
+    /// Atomically creates an explicitly named `RepositoryId` or attaches checkout
+    /// paths to the existing exact identity.
     ///
     /// # Errors
     ///
@@ -229,7 +1095,7 @@ impl UserConfigStore {
     #[allow(clippy::too_many_lines)]
     pub fn add_repository(
         &self,
-        repository_id: Option<RepositoryId>,
+        repository_id: RepositoryId,
         checkout_paths: &[PathBuf],
     ) -> Result<RepositoryCatalogAddOutcome> {
         if checkout_paths.is_empty() {
@@ -247,96 +1113,103 @@ impl UserConfigStore {
             .map(|path| validate_git_checkout_root(path))
             .collect::<Result<BTreeSet<_>>>()?;
         let lock = self.lock()?;
-        let mut document = self.read_document()?;
-        let configured_owner = document
-            .repositories
-            .iter()
-            .flat_map(|repository| {
-                repository
-                    .paths
-                    .iter()
-                    .map(move |path| (path.as_str(), repository.id))
-            })
-            .collect::<BTreeMap<_, _>>();
-        for path in &paths {
-            let text = path_text(path)?;
-            if let Some(owner) = configured_owner.get(text.as_str())
-                && repository_id != Some(*owner)
-            {
-                return Err(invalid(format!(
-                    "checkout path is already configured for Repository {owner}"
-                )));
-            }
-        }
-        let (repository_id, created_identity) = if let Some(repository_id) = repository_id {
-            if !document
+        let outcome = (|| {
+            let mut document = self.read_document()?;
+            let configured_owner = document
                 .repositories
                 .iter()
-                .any(|repository| repository.id == repository_id)
-            {
-                return Err(Error::new(
-                    ErrorKind::RepositoryNotConfigured,
-                    format!("Repository is not configured: {repository_id}"),
-                ));
+                .flat_map(|repository| {
+                    let repository_id = repository.id.clone();
+                    repository
+                        .paths
+                        .iter()
+                        .map(move |path| (path.as_str(), repository_id.clone()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            for path in &paths {
+                let text = path_text(path)?;
+                if let Some(owner) = configured_owner.get(text.as_str())
+                    && &repository_id != owner
+                {
+                    return Err(invalid(format!(
+                        "checkout path is already configured for Repository {owner}"
+                    )));
+                }
             }
-            (repository_id, false)
-        } else {
-            if document.repositories.len() >= MAX_CATALOG_REPOSITORIES {
+            let created_identity = !document
+                .repositories
+                .iter()
+                .any(|repository| repository.id == repository_id);
+            if created_identity {
+                if document.repositories.len() >= MAX_CATALOG_REPOSITORIES {
+                    return Err(invariant(format!(
+                        "Repository Catalog exceeds {MAX_CATALOG_REPOSITORIES} identities"
+                    )));
+                }
+                if let Some(conflict) = document.repositories.iter().find(|repository| {
+                    repository
+                        .id
+                        .as_str()
+                        .eq_ignore_ascii_case(repository_id.as_str())
+                }) {
+                    return Err(invalid(format!(
+                        "Repository ID differs only by ASCII case from configured identity {}",
+                        conflict.id
+                    )));
+                }
+            }
+            let lookup_id = repository_id.clone();
+            let repository = if let Some(repository) = document
+                .repositories
+                .iter_mut()
+                .find(|repository| repository.id == repository_id)
+            {
+                repository
+            } else {
+                document.repositories.push(RepositoryConfigDocument {
+                    id: repository_id,
+                    paths: Vec::new(),
+                });
+                let index = document.repositories.len().saturating_sub(1);
+                document
+                    .repositories
+                    .get_mut(index)
+                    .ok_or_else(|| invariant("failed to insert Repository Catalog identity"))?
+            };
+            let before = repository.paths.len();
+            repository.paths.extend(
+                paths
+                    .iter()
+                    .map(|path| path_text(path))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            repository.paths.sort();
+            repository.paths.dedup();
+            if repository.paths.len() > MAX_CHECKOUTS_PER_REPOSITORY {
                 return Err(invariant(format!(
-                    "Repository Catalog exceeds {MAX_CATALOG_REPOSITORIES} identities"
+                    "Repository {} exceeds {MAX_CHECKOUTS_PER_REPOSITORY} checkout paths",
+                    repository.id
                 )));
             }
-            (RepositoryId::new(), true)
-        };
-        let repository = if let Some(repository) = document
-            .repositories
-            .iter_mut()
-            .find(|repository| repository.id == repository_id)
-        {
-            repository
-        } else {
-            document.repositories.push(RepositoryConfigDocument {
-                id: repository_id,
-                paths: Vec::new(),
-            });
-            let index = document.repositories.len().saturating_sub(1);
+            let added_paths = repository.paths.len().saturating_sub(before);
             document
                 .repositories
-                .get_mut(index)
-                .ok_or_else(|| invariant("failed to insert Repository Catalog identity"))?
-        };
-        let before = repository.paths.len();
-        repository.paths.extend(
-            paths
-                .iter()
-                .map(|path| path_text(path))
-                .collect::<Result<Vec<_>>>()?,
-        );
-        repository.paths.sort();
-        repository.paths.dedup();
-        if repository.paths.len() > MAX_CHECKOUTS_PER_REPOSITORY {
-            return Err(invariant(format!(
-                "Repository {repository_id} exceeds {MAX_CHECKOUTS_PER_REPOSITORY} checkout paths"
-            )));
-        }
-        let added_paths = repository.paths.len().saturating_sub(before);
-        document
-            .repositories
-            .sort_by_key(|repository| repository.id.to_string());
-        self.validate_document(&document)?;
-        self.write_document(&document)?;
-        let snapshot = catalog_snapshot(&document);
-        let repository = snapshot
-            .repositories
-            .into_iter()
-            .find(|repository| repository.repository_id == repository_id)
-            .ok_or_else(|| invariant("configured Repository disappeared before commit"))?;
-        FileExt::unlock(&lock).map_err(io_error("unlock config.lock"))?;
-        Ok(RepositoryCatalogAddOutcome {
-            repository,
-            created_identity,
-            added_paths,
-        })
+                .sort_by_key(|repository| repository.id.to_string());
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            let snapshot = catalog_snapshot(&document);
+            let repository = snapshot
+                .repositories
+                .into_iter()
+                .find(|repository| repository.repository_id == lookup_id)
+                .ok_or_else(|| invariant("configured Repository disappeared before commit"))?;
+            Ok(RepositoryCatalogAddOutcome {
+                repository,
+                created_identity,
+                added_paths,
+            })
+        })();
+        finish_locked(&lock, outcome)
     }
 
     /// Validates every configured checkout without changing Catalog identity.
@@ -346,12 +1219,12 @@ impl UserConfigStore {
     /// Returns configuration or local process errors. Per-checkout drift is
     /// represented in the typed report.
     pub fn doctor_repository_catalog(&self) -> Result<RepositoryCatalogDoctorReport> {
-        let catalog = self.repository_catalog()?;
+        let catalog = self.inspect_repository_catalog()?;
         let mut checkouts = Vec::new();
         for repository in &catalog.repositories {
             for path in &repository.checkout_paths {
                 checkouts.push(RepositoryCatalogCheckoutCheck {
-                    repository_id: repository.repository_id,
+                    repository_id: repository.repository_id.clone(),
                     checkout_path: path.clone(),
                     status: checkout_status(path)?,
                 });
@@ -360,12 +1233,174 @@ impl UserConfigStore {
         let healthy = checkouts
             .iter()
             .all(|checkout| checkout.status == CatalogCheckoutStatus::Available);
+        let diagnostics = catalog
+            .repositories
+            .iter()
+            .filter(|repository| {
+                repository
+                    .repository_id
+                    .as_str()
+                    .starts_with(LEGACY_REPOSITORY_ID_PREFIX)
+            })
+            .map(
+                |repository| RepositoryCatalogDiagnostic::LegacyRepositoryId {
+                    repository_id: repository.repository_id.clone(),
+                    message: format!(
+                        "Repository {} still uses the pre-ADR-0001 legacy identity spelling; \
+                     rename it to a team-chosen readable name. Existing EngineeringReference \
+                     events keep the legacy spelling (ADR-0001 does not rewrite Git history).",
+                        repository.repository_id
+                    ),
+                    migration_command: format!(
+                        "sctx repository rename --from {} --to <ReadableRepositoryId>",
+                        repository.repository_id
+                    ),
+                },
+            )
+            .collect();
         Ok(RepositoryCatalogDoctorReport {
             healthy,
             repository_count: catalog.repositories.len(),
             checkout_count: checkouts.len(),
             checkouts,
+            diagnostics,
         })
+    }
+
+    /// Atomically renames one local Catalog `RepositoryId` identity.
+    ///
+    /// Only the local Catalog changes: no Git Event is appended or rewritten,
+    /// so any `EngineeringReference` recorded under `from` durably keeps that
+    /// spelling (ADR-0001).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ErrorKind::InvalidInput` when `from` and `to` are identical,
+    /// `ErrorKind::RepositoryNotConfigured` when `from` is not configured, and
+    /// `ErrorKind::Conflict` when `to` already names a configured identity
+    /// (exact or case-insensitive match).
+    pub fn rename_repository(
+        &self,
+        from: &RepositoryId,
+        to: &RepositoryId,
+    ) -> Result<RepositoryCatalogRenameOutcome> {
+        if from.as_str() == to.as_str() {
+            return Err(invalid(
+                "repository rename requires a --to identity different from --from",
+            ));
+        }
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document()?;
+            let index = document
+                .repositories
+                .iter()
+                .position(|repository| &repository.id == from)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::RepositoryNotConfigured,
+                        format!("Repository identity is not configured: {from}"),
+                    )
+                })?;
+            if let Some(conflict) = document
+                .repositories
+                .iter()
+                .find(|repository| repository.id.as_str().eq_ignore_ascii_case(to.as_str()))
+            {
+                return Err(Error::new(
+                    ErrorKind::Conflict,
+                    format!(
+                        "Repository ID {to} already names configured identity {}",
+                        conflict.id
+                    ),
+                ));
+            }
+            document.repositories[index].id = to.clone();
+            document
+                .repositories
+                .sort_by_key(|repository| repository.id.to_string());
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            let repository = catalog_snapshot(&document)
+                .repositories
+                .into_iter()
+                .find(|repository| &repository.repository_id == to)
+                .ok_or_else(|| invariant("renamed Repository disappeared before commit"))?;
+            Ok(RepositoryCatalogRenameOutcome {
+                previous_repository_id: from.clone(),
+                repository,
+            })
+        })();
+        finish_locked(&lock, outcome)
+    }
+
+    /// Points `[retrieval]` at a model directory and an ONNX Runtime library.
+    ///
+    /// Both halves are written together because half a configuration is the same fact as none
+    /// (see [`RetrievalSettings`]); there is deliberately no way to set one from here. The write
+    /// goes through the same read-modify-validate-replace path as the Catalog writers, so every
+    /// other table in `config.toml` round-trips untouched and a concurrent reader either sees the
+    /// old document or the new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when either path is relative or empty, and typed locking or
+    /// filesystem errors when the document cannot be read or replaced.
+    pub fn set_retrieval_embedding(
+        &self,
+        model_path: &Path,
+        runtime_path: &Path,
+    ) -> Result<RetrievalSettings> {
+        let model = absolute_retrieval_text(model_path, "retrieval.embedding_model_path")?;
+        let runtime = absolute_retrieval_text(runtime_path, "retrieval.embedding_runtime_path")?;
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document()?;
+            // Reinstalling the model is not a reason to discard a number the operator tuned for
+            // this installation: the two halves this call owns are the paths, and nothing else.
+            let tuned = document.retrieval.as_ref();
+            let hop2_floor =
+                tuned.and_then(|retrieval| retrieval.hop2_admission_floor_basis_points);
+            let wire_ceiling = tuned.and_then(|retrieval| retrieval.pack_wire_token_ceiling);
+            document.retrieval = Some(RetrievalConfigDocument {
+                embedding_model_path: Some(model),
+                embedding_runtime_path: Some(runtime),
+                // Deliberately dropped rather than preserved: the encode budget governs nothing
+                // since ADR-0007 retired the query path, so carrying it forward would keep a
+                // dead key alive in every rewritten `config.toml`.
+                embedding_encode_budget_ms: None,
+                hop2_admission_floor_basis_points: hop2_floor,
+                pack_wire_token_ceiling: wire_ceiling,
+            });
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            RetrievalSettings::from_document(document.retrieval.as_ref())
+        })();
+        finish_locked(&lock, outcome)
+    }
+
+    /// Removes both `[retrieval]` embedding keys, reporting whether anything was configured.
+    ///
+    /// The whole table is dropped rather than emptied: an empty `[retrieval]` and an absent one
+    /// mean the same thing to every reader, and the absent one is what a never-configured
+    /// installation has, so removal restores the exact document shape it started from.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed configuration, locking, or filesystem errors.
+    pub fn clear_retrieval_embedding(&self) -> Result<bool> {
+        let lock = self.lock()?;
+        let outcome = (|| {
+            let mut document = self.read_document()?;
+            if document.retrieval.is_none() {
+                return Ok(false);
+            }
+            document.retrieval = None;
+            self.validate_document(&document)?;
+            self.write_document(&document)?;
+            Ok(true)
+        })();
+        finish_locked(&lock, outcome)
     }
 
     fn lock(&self) -> Result<File> {
@@ -390,26 +1425,12 @@ impl UserConfigStore {
                 format!("parse {}: {error}", self.config_path.display()),
             )
         })?;
-        self.validate_document(&document)?;
+        validate_document_structure(&document, &self.repository)?;
         Ok(document)
     }
 
     fn validate_document(&self, document: &ConfigDocument) -> Result<()> {
-        if document.version != CONFIG_VERSION {
-            return Err(invariant(format!(
-                "unsupported config version {}",
-                document.version
-            )));
-        }
-        let expected = path_text(&self.repository)?;
-        if document.store != expected {
-            return Err(invariant(format!(
-                "config must contain exactly the fixed Store {}; found {}",
-                self.repository.display(),
-                document.store
-            )));
-        }
-        validate_repository_documents(&document.repositories)
+        validate_document_structure(document, &self.repository)
     }
 
     fn write_document(&self, document: &ConfigDocument) -> Result<()> {
@@ -438,6 +1459,146 @@ impl UserConfigStore {
 }
 
 impl RepositoryCatalogSnapshot {
+    /// Computes the semantic revision used to invalidate local Session leases.
+    ///
+    /// Ordering differences in caller-built Snapshots do not change the result.
+    /// The revision changes when any configured Repository identity, checkout,
+    /// or activation switch changes. No path is inspected and Git is never
+    /// executed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an input error when a configured path cannot be serialized.
+    pub fn revision(&self) -> Result<RepositoryCatalogRevision> {
+        let mut canonical = self.clone();
+        canonical
+            .repositories
+            .sort_by_key(|repository| repository.repository_id.clone());
+        for repository in &mut canonical.repositories {
+            repository.checkout_paths.sort();
+        }
+        let bytes = serde_json::to_vec(&canonical)
+            .map_err(|_| invalid("serialize Repository Catalog revision source"))?;
+        let digest = Sha256::digest(bytes);
+        Ok(RepositoryCatalogRevision(format!("sha256:{digest:x}")))
+    }
+
+    /// Resolves one canonical Agent startup directory into local authorization.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-canonical startup directory or ambiguous Catalog ownership.
+    /// Repository health belongs to Catalog configuration and doctor operations;
+    /// this `SessionStart` resolver does not invoke Git.
+    pub fn resolve_activation_scope(
+        &self,
+        canonical_startup_cwd: &Path,
+    ) -> Result<ActivationScope> {
+        validate_canonical_directory(canonical_startup_cwd, "Agent startup directory")?;
+        self.resolve_recorded_activation_scope(canonical_startup_cwd)
+    }
+
+    /// Derives the activation of one already-canonical startup directory without
+    /// touching the filesystem.
+    ///
+    /// Two rules, in order, and nothing else is registered by hand:
+    ///
+    /// 1. The directory is inside a registered checkout — the deepest one wins —
+    ///    so the Session records for exactly that Repository.
+    /// 2. The directory *contains* registered checkouts, which is what starting an
+    ///    Agent at the common parent of several checkouts looks like, so the Session
+    ///    records for every Repository whose checkout lives below it.
+    ///
+    /// Anything else is Disabled, including the guarded ancestors described in
+    /// [`parent_activation_is_guarded`]: without that guard, starting an Agent in the
+    /// home directory would enable every Repository on the machine, which is the
+    /// opposite of recording only inside the Repositories the user registered.
+    ///
+    /// This is the pure re-resolution seam an activation lease uses to follow later
+    /// Catalog edits: it never stats a path, never runs Git, and never scans a
+    /// Repository, so it is safe on the Hook and MCP hot paths.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a relative or dot-segmented directory and ambiguous Catalog ownership.
+    pub fn resolve_recorded_activation_scope(
+        &self,
+        canonical_startup_cwd: &Path,
+    ) -> Result<ActivationScope> {
+        validate_absolute_path(canonical_startup_cwd, "Agent startup directory")?;
+
+        if let Some((repository_id, _)) = self.deepest_checkout_for(canonical_startup_cwd)? {
+            return Ok(ActivationScope::Enabled {
+                repository_ids: vec![repository_id],
+            });
+        }
+        if parent_activation_is_guarded(canonical_startup_cwd, self.activation) {
+            return Ok(ActivationScope::Disabled);
+        }
+        let repository_ids = self
+            .repositories
+            .iter()
+            .filter(|repository| {
+                repository
+                    .checkout_paths
+                    .iter()
+                    .any(|checkout| checkout.starts_with(canonical_startup_cwd))
+            })
+            .map(|repository| repository.repository_id.clone())
+            .collect::<BTreeSet<_>>();
+        if repository_ids.is_empty() {
+            return Ok(ActivationScope::Disabled);
+        }
+        Ok(ActivationScope::Enabled {
+            repository_ids: repository_ids.into_iter().collect(),
+        })
+    }
+
+    /// Deepest configured checkout that contains `path`, or `None` when the path is
+    /// outside every configured checkout.
+    ///
+    /// This is the one longest-prefix ownership rule shared by activation derivation
+    /// and Hook path attribution. It is pure: no stat, no Git, no scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant violation when the same deepest checkout is claimed by two
+    /// Repository identities, which configuration validation already forbids.
+    pub fn deepest_checkout_for(&self, path: &Path) -> Result<Option<(RepositoryId, PathBuf)>> {
+        let mut matches = self
+            .repositories
+            .iter()
+            .flat_map(|repository| {
+                repository
+                    .checkout_paths
+                    .iter()
+                    .filter_map(move |checkout| {
+                        path.starts_with(checkout)
+                            .then_some((repository.repository_id.clone(), checkout))
+                    })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .1
+                .components()
+                .count()
+                .cmp(&left.1.components().count())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let Some((repository_id, checkout_path)) = matches.first().cloned() else {
+            return Ok(None);
+        };
+        if matches.iter().skip(1).any(|(other_id, other_path)| {
+            *other_path == checkout_path && other_id != &repository_id
+        }) {
+            return Err(invariant(
+                "ActivationScope has ambiguous checkout ownership",
+            ));
+        }
+        Ok(Some((repository_id, checkout_path.clone())))
+    }
+
     /// Canonicalizes and resolves one existing absolute file inside both an
     /// allowed Workspace and one configured checkout.
     ///
@@ -491,7 +1652,7 @@ impl RepositoryCatalogSnapshot {
                     .filter_map(move |checkout| {
                         declared_path
                             .starts_with(checkout)
-                            .then_some((repository.repository_id, checkout))
+                            .then_some((repository.repository_id.clone(), checkout))
                     })
             })
             .collect::<Vec<_>>();
@@ -503,7 +1664,7 @@ impl RepositoryCatalogSnapshot {
                 .cmp(&left.1.components().count())
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let Some((repository_id, checkout_path)) = matches.first().copied() else {
+        let Some((repository_id, checkout_path)) = matches.first().cloned() else {
             return Err(Error::new(
                 ErrorKind::RepositoryNotConfigured,
                 "declared Artifact path is not inside a configured Repository checkout",
@@ -552,7 +1713,7 @@ impl RepositoryCatalogSnapshot {
                     .filter_map(move |checkout| {
                         canonical_file
                             .starts_with(checkout)
-                            .then_some((repository.repository_id, checkout))
+                            .then_some((repository.repository_id.clone(), checkout))
                     })
             })
             .collect::<Vec<_>>();
@@ -564,7 +1725,7 @@ impl RepositoryCatalogSnapshot {
                 .cmp(&left.1.components().count())
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let Some((repository_id, checkout_path)) = matches.first().copied() else {
+        let Some((repository_id, checkout_path)) = matches.first().cloned() else {
             return Err(Error::new(
                 ErrorKind::RepositoryNotConfigured,
                 "file path is not inside a configured Repository checkout",
@@ -590,11 +1751,84 @@ fn catalog_snapshot(document: &ConfigDocument) -> RepositoryCatalogSnapshot {
             .repositories
             .iter()
             .map(|repository| RepositoryCatalogEntry {
-                repository_id: repository.id,
+                repository_id: repository.id.clone(),
                 checkout_paths: repository.paths.iter().map(PathBuf::from).collect(),
             })
             .collect(),
+        activation: ActivationSettings::from_document(document.activation),
     }
+}
+
+/// Startup directories that never derive parent-directory activation.
+///
+/// The filesystem root, the user's home directory, and the directory that contains
+/// home are the ancestors that essentially every checkout on the machine shares, so
+/// deriving activation from them would enable every registered Repository at once.
+/// The guard is structural rather than a blocklist: it applies only to rule 2 of
+/// [`RepositoryCatalogSnapshot::resolve_recorded_activation_scope`], so a checkout the
+/// user explicitly registered at such a path still activates directly.
+///
+/// `[activation] allow_home = true` lifts the two home guards for operators who really
+/// do keep every Repository directly under home. The filesystem root is never derivable.
+fn parent_activation_is_guarded(directory: &Path, settings: ActivationSettings) -> bool {
+    if directory.parent().is_none() {
+        return true;
+    }
+    if settings.allow_home {
+        return false;
+    }
+    let Some(home) = home_directory() else {
+        return false;
+    };
+    directory == home || Some(directory) == home.parent()
+}
+
+/// The invoking user's home directory, when the environment names an absolute one
+/// that is not itself the filesystem root.
+fn home_directory() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    (home.is_absolute() && home.parent().is_some()).then_some(home)
+}
+
+/// Rewrites one `config.toml` body that still carries the removed `[[repository_groups]]`
+/// section, returning `None` when there is nothing to migrate.
+///
+/// Explicit Groups were the hand-registered form of "this parent directory activates these
+/// Repositories"; activation now derives that from the registered checkouts themselves, so
+/// the section carries no decision any more and a document that still contains it no longer
+/// parses. `upgrade` and `setup` drop it inside their transaction, which keeps a backup.
+///
+/// # Errors
+///
+/// Returns an input error when the document is not parseable TOML or cannot be re-serialized.
+pub fn migrate_legacy_repository_groups(document: &str) -> Result<Option<String>> {
+    let mut table: toml::Table = document
+        .parse()
+        .map_err(|error| invalid(format!("parse config.toml for migration: {error}")))?;
+    if table.remove("repository_groups").is_none() {
+        return Ok(None);
+    }
+    toml::to_string_pretty(&table)
+        .map(Some)
+        .map_err(|error| invalid(format!("serialize migrated config.toml: {error}")))
+}
+
+fn validate_document_structure(document: &ConfigDocument, repository: &Path) -> Result<()> {
+    if document.version != CONFIG_VERSION {
+        return Err(invariant(format!(
+            "unsupported config version {}",
+            document.version
+        )));
+    }
+    let expected = path_text(repository)?;
+    if document.store != expected {
+        return Err(invariant(format!(
+            "config must contain exactly the fixed Store {}; found {}",
+            repository.display(),
+            document.store
+        )));
+    }
+    validate_repository_documents(&document.repositories)
 }
 
 fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> Result<()> {
@@ -606,7 +1840,7 @@ fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> R
     let mut ids = BTreeSet::new();
     let mut paths = BTreeMap::<String, RepositoryId>::new();
     for repository in repositories {
-        if !ids.insert(repository.id) {
+        if !ids.insert(repository.id.clone()) {
             return Err(invalid(format!(
                 "duplicate Repository Catalog identity: {}",
                 repository.id
@@ -628,7 +1862,7 @@ fn validate_repository_documents(repositories: &[RepositoryConfigDocument]) -> R
                     repository.id
                 )));
             }
-            if let Some(owner) = paths.insert(path.clone(), repository.id) {
+            if let Some(owner) = paths.insert(path.clone(), repository.id.clone()) {
                 return Err(invalid(format!(
                     "checkout path belongs to multiple Repository identities: {owner} and {}",
                     repository.id
@@ -656,6 +1890,22 @@ fn validate_git_checkout_root(path: &Path) -> Result<PathBuf> {
             "Repository checkout path must be a Git worktree root",
         )),
     }
+}
+
+fn validate_canonical_directory(path: &Path, field: &str) -> Result<()> {
+    validate_absolute_path(path, field)?;
+    let metadata = fs::symlink_metadata(path).map_err(io_error("inspect canonical directory"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(invalid(format!("{field} must not be a symlink")));
+    }
+    if !metadata.is_dir() {
+        return Err(invalid(format!("{field} must be a directory")));
+    }
+    let canonical = fs::canonicalize(path).map_err(io_error("canonicalize directory"))?;
+    if canonical != path {
+        return Err(invalid(format!("{field} must use its canonical path")));
+    }
+    Ok(())
 }
 
 fn checkout_status(path: &Path) -> Result<CatalogCheckoutStatus> {
@@ -851,6 +2101,11 @@ fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(io_error("sync directory"))
+}
+
+fn finish_locked<T>(lock: &File, outcome: Result<T>) -> Result<T> {
+    FileExt::unlock(lock).map_err(io_error("unlock config.lock"))?;
+    outcome
 }
 
 fn invariant(message: impl Into<String>) -> Error {

@@ -11,12 +11,14 @@ mod store;
 pub use journal::{BatchId, JournalPhase, PendingBatch, PendingFile, PendingFileKind};
 pub use sctx_domain::{Error, ErrorKind, Result};
 pub use store::{
-    AppendBatchOutcome, AppendOutcome, AppendRequest, CandidateConfirmationIndex,
-    CandidateConfirmationLookup, CandidateConfirmationOutcome, CandidateConfirmationRecord,
-    CandidateConfirmationWriteStatus, CandidateSubmissionIndex, CandidateSubmissionLookup,
-    CandidateSubmissionOutcome, CandidateSubmissionRecord, CandidateSubmissionRequest,
-    CandidateSubmissionStatus, CommitObserver, CrashInjector, CrashSeam, GitStore,
-    NoopCommitObserver, NoopCrashInjector, ObjectRef, StagedValidation, TextObject,
+    AppendBatchOutcome, AppendOutcome, AppendRequest, CandidateConfirmationBatchEntry,
+    CandidateConfirmationBatchWrite, CandidateConfirmationIndex, CandidateConfirmationLookup,
+    CandidateConfirmationOutcome, CandidateConfirmationRecord, CandidateConfirmationWriteStatus,
+    CandidateSubmissionBatchEntry, CandidateSubmissionBatchWrite, CandidateSubmissionIndex,
+    CandidateSubmissionLookup, CandidateSubmissionOutcome, CandidateSubmissionRecord,
+    CandidateSubmissionRequest, CandidateSubmissionStatus, CommitObserver, CrashInjector,
+    CrashSeam, GitStore, MAX_CANDIDATE_SUBMISSION_BATCH, NoopCommitObserver, NoopCrashInjector,
+    ObjectRef, RemoteBootstrap, StagedValidation, TextObject,
     UnavailableCandidateConfirmationIndex, UnavailableCandidateSubmissionIndex,
 };
 

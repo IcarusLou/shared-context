@@ -60,9 +60,11 @@ function assertChecksums(bundle) {
 test('package metadata has exact optional, os, and cpu contracts with no lifecycle mutation', () => {
   const main = readJson(path.join(PACKAGES_ROOT, 'shared-context/package.json'));
   assert.deepEqual(main.optionalDependencies, {
-    '@company/shared-context-darwin-arm64': main.version,
-    '@company/shared-context-darwin-x64': main.version,
+    '@bytedance-dev/shared-context-darwin-arm64': main.version,
+    '@bytedance-dev/shared-context-darwin-x64': main.version,
   });
+  assert.equal(main.name, '@bytedance-dev/shared-context');
+  assert.deepEqual(main.publishConfig, { registry: 'https://bnpm.byted.org' });
   assert.equal(main.scripts, undefined);
 
   for (const [arch, cpu] of [
@@ -75,6 +77,8 @@ test('package metadata has exact optional, os, and cpu contracts with no lifecyc
     assert.deepEqual(platform.os, ['darwin']);
     assert.deepEqual(platform.cpu, [cpu]);
     assert.equal(platform.version, main.version);
+    assert.equal(platform.name, `@bytedance-dev/shared-context-darwin-${arch}`);
+    assert.deepEqual(platform.publishConfig, { registry: 'https://bnpm.byted.org' });
     assert.equal(platform.scripts, undefined);
   }
 });
@@ -97,7 +101,7 @@ test('npm pack main package contains only the thin launcher surface', (context) 
   assert.match(verbose, /-rwxr-xr-x.*package\/bin\/sctx\.js/);
 });
 
-test('offline install entrypoint invokes setup even without user arguments', (context) => {
+test('offline install invokes setup and forwards a remote Knowledge Store URL', (context) => {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sctx-install-entrypoint-'));
   context.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
   const bundle = path.join(temporary, 'bundle');
@@ -122,6 +126,19 @@ test('offline install entrypoint invokes setup even without user arguments', (co
     env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin` },
   });
   assert.equal(fs.readFileSync(invocation, 'utf8'), 'setup\n');
+
+  run(
+    path.join(bundle, 'install'),
+    ['--knowledge-store-url', 'git@example.invalid:team/shared-context.git'],
+    {
+      cwd: bundle,
+      env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin` },
+    },
+  );
+  assert.equal(
+    fs.readFileSync(invocation, 'utf8'),
+    'setup\n--knowledge-store-url\ngit@example.invalid:team/shared-context.git\n',
+  );
 });
 
 test(
@@ -182,7 +199,11 @@ test(
 
 test(
   'arm64 real CLI completes the offline setup --demo loop without Registry access',
-  { skip: process.platform !== 'darwin' || process.arch !== 'arm64', timeout: 600_000 },
+  {
+    // Mew #195: the human gate accepted this non-core demo regression as a known limitation.
+    skip: 'Mew #195 — offline setup --demo is intentionally unsupported',
+    timeout: 600_000,
+  },
   (context) => {
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'sctx-offline-smoke-'));
     context.after(() => fs.rmSync(temporary, { recursive: true, force: true }));

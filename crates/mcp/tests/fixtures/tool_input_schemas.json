@@ -1,0 +1,1370 @@
+{
+  "association_explain": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "reference_id": {
+        "pattern": "^ref_[0-9a-fA-F-]+$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "reference_id"
+    ],
+    "type": "object"
+  },
+  "association_rebuild": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "diagnose_only": {
+        "default": false,
+        "type": "boolean"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id"
+    ],
+    "type": "object"
+  },
+  "candidate_confirm": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "candidate_id": {
+        "description": "Send exactly one of candidate_id or candidate_ids; sending both or neither is rejected.",
+        "pattern": "^cnd_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "candidate_ids": {
+        "description": "Send exactly one of candidate_id or candidate_ids; the batch form shares one Space organization and rejects edits, so per-Candidate edits stay single-Candidate calls.",
+        "items": {
+          "pattern": "^cnd_[0-9a-fA-F-]+$",
+          "type": "string"
+        },
+        "maxItems": 32,
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "decision_source": {
+        "description": "Who decided this confirmation. Defaults to human when omitted. agent_policy declares that you confirmed it yourself without asking the user, and the server accepts it only for a row whose auto_confirmable is true (Review pending, candidate_status exactly ready_for_review, top assessment relation novel or supports) and a request carrying no edits; anything else is refused as auto_confirm_not_permitted, whose message names the step that is missing, and belongs in front of the user. Note that ready_for_review on a compact row means the row wants a reviewer, not that it may be confirmed automatically.",
+        "enum": [
+          "human",
+          "agent_policy"
+        ],
+        "type": "string"
+      },
+      "edits": {
+        "additionalProperties": false,
+        "properties": {
+          "applicability": {
+            "additionalProperties": false,
+            "properties": {
+              "conditions": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "domains": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "platforms": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "type": "object"
+          },
+          "assumptions": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "evidence": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "content": {
+                  "minProperties": 1,
+                  "type": "object"
+                },
+                "interpretation": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "source_snapshot",
+                    "experiment_record",
+                    "artifact_snapshot"
+                  ],
+                  "type": "string"
+                },
+                "limitations": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "supports": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "supports",
+                "content",
+                "interpretation",
+                "limitations"
+              ],
+              "type": "object"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "hints": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "enum": [
+              "decision",
+              "contract",
+              "issue",
+              "risk",
+              "validation",
+              "discovery",
+              "progress"
+            ],
+            "type": "string"
+          },
+          "problem_view": {
+            "additionalProperties": false,
+            "description": "Replace the problem view: action set requires value; action clear removes it and must omit value.",
+            "properties": {
+              "action": {
+                "enum": [
+                  "set",
+                  "clear"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "type": "object"
+          },
+          "rationale": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "recheck_when": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "relations": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "depends_on",
+                    "constrains",
+                    "implements",
+                    "validated_by",
+                    "contradicts",
+                    "supersedes",
+                    "related_to"
+                  ],
+                  "type": "string"
+                },
+                "rationale": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "supports": {
+                  "items": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "target_context_id": {
+                  "pattern": "^ctx_[0-9a-fA-F-]+$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "target_context_id",
+                "kind",
+                "rationale",
+                "supports"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "statement": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "topic_key": {
+            "additionalProperties": false,
+            "description": "Replace the topic key: action set requires value; action clear removes it and must omit value.",
+            "properties": {
+              "action": {
+                "enum": [
+                  "set",
+                  "clear"
+                ],
+                "type": "string"
+              },
+              "value": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "action"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "expected_intent_revision_id": {
+        "pattern": "^tir_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "expected_review_version": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "expected_task_id": {
+        "pattern": "^tsk_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "primary": {
+        "additionalProperties": false,
+        "description": "Send exactly one of existing_space_id or new_space_recommendation_id; sending both or neither is rejected, and a proposed new Space is single-Candidate only.",
+        "properties": {
+          "existing_space_id": {
+            "pattern": "^spc_[0-9a-fA-F-]+$",
+            "type": "string"
+          },
+          "new_space_recommendation_id": {
+            "pattern": "^rec_[0-9a-fA-F-]+$",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "related_space_ids": {
+        "items": {
+          "pattern": "^spc_[0-9a-fA-F-]+$",
+          "type": "string"
+        },
+        "type": "array",
+        "uniqueItems": true
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "expected_task_id",
+      "expected_intent_revision_id",
+      "expected_review_version",
+      "primary",
+      "related_space_ids"
+    ],
+    "type": "object"
+  },
+  "candidate_discard": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "candidate_id": {
+        "description": "Send exactly one of candidate_id or candidate_ids; sending both or neither is rejected.",
+        "pattern": "^cnd_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "candidate_ids": {
+        "description": "Send exactly one of candidate_id or candidate_ids; the batch form discards every listed Candidate atomically under the same Review version and reason.",
+        "items": {
+          "pattern": "^cnd_[0-9a-fA-F-]+$",
+          "type": "string"
+        },
+        "maxItems": 32,
+        "minItems": 1,
+        "type": "array",
+        "uniqueItems": true
+      },
+      "decision_source": {
+        "description": "Who decided this discard. Defaults to human when omitted. Use agent_policy only for a discard you made yourself without asking the user.",
+        "enum": [
+          "human",
+          "agent_policy"
+        ],
+        "type": "string"
+      },
+      "expected_intent_revision_id": {
+        "pattern": "^tir_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "expected_review_version": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "expected_task_id": {
+        "pattern": "^tsk_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "reason": {
+        "maxLength": 512,
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "expected_task_id",
+      "expected_intent_revision_id",
+      "expected_review_version",
+      "reason"
+    ],
+    "type": "object"
+  },
+  "candidate_get": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "candidate_id": {
+        "pattern": "^cnd_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "candidate_id"
+    ],
+    "type": "object"
+  },
+  "candidate_list": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "cursor": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "detail_level": {
+        "default": "compact",
+        "description": "compact returns only the inheritable fact fields; full returns the explainable payload with retrieval paths and match reasons.",
+        "enum": [
+          "compact",
+          "full"
+        ],
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "limit": {
+        "default": 20,
+        "maximum": 100,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "scope": {
+        "default": "task",
+        "description": "task lists only this Task's Candidates; session additionally lists, read-only, the Candidates of every other Task in this Session and names each row's source_task_id.",
+        "enum": [
+          "task",
+          "session"
+        ],
+        "type": "string"
+      },
+      "status": {
+        "default": "pending",
+        "enum": [
+          "pending",
+          "discarded",
+          "expired",
+          "confirmed"
+        ],
+        "type": "string"
+      },
+      "token_budget": {
+        "default": 4096,
+        "maximum": 32768,
+        "minimum": 512,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id"
+    ],
+    "type": "object"
+  },
+  "context_get": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "context_id": {
+        "pattern": "^ctx_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "revision_id": {
+        "pattern": "^rev_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "space_id": {
+        "pattern": "^spc_[0-9a-fA-F-]+$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "context_id"
+    ],
+    "type": "object"
+  },
+  "context_search": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "conditions": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "cursor": {
+        "type": "string"
+      },
+      "domains": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "kinds": {
+        "items": {
+          "enum": [
+            "decision",
+            "contract",
+            "issue",
+            "risk",
+            "validation",
+            "discovery",
+            "progress"
+          ],
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "match_mode": {
+        "default": "ranked",
+        "description": "ranked matches any query token and orders by BM25 combined with query token coverage; exact requires every token.",
+        "enum": [
+          "ranked",
+          "exact"
+        ],
+        "type": "string"
+      },
+      "page_size": {
+        "default": 20,
+        "maximum": 200,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "platforms": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "query": {
+        "default": "",
+        "type": "string"
+      },
+      "space_ids": {
+        "items": {
+          "pattern": "^spc_[0-9a-fA-F-]+$",
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "statuses": {
+        "items": {
+          "enum": [
+            "candidate",
+            "accepted",
+            "deprecated",
+            "superseded",
+            "governance_conflict"
+          ],
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id"
+    ],
+    "type": "object"
+  },
+  "engineering_reference_record": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "artifact_kind": {
+        "enum": [
+          "module",
+          "file",
+          "symbol",
+          "api",
+          "schema",
+          "test"
+        ],
+        "type": "string"
+      },
+      "context_id": {
+        "pattern": "^ctx_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "limitations": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "locator": {
+        "additionalProperties": false,
+        "description": "Kind-specific Artifact coordinates plus the repository-relative path. Send locator_kind and path plus exactly the fields that kind requires and no others: file and module require nothing else; api requires protocol, operation and normalized_route; schema requires namespace, version and qualified_name; symbol requires language, module, enclosing_type (string or null), symbol_name and signature; test requires qualified_test_name. The server names the missing or foreign coordinate field.",
+        "properties": {
+          "enclosing_type": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "language": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "locator_kind": {
+            "enum": [
+              "file",
+              "module",
+              "api",
+              "schema",
+              "symbol",
+              "test"
+            ],
+            "type": "string"
+          },
+          "module": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "namespace": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "normalized_route": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "protocol": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "qualified_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "qualified_test_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "signature": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "symbol_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "locator_kind",
+          "path"
+        ],
+        "type": "object"
+      },
+      "relation": {
+        "enum": [
+          "implements",
+          "defines",
+          "consumes",
+          "validates",
+          "constrains",
+          "depends_on"
+        ],
+        "type": "string"
+      },
+      "repository_id": {
+        "maxLength": 64,
+        "minLength": 1,
+        "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+        "type": "string"
+      },
+      "revision_id": {
+        "pattern": "^rev_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "supports": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "context_id",
+      "revision_id",
+      "repository_id",
+      "artifact_kind",
+      "relation",
+      "locator",
+      "supports",
+      "limitations"
+    ],
+    "type": "object"
+  },
+  "repository_scan": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "checkout_path": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "max_artifacts": {
+        "default": 200,
+        "maximum": 1000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "paths": {
+        "items": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "maxItems": 10000,
+        "minItems": 1,
+        "type": "array"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "checkout_path",
+      "paths"
+    ],
+    "type": "object"
+  },
+  "space_create": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "intent": {
+        "additionalProperties": false,
+        "description": "Complete Space Intent; out_of_scope and domain_terms are the only optional lists.",
+        "properties": {
+          "acceptance_conditions": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "desired_outcome": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "domain_terms": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "in_scope": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "out_of_scope": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "problem": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "problem",
+          "desired_outcome",
+          "in_scope",
+          "acceptance_conditions"
+        ],
+        "type": "object"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "intent"
+    ],
+    "type": "object"
+  },
+  "space_list": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id"
+    ],
+    "type": "object"
+  },
+  "task_artifact_focus": {
+    "additionalProperties": false,
+    "properties": {
+      "absolute_file_path": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "detail_level": {
+        "default": "compact",
+        "description": "compact returns only the inheritable fact fields; full returns the explainable payload with retrieval paths and match reasons.",
+        "enum": [
+          "compact",
+          "full"
+        ],
+        "type": "string"
+      },
+      "expected_revision_id": {
+        "pattern": "^tir_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "locator": {
+        "additionalProperties": false,
+        "description": "Kind-specific Artifact coordinates. Send locator_kind plus exactly the fields that kind requires and no others: file and module require nothing else; api requires protocol, operation and normalized_route; schema requires namespace, version and qualified_name; symbol requires language, module, enclosing_type (string or null), symbol_name and signature; test requires qualified_test_name. The server names the missing or foreign coordinate field.",
+        "properties": {
+          "enclosing_type": {
+            "minLength": 1,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "language": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "locator_kind": {
+            "enum": [
+              "file",
+              "module",
+              "api",
+              "schema",
+              "symbol",
+              "test"
+            ],
+            "type": "string"
+          },
+          "module": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "namespace": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "normalized_route": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "operation": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "protocol": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "qualified_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "qualified_test_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "signature": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "symbol_name": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "version": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "locator_kind"
+        ],
+        "type": "object"
+      },
+      "max_spaces": {
+        "default": 8,
+        "maximum": 32,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "token_budget": {
+        "default": 8000,
+        "minimum": 256,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "expected_revision_id",
+      "absolute_file_path",
+      "locator"
+    ],
+    "type": "object"
+  },
+  "task_checkpoint": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "claims": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "conditions": {
+              "items": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 64,
+              "type": "array"
+            },
+            "context_kind": {
+              "enum": [
+                "decision",
+                "contract",
+                "issue",
+                "risk",
+                "validation",
+                "discovery",
+                "progress"
+              ],
+              "type": "string"
+            },
+            "evidence": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "evidence_type": {
+                    "enum": [
+                      "source_snapshot",
+                      "experiment_record",
+                      "artifact_snapshot"
+                    ],
+                    "type": "string"
+                  },
+                  "limitations": {
+                    "items": {
+                      "maxLength": 4096,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "maxItems": 64,
+                    "type": "array"
+                  },
+                  "summary": {
+                    "maxLength": 4096,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "evidence_type",
+                  "summary",
+                  "limitations"
+                ],
+                "type": "object"
+              },
+              "maxItems": 32,
+              "minItems": 1,
+              "type": "array"
+            },
+            "rationale": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            "statement": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "context_kind",
+            "statement",
+            "rationale",
+            "conditions",
+            "evidence"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array"
+      },
+      "external_session_id": {
+        "maxLength": 4096,
+        "minLength": 1,
+        "type": "string"
+      },
+      "unknowns": {
+        "items": {
+          "additionalProperties": false,
+          "properties": {
+            "blocking": {
+              "type": "boolean"
+            },
+            "statement": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "statement",
+            "blocking"
+          ],
+          "type": "object"
+        },
+        "maxItems": 64,
+        "type": "array"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "claims",
+      "unknowns"
+    ],
+    "type": "object"
+  },
+  "task_context": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "detail_level": {
+        "default": "compact",
+        "description": "compact returns only the inheritable fact fields; full returns the explainable payload with retrieval paths and match reasons.",
+        "enum": [
+          "compact",
+          "full"
+        ],
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "max_spaces": {
+        "default": 8,
+        "maximum": 32,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "token_budget": {
+        "default": 8000,
+        "minimum": 256,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id"
+    ],
+    "type": "object"
+  },
+  "task_intent_update": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "detail_level": {
+        "default": "compact",
+        "description": "compact returns only the inheritable fact fields; full returns the explainable payload with retrieval paths and match reasons.",
+        "enum": [
+          "compact",
+          "full"
+        ],
+        "type": "string"
+      },
+      "expected_revision_id": {
+        "description": "The last returned intent_revision_id, or null only for the first new Task in a new external Session.",
+        "pattern": "^tir_[0-9a-fA-F-]+$",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "intent": {
+        "additionalProperties": false,
+        "properties": {
+          "acceptance_conditions": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "artifact_hints": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "constraints": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "current_direction": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "domains": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "goal": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "in_scope": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "interface_hints": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "open_questions": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "out_of_scope": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "platforms": {
+            "items": {
+              "maxLength": 1024,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array",
+            "uniqueItems": true
+          }
+        },
+        "required": [
+          "goal"
+        ],
+        "type": "object"
+      },
+      "task_boundary": {
+        "enum": [
+          "continue",
+          "new"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "task_boundary",
+      "expected_revision_id",
+      "intent"
+    ],
+    "type": "object"
+  },
+  "task_signal_supersede": {
+    "additionalProperties": false,
+    "properties": {
+      "agent_kind": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "expected_revision_id": {
+        "pattern": "^tir_[0-9a-fA-F-]+$",
+        "type": "string"
+      },
+      "external_session_id": {
+        "minLength": 1,
+        "type": "string"
+      },
+      "signal_ids": {
+        "items": {
+          "pattern": "^sig_[0-9a-fA-F-]+$",
+          "type": "string"
+        },
+        "minItems": 1,
+        "type": "array"
+      },
+      "task_id": {
+        "pattern": "^tsk_[0-9a-fA-F-]+$",
+        "type": "string"
+      }
+    },
+    "required": [
+      "agent_kind",
+      "external_session_id",
+      "task_id",
+      "expected_revision_id",
+      "signal_ids"
+    ],
+    "type": "object"
+  }
+}

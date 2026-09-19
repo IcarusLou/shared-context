@@ -6,14 +6,15 @@
 //! interrupted earlier invocation.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{BufReader, Cursor, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
+    str::FromStr,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -22,31 +23,82 @@ use std::{
 use fs2::FileExt;
 use sctx_adapter_codex::TrustState;
 pub use sctx_domain::{Error, ErrorKind, Result};
+use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
 use sctx_git_store::GitStore;
-use sctx_index::ProjectionIndex;
-use sctx_local_state::{CatalogCheckoutStatus, UserConfigStore};
-use sctx_mcp::{ClientKind, McpServer};
-use sctx_search::{SearchEngine, SearchFilters, SearchRequest};
+use sctx_index::{ProjectionIndex, SEARCH_RANKING_VERSION};
+use sctx_local_state::{
+    AuthorizedSessionScopeStore, CatalogCheckoutStatus, DEFAULT_POLICY_MARKDOWN, MaintenanceLock,
+    ORPHAN_LEASE_MAX_AGE, POLICY_FILE_NAME, UserConfigStore, installation_policy,
+    migrate_legacy_repository_groups,
+};
+use sctx_mcp::{AssociationRebuildInput, ClientKind, McpServer};
+use sctx_search::{
+    SearchEngine, SearchFilters, SearchRequest, SemanticCacheKey, SemanticVectorCache,
+    model_fingerprint, semantic_cache_path,
+};
+use sctx_task_runtime::TaskRuntime;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 use uuid::Uuid;
 
+pub mod codex_trust;
+pub mod embedding;
+pub mod launchd;
+pub mod logs_launchd;
+pub mod maintain;
+
+use launchd::{
+    LaunchAgentActivation, MAINTAIN_LAUNCH_AGENT_LABEL, OwnedLaunchAgent, install_launch_agent,
+    launch_agent_path, plan_launch_agent,
+};
+use maintain::MAINTAIN_SYNC_BACKOFF;
+
 const JOURNAL_VERSION: u32 = 1;
+const RESET_JOURNAL_VERSION: u32 = 1;
 const MANIFEST_VERSION: u32 = 1;
 const MINIMUM_FREE_SPACE_BYTES: u64 = 64 * 1024 * 1024;
 const AGENT_VERSION_TIMEOUT: Duration = Duration::from_secs(2);
+const KNOWLEDGE_SYNC_PUSH_ATTEMPTS: usize = 3;
+/// Wall-clock budget for one Knowledge Store Git operation that reaches the remote.
+///
+/// Generous enough that a slow but live clone still completes, short enough that a scheduled
+/// `sctx maintain run` on a dead network releases the exclusive lease the same day it took it.
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(120);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const PRODUCT_KEY: &str = "shared-context";
-const GLOBAL_SKILL_DIRECTORY: &str = ".agents/skills/shared-context";
-const SKILL_ASSETS: [(&str, &[u8]); 2] = [
+/// The one directory every managed global Agent Skill bundle lives under.
+const GLOBAL_SKILLS_DIRECTORY: &str = ".agents/skills";
+/// Bundle directory names under [`GLOBAL_SKILLS_DIRECTORY`], in install order. `shared-context`
+/// is the session gate; `sctx-review` carries the long-form governance procedures a user reaches
+/// explicitly. The first entry names the bundle a [`SkillReport`] points at.
+const GLOBAL_SKILL_DIRECTORIES: [&str; 2] = ["shared-context", "sctx-review"];
+/// Every managed Skill file, keyed by its path relative to [`GLOBAL_SKILLS_DIRECTORY`].
+const SKILL_ASSETS: [(&str, &[u8]); 6] = [
     (
-        "SKILL.md",
+        "shared-context/SKILL.md",
         include_bytes!("../../../skills/shared-context/SKILL.md"),
     ),
     (
-        "agents/openai.yaml",
+        "shared-context/references/workflow.md",
+        include_bytes!("../../../skills/shared-context/references/workflow.md"),
+    ),
+    (
+        "shared-context/agents/openai.yaml",
         include_bytes!("../../../skills/shared-context/agents/openai.yaml"),
+    ),
+    (
+        "sctx-review/SKILL.md",
+        include_bytes!("../../../skills/sctx-review/SKILL.md"),
+    ),
+    (
+        "sctx-review/references/review.md",
+        include_bytes!("../../../skills/sctx-review/references/review.md"),
+    ),
+    (
+        "sctx-review/agents/openai.yaml",
+        include_bytes!("../../../skills/sctx-review/agents/openai.yaml"),
     ),
 ];
 const HOOK_EVENTS_CURSOR: [&str; 6] = [
@@ -95,7 +147,15 @@ pub enum SetupStage {
     CursorHooksWritten,
     CodexMcpWritten,
     CodexHooksWritten,
+    CodexHookTrustStamped,
+    GlobalSkillGateWritten,
+    GlobalSkillWorkflowWritten,
+    GlobalSkillMetadataWritten,
+    GlobalSkillReviewGateWritten,
+    GlobalSkillReviewReferenceWritten,
+    GlobalSkillReviewMetadataWritten,
     GlobalSkillWritten,
+    LaunchAgentWritten,
     ManifestWritten,
     SmokeTested,
 }
@@ -123,6 +183,57 @@ pub trait Host: Send + Sync {
     /// Returns an external or parse error when free space cannot be determined.
     fn available_space(&self, path: &Path) -> Result<u64>;
     fn agent_version(&self, agent: Agent) -> Option<String>;
+
+    /// Registers the user `LaunchAgent` at `plist` in the calling user's GUI domain, replacing any
+    /// job already loaded under `label`.
+    ///
+    /// Defaults to doing nothing, which is what every host but the production one wants:
+    /// bootstrapping a job is the one setup side effect that outlives the process and reaches
+    /// state no test owns. Only [`SystemHost`] talks to `launchctl`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an external error when `launchctl` cannot be run or refuses the job.
+    fn load_launch_agent(&self, _plist: &Path, _label: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Removes `label` from the calling user's GUI domain if it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an external error when `launchctl` cannot be run. A job that is not loaded is not
+    /// an error: the operation is defined as "this label is not registered afterwards".
+    fn unload_launch_agent(&self, _label: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Environment escape hatch that keeps `launchctl` out of a process that must not touch the
+/// machine's launchd state -- the test harness above all, but also a CI image or a container where
+/// a per-user GUI domain does not exist. Any non-empty value disables registration; the plist is
+/// still written and still owned, so a later `sctx setup` without it registers what is already
+/// there.
+pub const SKIP_LAUNCHCTL_ENV: &str = "SCTX_SKIP_LAUNCHCTL";
+
+fn launchctl_is_disabled() -> bool {
+    env::var_os(SKIP_LAUNCHCTL_ENV).is_some_and(|value| !value.is_empty())
+}
+
+/// The GUI domain target of the calling user, which is where a `LaunchAgent` belongs.
+///
+/// `id -u` rather than `getuid`, because the installer takes no `libc` dependency and this runs
+/// exactly twice per setup, on a path that is already spawning `launchctl`.
+fn launchctl_gui_domain() -> Result<String> {
+    let uid = command_stdout(Command::new("id").arg("-u"), "id -u")?;
+    let uid = uid.trim();
+    if uid.is_empty() || !uid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Error::new(
+            ErrorKind::External,
+            format!("`id -u` did not report a numeric user id, got {uid:?}"),
+        ));
+    }
+    Ok(format!("gui/{uid}"))
 }
 
 /// Production host implementation using argv-based macOS commands.
@@ -197,16 +308,99 @@ impl Host for SystemHost {
         Ok(blocks.saturating_mul(1024))
     }
 
+    /// Probes the executable that actually runs the Hook.
+    ///
+    /// Cursor ships two of them: the Hook-running CLI `cursor-agent`, whose version is a date-like
+    /// build id (`2026.08.25-3e8eec8`), and the desktop shim `cursor`, which reports semver. The
+    /// shim's version says nothing about the Hook host, so probe `cursor-agent` first and fall back
+    /// to `cursor` only when it is absent. The recorded value is informational; nothing gates on it.
     fn agent_version(&self, agent: Agent) -> Option<String> {
-        let executable = match agent {
-            Agent::Cursor => "cursor",
-            Agent::Codex => "codex",
+        let executables: &[&str] = match agent {
+            Agent::Cursor => &["cursor-agent", "cursor"],
+            Agent::Codex => &["codex"],
         };
-        command_stdout_with_timeout(
-            Command::new(executable).arg("--version"),
-            AGENT_VERSION_TIMEOUT,
-        )
+        executables.iter().find_map(|executable| {
+            command_stdout_with_timeout(
+                Command::new(executable).arg("--version"),
+                AGENT_VERSION_TIMEOUT,
+            )
+        })
     }
+
+    /// Replaces the job under `label`, because `bootstrap` refuses a label that is already loaded
+    /// and an upgrade that changed the schedule must reach launchd rather than only the file.
+    fn load_launch_agent(&self, plist: &Path, label: &str) -> Result<()> {
+        if launchctl_is_disabled() {
+            return Ok(());
+        }
+        let domain = launchctl_gui_domain()?;
+        // An unloaded label is the normal case on a first install, so this ending is discarded
+        // rather than reported: only the bootstrap below decides whether the job is registered.
+        let _ = launchctl(&["bootout", &format!("{domain}/{label}")]);
+        launchctl(&["bootstrap", &domain, &path_text(plist)?]).map_err(LaunchctlFailure::into_error)
+    }
+
+    fn unload_launch_agent(&self, label: &str) -> Result<()> {
+        if launchctl_is_disabled() {
+            return Ok(());
+        }
+        let domain = launchctl_gui_domain()?;
+        match launchctl(&["bootout", &format!("{domain}/{label}")]) {
+            // 3 is `ESRCH` in launchd's exit vocabulary: no such process, which is exactly the
+            // state this operation is asking for.
+            Err(LaunchctlFailure::Refused { code: 3, .. }) | Ok(()) => Ok(()),
+            Err(failure) => Err(failure.into_error()),
+        }
+    }
+}
+
+/// One unsuccessful `launchctl` invocation, keeping the exit code callers actually branch on.
+enum LaunchctlFailure {
+    Unavailable(Error),
+    Refused {
+        command: String,
+        code: i32,
+        detail: String,
+    },
+}
+
+impl LaunchctlFailure {
+    fn into_error(self) -> Error {
+        match self {
+            Self::Unavailable(error) => error,
+            Self::Refused {
+                command,
+                code,
+                detail,
+            } => Error::new(
+                ErrorKind::External,
+                format!(
+                    "launchctl {command} failed ({code}){}{detail}",
+                    if detail.is_empty() { "" } else { ": " }
+                ),
+            ),
+        }
+    }
+}
+
+/// Runs one `launchctl` subcommand, reporting a failure with the exit status launchd chose.
+fn launchctl(arguments: &[&str]) -> std::result::Result<(), LaunchctlFailure> {
+    let output = Command::new("launchctl")
+        .args(arguments)
+        .output()
+        .map_err(|error| {
+            LaunchctlFailure::Unavailable(external_error("execute launchctl")(error))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(LaunchctlFailure::Refused {
+        command: arguments.join(" "),
+        // A signalled `launchctl` is not a code launchd chose, so it becomes a code no branch
+        // matches rather than being mistaken for one that means something.
+        code: output.status.code().unwrap_or(-1),
+        detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    })
 }
 
 fn command_stdout_with_timeout(command: &mut Command, timeout: Duration) -> Option<String> {
@@ -298,14 +492,72 @@ impl InstallContext {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SetupOptions {
     pub agents: BTreeSet<Agent>,
+    pub knowledge_store_url: Option<KnowledgeStoreUrl>,
 }
 
 impl Default for SetupOptions {
     fn default() -> Self {
         Self {
             agents: [Agent::Cursor, Agent::Codex].into_iter().collect(),
+            knowledge_store_url: None,
         }
     }
+}
+
+/// Validated Git URL used only during remote Knowledge Store setup.
+#[derive(Clone, Eq, PartialEq)]
+pub struct KnowledgeStoreUrl(String);
+
+impl KnowledgeStoreUrl {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn remote_type(&self) -> KnowledgeRemoteType {
+        classify_remote_type(&self.0)
+    }
+
+    fn digest(&self) -> String {
+        sha256(self.0.as_bytes())
+    }
+}
+
+impl std::fmt::Debug for KnowledgeStoreUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("KnowledgeStoreUrl(<redacted>)")
+    }
+}
+
+impl FromStr for KnowledgeStoreUrl {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        validate_knowledge_store_url(value)?;
+        Ok(Self(value.to_owned()))
+    }
+}
+
+/// Transport class retained without persisting the remote URL itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeRemoteType {
+    Local,
+    Http,
+    Https,
+    Ssh,
+    Git,
+}
+
+/// Safe Knowledge Store identity returned by setup without exposing credentials or URLs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KnowledgeStoreReport {
+    pub installation_id: String,
+    pub source: String,
+    pub remote_type: Option<KnowledgeRemoteType>,
+    pub default_branch: String,
+    pub work_branch: Option<String>,
+    pub url_digest: Option<String>,
 }
 
 /// One preflight observation.
@@ -328,6 +580,7 @@ pub struct SetupReport {
     pub runtime: PathBuf,
     pub journal: PathBuf,
     pub changed: bool,
+    pub knowledge_store: KnowledgeStoreReport,
     pub preflight: PreflightReport,
     pub capabilities: Vec<sctx_agent_adapter::AgentCapabilities>,
     pub skill: SkillReport,
@@ -389,12 +642,58 @@ pub struct UninstallReport {
     pub warnings: Vec<String>,
 }
 
+/// One deterministic reset crash seam exposed only for recovery testing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetStage {
+    Staged,
+    FirstOriginalMoved,
+    FirstReplacementInstalled,
+    Swapped,
+    SmokeTested,
+}
+
+/// Destructive reset selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DataResetOptions {
+    pub confirmed: bool,
+    pub dry_run: bool,
+}
+
+/// Completed reset or read-only reset plan.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DataResetReport {
+    pub root: PathBuf,
+    pub dry_run: bool,
+    pub reset_id: Option<String>,
+    pub backup: Option<PathBuf>,
+    pub repository_count_cleared: usize,
+    pub cleared_targets: Vec<PathBuf>,
+    pub preserved: Vec<PathBuf>,
+    pub remote_detached: bool,
+    pub remote_mutated: bool,
+}
+
+/// Completed protected-branch Knowledge Store synchronization.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct KnowledgeSyncReport {
+    pub base_branch: String,
+    pub work_branch: String,
+    pub ahead: u64,
+    pub behind: u64,
+    pub pushed: bool,
+    pub needs_merge: bool,
+}
+
 /// Installer entry point.
 pub struct Installer {
     context: InstallContext,
     host: Arc<dyn Host>,
     fail_after: Option<SetupStage>,
+    reset_crash_after: Option<ResetStage>,
     codex_trust: TrustState,
+    git_network_timeout: Duration,
+    maintain_sync_backoff: Vec<Duration>,
 }
 
 impl Installer {
@@ -417,14 +716,44 @@ impl Installer {
             context,
             host,
             fail_after: None,
+            reset_crash_after: None,
             codex_trust: TrustState::Unconfirmed,
+            git_network_timeout: GIT_NETWORK_TIMEOUT,
+            maintain_sync_backoff: MAINTAIN_SYNC_BACKOFF.to_vec(),
         }
+    }
+
+    /// Overrides the wall-clock budget for Knowledge Store Git operations that reach the remote.
+    ///
+    /// Exposed for tests and managed callers with their own network expectations; production keeps
+    /// [`GIT_NETWORK_TIMEOUT`].
+    #[must_use]
+    pub const fn with_git_network_timeout(mut self, timeout: Duration) -> Self {
+        self.git_network_timeout = timeout;
+        self
+    }
+
+    /// Overrides the `maintain run` retry schedule for a busy installation.
+    ///
+    /// One entry per retry, in order; an empty schedule means a single attempt. Exposed so tests
+    /// exercise the backoff without paying its production minutes.
+    #[must_use]
+    pub fn with_maintain_sync_backoff(mut self, backoff: Vec<Duration>) -> Self {
+        self.maintain_sync_backoff = backoff;
+        self
     }
 
     /// Injects one deterministic failure after a completed write stage.
     #[must_use]
     pub const fn with_failure_after(mut self, stage: SetupStage) -> Self {
         self.fail_after = Some(stage);
+        self
+    }
+
+    /// Simulates a process crash after one reset stage, leaving recovery journal state.
+    #[must_use]
+    pub const fn with_reset_crash_after(mut self, stage: ResetStage) -> Self {
+        self.reset_crash_after = Some(stage);
         self
     }
 
@@ -460,19 +789,32 @@ impl Installer {
         for directory in ["bin", "state", "backups", "logs"] {
             ensure_private_directory(&self.context.root.join(directory))?;
         }
+        let _maintenance = MaintenanceLock::initialize(&self.context.root)?.try_exclusive()?;
         let lock = open_lock(&self.context.root.join("state/setup.lock"))?;
         lock.lock_exclusive()
             .map_err(io_error("lock setup transaction"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
         recover_incomplete_journals(&self.context.root)?;
         if operation == Operation::Upgrade {
             require_existing_installation(&self.context.root)?;
         }
 
         let mut transaction = Transaction::begin(&self.context.root, operation)?;
-        let result = self.install_locked(operation, options, preflight, &mut transaction);
+        let mut activation = None;
+        let result = self.install_locked(
+            operation,
+            options,
+            preflight,
+            &mut transaction,
+            &mut activation,
+        );
         let result = match result {
-            Ok(report) => {
+            Ok(mut report) => {
                 transaction.complete()?;
+                // Only now, with the plist committed and no rollback left that could contradict
+                // it, does anything reach launchd. See `launchd`'s module documentation for why
+                // this is the one setup side effect that lives outside the transaction.
+                self.activate_launch_agent(activation.as_ref(), &mut report.notices);
                 Ok(report)
             }
             Err(error) => match transaction.rollback() {
@@ -487,6 +829,35 @@ impl Installer {
         result
     }
 
+    /// Registers or deregisters the maintenance job, best effort, after the transaction commits.
+    ///
+    /// A failure here is always a notice and never an error: the plist is on disk and correct, and
+    /// launchd picks it up at the next login even when this process could not reach the domain --
+    /// which is the normal outcome over SSH, in a container, and on a machine whose user has not
+    /// logged in graphically since boot.
+    fn activate_launch_agent(
+        &self,
+        activation: Option<&LaunchAgentActivation>,
+        notices: &mut Vec<String>,
+    ) {
+        let outcome = match activation {
+            None => return,
+            Some(LaunchAgentActivation::Load { plist }) => self
+                .host
+                .load_launch_agent(plist, MAINTAIN_LAUNCH_AGENT_LABEL),
+            Some(LaunchAgentActivation::Unload) => {
+                self.host.unload_launch_agent(MAINTAIN_LAUNCH_AGENT_LABEL)
+            }
+        };
+        if let Err(error) = outcome {
+            notices.push(format!(
+                "scheduled maintenance was written to disk but could not be registered with \
+                 launchd right now ({error}); it takes effect the next time you log in, or \
+                 immediately after `sctx setup` from a graphical session."
+            ));
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn install_locked(
         &self,
@@ -494,6 +865,7 @@ impl Installer {
         options: &SetupOptions,
         preflight: PreflightReport,
         transaction: &mut Transaction,
+        activation: &mut Option<LaunchAgentActivation>,
     ) -> Result<SetupReport> {
         let architecture = preflight.architecture;
         let runtime_dir = self
@@ -511,23 +883,51 @@ impl Installer {
         let relative_target = PathBuf::from(&self.context.version).join(architecture.directory());
         let changed_current = switch_current(transaction, &current, &relative_target)?;
         self.fail(SetupStage::CurrentSwitched)?;
+        let task_runtime_changed = ensure_current_task_runtime(transaction, &self.context.root)?;
+        let legacy_capture_changed = remove_legacy_capture_state(transaction, &self.context.root)?;
+        let mut notices = Vec::new();
+        // Activation is derived from registered checkouts now, so a `config.toml` that still
+        // carries the removed section no longer parses. Drop it before anything reads the
+        // Catalog, inside this transaction, which keeps the original document as a backup.
+        let repository_groups_migrated =
+            migrate_repository_groups(transaction, &self.context.root, &mut notices)?;
 
-        let store = GitStore::initialize(&self.context.root)?;
+        let prior_manifest = read_manifest(&self.context.root)?;
+        let installation_id = installation_id(prior_manifest.as_ref())?;
+        let KnowledgeStoreInstall {
+            store,
+            source: knowledge_store_source,
+            changed: mut knowledge_store_changed,
+        } = install_knowledge_store(
+            &self.context.root,
+            options.knowledge_store_url.as_ref(),
+            prior_manifest.as_ref(),
+            &installation_id,
+            transaction,
+        )?;
+        knowledge_store_changed |= store.ensure_bundled_schemas()?;
         self.fail(SetupStage::RepositoryInitialized)?;
         let index = ProjectionIndex::for_store(&store);
         index.synchronize()?;
         sctx_mcp::sync_repository_catalog_at_root(&self.context.root)?;
         self.fail(SetupStage::IndexInitialized)?;
 
-        let stable_binary = current.join("sctx");
-        let prior_manifest = read_manifest(&self.context.root)?;
         let mut ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.configs.clone());
+        let mut manifest_agent_versions = prior_manifest
+            .as_ref()
+            .map_or_else(BTreeMap::new, |manifest| manifest.agent_versions.clone());
+        let stable_binary = current.join("sctx");
+        let agent_versions = self.agent_versions_with_fallback(options, &manifest_agent_versions);
+        for (agent, version) in &agent_versions {
+            if let Some(version) = version {
+                manifest_agent_versions.insert(*agent, version.clone());
+            }
+        }
         let prior_skill_ownership = prior_manifest
             .as_ref()
             .map_or_else(Vec::new, |manifest| manifest.skills.clone());
-        let mut notices = Vec::new();
         let mut config_changed = false;
 
         if options.agents.contains(&Agent::Cursor) {
@@ -544,29 +944,50 @@ impl Installer {
                 &self.context.home.join(".cursor/hooks.json"),
                 Agent::Cursor,
                 &stable_binary,
+                agent_versions
+                    .get(&Agent::Cursor)
+                    .and_then(Option::as_deref),
                 &mut ownership,
                 &mut notices,
-            )?;
+            )?
+            .changed;
             self.fail(SetupStage::CursorHooksWritten)?;
         }
         if options.agents.contains(&Agent::Codex) {
+            let codex_config = self.context.home.join(".codex/config.toml");
             config_changed |= merge_codex_mcp(
                 transaction,
-                &self.context.home.join(".codex/config.toml"),
+                &codex_config,
                 &stable_binary,
                 &mut ownership,
                 &mut notices,
             )?;
             self.fail(SetupStage::CodexMcpWritten)?;
-            config_changed |= merge_json_hooks(
+            let codex_hooks = self.context.home.join(".codex/hooks.json");
+            let merge = merge_json_hooks(
                 transaction,
-                &self.context.home.join(".codex/hooks.json"),
+                &codex_hooks,
                 Agent::Codex,
                 &stable_binary,
+                agent_versions.get(&Agent::Codex).and_then(Option::as_deref),
                 &mut ownership,
                 &mut notices,
             )?;
+            config_changed |= merge.changed;
             self.fail(SetupStage::CodexHooksWritten)?;
+            // The hooks file alone does nothing: Codex will not run a hook whose stored trust hash
+            // no longer describes it. Re-stamped unconditionally, because the hash covers a command
+            // that carries `--agent-version` and so goes stale on every upgrade.
+            match restamp_codex_hook_trust(transaction, &codex_config, &codex_hooks, &merge) {
+                Ok(update) => config_changed |= update.changed(),
+                Err(error) => notices.push(format!(
+                    "could not re-stamp the Codex hook trust hashes in {}: {error}. Codex will \
+                     skip the Shared Context hooks until they are trusted again -- `sctx doctor` \
+                     reports this as codex_trusted_hash",
+                    codex_config.display()
+                )),
+            }
+            self.fail(SetupStage::CodexHookTrustStamped)?;
         }
 
         finalize_ownership(transaction, &mut ownership)?;
@@ -576,28 +997,79 @@ impl Installer {
             &self.context.home,
             &prior_skill_ownership,
             &mut notices,
+            self.fail_after,
         )?;
         self.fail(SetupStage::GlobalSkillWritten)?;
+
+        reclaim_orphan_leases(&self.context.root, &mut notices);
+
+        install_default_policy(&self.context.root, &mut notices);
+
+        // The schedule is read from the same `config.toml` the Catalog lives in, which the
+        // Knowledge Store install above has already created, so a first setup sees the defaults
+        // and every later one sees whatever the operator wrote.
+        let maintenance = UserConfigStore::open_existing(&self.context.root)
+            .and_then(|config| config.maintenance_settings())?;
+        let launch_agent = install_launch_agent(
+            transaction,
+            &self.context.home,
+            &self.context.root,
+            &plan_launch_agent(self.host.platform(), &maintenance),
+            prior_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.launch_agent.as_ref()),
+            &mut notices,
+        )?;
+        *activation = launch_agent.activation;
+        self.fail(SetupStage::LaunchAgentWritten)?;
 
         let manifest = InstallManifest {
             version: MANIFEST_VERSION,
             installed_version: self.context.version.clone(),
             architecture,
+            installation_id: installation_id.clone(),
+            agent_versions: manifest_agent_versions,
+            knowledge_store: knowledge_store_source.clone(),
             configs: ownership,
             skills: skill_install.ownership,
+            // Re-resolved on every setup and upgrade so a changed Git identity is picked up, and
+            // never allowed to erase what a previous run already cached.
+            author: resolve_manifest_author().or_else(|| {
+                prior_manifest
+                    .as_ref()
+                    .and_then(|prior| prior.author.clone())
+            }),
+            launch_agent: launch_agent.ownership,
         };
         let manifest_changed = write_manifest(transaction, &self.context.root, &manifest)?;
         self.fail(SetupStage::ManifestWritten)?;
         mcp_smoke(&self.context.root)?;
         self.fail(SetupStage::SmokeTested)?;
 
-        let capabilities = self.capabilities(options);
+        let capabilities = self.capabilities_with_versions(options, &agent_versions);
         notices.extend(
             capabilities
                 .iter()
                 .filter(|capability| capability.diagnostic.starts_with("ACTION REQUIRED:"))
                 .map(|capability| capability.diagnostic.clone()),
         );
+        // `bin/current` just moved to point at a different version than the one this run started
+        // with -- and it only moves for an installation that already existed (`prior_manifest`).
+        // An editor's `sctx mcp serve` process, or a Hook process spawned before this run, resolved
+        // `bin/current` once already and keeps its own already-open binary mapped in memory: the
+        // symlink change is invisible to it. Nothing this process does can restart another
+        // process's MCP server, so the only correct fix is telling the operator to.
+        if changed_current {
+            if let Some(prior) = &prior_manifest {
+                notices.push(format!(
+                    "ACTION REQUIRED: sctx was updated from {} to {}. Any editor or MCP server \
+                     process started before this run is still running the previous binary; \
+                     restart your editor (or the `sctx mcp serve` process it manages) to use the \
+                     new version.",
+                    prior.installed_version, self.context.version
+                ));
+            }
+        }
         Ok(SetupReport {
             operation: operation.as_str().to_owned(),
             root: self.context.root.clone(),
@@ -606,9 +1078,15 @@ impl Installer {
             journal: transaction.journal_path.clone(),
             changed: changed_runtime
                 || changed_current
+                || task_runtime_changed
+                || legacy_capture_changed
+                || repository_groups_migrated
+                || knowledge_store_changed
                 || config_changed
                 || skill_install.changed
+                || launch_agent.changed
                 || manifest_changed,
+            knowledge_store: knowledge_store_source.report(&installation_id),
             preflight,
             capabilities,
             skill: SkillReport {
@@ -623,14 +1101,38 @@ impl Installer {
     #[must_use]
     pub fn doctor(&self) -> DoctorReport {
         let root = &self.context.root;
+        let _maintenance = match MaintenanceLock::open_or_create(root)
+            .and_then(|maintenance| maintenance.try_shared())
+        {
+            Ok(guard) => Some(guard),
+            Err(error) if error.kind() == ErrorKind::MaintenanceBusy => {
+                return DoctorReport {
+                    healthy: false,
+                    root: root.clone(),
+                    checks: vec![failed(
+                        "maintenance",
+                        "installation maintenance is currently active",
+                    )],
+                    capabilities: self.capabilities(&SetupOptions::default()),
+                };
+            }
+            Err(_) => None,
+        };
         let mut checks = Vec::new();
         check_directory(root, &mut checks);
         check_runtime(root, &mut checks);
         check_repository(root, &mut checks);
         check_index(root, &mut checks);
+        check_engineering_graph(root, &mut checks);
         check_repository_catalog(root, &mut checks);
         check_configs(root, &self.context.home, &mut checks);
+        check_codex_trusted_hash(root, &self.context.home, &mut checks);
+        check_policy(root, &mut checks);
         check_global_skill(root, &self.context.home, &mut checks);
+        check_session_scope_leases(root, &mut checks);
+        check_retrieval(root, &mut checks);
+        check_maintain(root, &mut checks);
+        check_logging(&self.context.home, &mut checks);
         if root.join("repository/.git").is_dir() && root.join("bin/current/sctx").is_file() {
             match mcp_smoke(root) {
                 Ok(()) => checks.push(ok(
@@ -647,6 +1149,8 @@ impl Installer {
         }
         let options = SetupOptions::default();
         let capabilities = self.capabilities(&options);
+        // Agent versions are never gated: the detected version is reported for diagnosis only and
+        // never downgrades a check. Only missing Hook wiring or unconfirmed Codex Hook Trust does.
         for capability in &capabilities {
             let (status, name) = if capability.diagnostic.starts_with("ACTION REQUIRED:") {
                 (CheckStatus::ActionRequired, "codex_hook_trust")
@@ -655,10 +1159,15 @@ impl Installer {
             } else {
                 (CheckStatus::Warning, "adapter_capability")
             };
+            let message = format!(
+                "{} (detected version {})",
+                capability.diagnostic,
+                capability.detected_version.as_deref().unwrap_or("unknown")
+            );
             checks.push(DoctorCheck {
                 name: format!("{name}.{:?}", capability.agent).to_lowercase(),
                 status,
-                message: capability.diagnostic.clone(),
+                message,
             });
         }
         let healthy = !checks
@@ -687,9 +1196,29 @@ impl Installer {
             context,
             host: Arc::clone(&self.host),
             fail_after: None,
+            reset_crash_after: None,
             codex_trust: self.codex_trust,
+            git_network_timeout: self.git_network_timeout,
+            maintain_sync_backoff: self.maintain_sync_backoff.clone(),
         };
         fixer.setup(options)?;
+        // The Graph is derived local state, so repairing it is exactly what `--fix` is for, and it
+        // is the repair for the one diagnosis `--fix` could otherwise only keep reporting. Every
+        // way it can fail -- an unavailable checkout, an unreadable projection -- is best effort,
+        // because the diagnosis that follows is what tells the operator where they actually stand.
+        let _ = sctx_mcp::association_rebuild_at_root(
+            &self.context.root,
+            &AssociationRebuildInput {
+                diagnose_only: false,
+            },
+        );
+        // The vector cache is derived local state too, and its background filler only ever runs
+        // inside a long-lived `sctx mcp serve`. An installation whose MCP process answers one
+        // request and exits would otherwise never embed anything at all, so `--fix` is the
+        // supported way to pay the 9-12 second model load on purpose. Best effort for the same
+        // reason as the Graph above: an unloadable model is a diagnosis, not a failed repair, and
+        // an unconfigured `[retrieval]` returns immediately without touching anything.
+        let _ = sctx_mcp::warm_semantic_cache_at_root(&self.context.root);
         Ok(self.doctor())
     }
 
@@ -712,8 +1241,10 @@ impl Installer {
         if !root.exists() {
             return Ok(report);
         }
+        let _maintenance = MaintenanceLock::open_or_create(root)?.try_exclusive()?;
         let lock = open_lock(&root.join("state/setup.lock"))?;
         lock.lock_exclusive().map_err(io_error("lock uninstall"))?;
+        recover_incomplete_data_reset(root)?;
         recover_incomplete_journals(root)?;
         if let Some(manifest) = read_manifest(root)? {
             for config in &manifest.configs {
@@ -729,6 +1260,9 @@ impl Installer {
                 let config_lock = config_lock_path(&config.path)?;
                 remove_path_if_exists(&config_lock, &mut report.removed)?;
             }
+            // After the loop, so the Codex MCP uninstall's own write to `config.toml` cannot
+            // overwrite this one.
+            prune_codex_hook_trust(&self.context.home, &mut report);
             let mut had_expected_skill_ownership = false;
             for skill in &manifest.skills {
                 if is_expected_skill_path(&self.context.home, &skill.path) {
@@ -742,12 +1276,24 @@ impl Installer {
                     report.preserved.push(skill.path.clone());
                 }
             }
+            self.uninstall_launch_agent(manifest.launch_agent.as_ref(), &mut report);
             if had_expected_skill_ownership {
-                for directory in [
-                    global_skill_root(&self.context.home).join("agents"),
-                    global_skill_root(&self.context.home),
-                ] {
-                    if remove_empty_directory(&directory)? {
+                let prunable = global_skill_roots(&self.context.home)
+                    .into_iter()
+                    .flat_map(|root| {
+                        [root.join("references"), root.join("agents"), root].into_iter()
+                    })
+                    .collect::<Vec<_>>();
+                for directory in prunable {
+                    if !global_skill_directory_is_safe(&self.context.home, &directory)? {
+                        if fs::symlink_metadata(&directory).is_ok() {
+                            report.preserved.push(directory.clone());
+                            report.warnings.push(format!(
+                                "preserved global Agent Skill directory because it or a parent is not a non-symlink directory: {}",
+                                directory.display()
+                            ));
+                        }
+                    } else if remove_empty_directory(&directory)? {
                         report.removed.push(directory);
                     }
                 }
@@ -758,19 +1304,23 @@ impl Installer {
                     .to_owned(),
             );
         }
-        for path in [
-            root.join("bin"),
-            root.join("logs"),
-            root.join("backups"),
-            root.join("state/capture"),
-        ] {
+        for path in [root.join("bin"), root.join("logs"), root.join("backups")] {
             remove_path_if_exists(&path, &mut report.removed)?;
         }
-        for suffix in ["", "-wal", "-shm"] {
-            remove_path_if_exists(
-                &root.join(format!("state/index.sqlite{suffix}")),
-                &mut report.removed,
-            )?;
+        for database in ["index.sqlite", "runtime.sqlite", "semantic.sqlite"] {
+            for suffix in ["", "-wal", "-shm"] {
+                remove_path_if_exists(
+                    &root.join(format!("state/{database}{suffix}")),
+                    &mut report.removed,
+                )?;
+            }
+        }
+        for legacy in [
+            root.join("state/capture"),
+            root.join("state/capture.lock"),
+            root.join("state/capture-metadata.json"),
+        ] {
+            remove_path_if_exists(&legacy, &mut report.removed)?;
         }
         let manifest_path = manifest_path(root);
         remove_path_if_exists(&manifest_path, &mut report.removed)?;
@@ -779,6 +1329,88 @@ impl Installer {
         }
         FileExt::unlock(&lock).map_err(io_error("unlock uninstall"))?;
         Ok(report)
+    }
+
+    /// Deregisters and removes the maintenance `LaunchAgent` this installation owns.
+    ///
+    /// Deregistration comes first and unconditionally: a job whose plist is deleted while it is
+    /// still loaded stays loaded until the next login, and would then fail every day against a
+    /// binary uninstall just removed. Everything here is best effort and reported, never fatal --
+    /// uninstall's contract is to remove exactly what this installation owns and to say what it
+    /// could not, not to fail because launchd was unreachable.
+    fn uninstall_launch_agent(
+        &self,
+        owned: Option<&OwnedLaunchAgent>,
+        report: &mut UninstallReport,
+    ) {
+        let Some(owned) = owned else { return };
+        if let Err(error) = self.host.unload_launch_agent(&owned.label) {
+            report.warnings.push(format!(
+                "could not deregister the scheduled maintenance job {} from launchd ({error}); it \
+                 stops at the next login.",
+                owned.label
+            ));
+        }
+        if owned.path != launch_agent_path(&self.context.home) {
+            report.warnings.push(format!(
+                "preserved unexpected manifest LaunchAgent path: {}",
+                owned.path.display()
+            ));
+            report.preserved.push(owned.path.clone());
+            return;
+        }
+        match fs::read(&owned.path) {
+            Ok(bytes) if sha256(&bytes) == owned.sha256 => match fs::remove_file(&owned.path) {
+                Ok(()) => report.removed.push(owned.path.clone()),
+                Err(error) => {
+                    report.preserved.push(owned.path.clone());
+                    report.warnings.push(format!(
+                        "preserved the scheduled maintenance LaunchAgent because it could not be \
+                         removed: {} ({error})",
+                        owned.path.display()
+                    ));
+                }
+            },
+            Ok(_) => {
+                report.preserved.push(owned.path.clone());
+                report.warnings.push(format!(
+                    "preserved user-modified scheduled maintenance LaunchAgent: {}",
+                    owned.path.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                report.preserved.push(owned.path.clone());
+                report.warnings.push(format!(
+                    "preserved the scheduled maintenance LaunchAgent because it could not be read: \
+                     {} ({error})",
+                    owned.path.display()
+                ));
+            }
+        }
+    }
+
+    /// Fetches shared knowledge into this installation's work branch and publishes only that
+    /// branch. The remote default branch is never a push target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed installation, validation, merge-conflict, authentication, or bounded push
+    /// retry error. Supported local writers are excluded for the complete operation.
+    pub fn sync_knowledge(&self) -> Result<KnowledgeSyncReport> {
+        validate_context(&self.context)?;
+        require_existing_installation(&self.context.root)?;
+        let _maintenance = MaintenanceLock::open_or_create(&self.context.root)?.try_exclusive()?;
+        let setup_lock = open_lock(&self.context.root.join("state/setup.lock"))?;
+        setup_lock
+            .lock_exclusive()
+            .map_err(io_error("lock knowledge synchronization"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
+        recover_incomplete_journals(&self.context.root)?;
+        require_existing_installation(&self.context.root)?;
+        let result = sync_knowledge_locked(&self.context.root, self.git_network_timeout);
+        FileExt::unlock(&setup_lock).map_err(io_error("unlock knowledge synchronization"))?;
+        result
     }
 
     /// Deletes the knowledge repository only after two explicit confirmations.
@@ -801,6 +1433,12 @@ impl Installer {
                 "second confirmation must be DELETE-SHARED-CONTEXT-KNOWLEDGE",
             ));
         }
+        let _maintenance = MaintenanceLock::open_or_create(&self.context.root)?.try_exclusive()?;
+        let setup_lock = open_lock(&self.context.root.join("state/setup.lock"))?;
+        setup_lock
+            .lock_exclusive()
+            .map_err(io_error("lock knowledge deletion"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
         if repository.exists() {
             fs::remove_dir_all(&repository).map_err(io_error("delete knowledge repository"))?;
             sync_directory(
@@ -809,7 +1447,181 @@ impl Installer {
                     .ok_or_else(|| invalid("repository has no parent"))?,
             )?;
         }
+        FileExt::unlock(&setup_lock).map_err(io_error("unlock knowledge deletion"))?;
         Ok(repository)
+    }
+
+    /// Restores active Shared Context data to the empty post-install state.
+    ///
+    /// A read-only dry run needs no confirmation. An actual reset requires
+    /// `confirmed=true`, retains one recoverable backup, and never invokes a
+    /// remote Git mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, maintenance, staging, journal, component
+    /// smoke, or rollback error. Injected crash seams deliberately leave the
+    /// journal for the next reset/setup recovery path.
+    pub fn reset_data(&self, options: DataResetOptions) -> Result<DataResetReport> {
+        validate_context(&self.context)?;
+        if !options.dry_run && !options.confirmed {
+            return Err(invalid(
+                "data reset is destructive; rerun with --yes or use --dry-run",
+            ));
+        }
+        let maintenance = MaintenanceLock::open_or_create(&self.context.root)?;
+        if options.dry_run {
+            let _guard = maintenance.try_shared()?;
+            require_existing_installation(&self.context.root)?;
+            validate_reset_active_targets(&self.context.root)?;
+            let catalog =
+                UserConfigStore::open_existing(&self.context.root)?.inspect_repository_catalog()?;
+            let cleared_targets = existing_reset_targets(&self.context.root);
+            return Ok(reset_report(
+                &self.context.root,
+                DataResetReportMaterial {
+                    dry_run: true,
+                    reset_id: None,
+                    backup: None,
+                    had_remote: knowledge_has_remote(&self.context.root.join("repository"))?,
+                    repository_count_cleared: catalog.repositories.len(),
+                    cleared_targets,
+                },
+            ));
+        }
+
+        let _guard = maintenance.try_exclusive()?;
+        let setup_lock = open_lock(&self.context.root.join("state/setup.lock"))?;
+        setup_lock
+            .lock_exclusive()
+            .map_err(io_error("lock data reset transaction"))?;
+        recover_incomplete_data_reset(&self.context.root)?;
+        recover_incomplete_journals(&self.context.root)?;
+        require_existing_installation(&self.context.root)?;
+        let result = self.reset_data_locked();
+        let result = match result {
+            Ok(report) => Ok(report),
+            Err(error) if is_injected_reset_crash(&error) => Err(error),
+            Err(error) => match recover_incomplete_data_reset(&self.context.root) {
+                Ok(_) => Err(error),
+                Err(rollback) => Err(Error::new(
+                    ErrorKind::InvariantViolation,
+                    format!("{error}; reset rollback also failed: {rollback}"),
+                )),
+            },
+        };
+        FileExt::unlock(&setup_lock).map_err(io_error("unlock data reset transaction"))?;
+        result
+    }
+
+    fn reset_data_locked(&self) -> Result<DataResetReport> {
+        validate_reset_active_targets(&self.context.root)?;
+        let remote_detached = knowledge_has_remote(&self.context.root.join("repository"))?;
+        let catalog =
+            UserConfigStore::open_existing(&self.context.root)?.inspect_repository_catalog()?;
+        let repository_count = catalog.repositories.len();
+        let id = format!("reset-{}", Uuid::new_v4());
+        let backup_dir = self.context.root.join("backups").join(&id);
+        ensure_private_directory(&backup_dir)?;
+        let staging_root = backup_dir.join("new");
+        build_pristine_reset_root(&self.context.root, &staging_root)?;
+        let entries = build_reset_entries(&self.context.root, &backup_dir, &staging_root)?;
+        let mut journal = DataResetJournal {
+            version: RESET_JOURNAL_VERSION,
+            id: id.clone(),
+            root: self.context.root.clone(),
+            backup_dir: backup_dir.clone(),
+            staging_root,
+            phase: "prepared".to_owned(),
+            complete: false,
+            applied_entries: 0,
+            entries,
+        };
+        let cleared_targets = journal
+            .entries
+            .iter()
+            .filter(|entry| entry.original_present)
+            .map(|entry| entry.active.clone())
+            .collect();
+        persist_reset_journal(&journal, true)?;
+        self.fail_reset(ResetStage::Staged)?;
+
+        for index in 0..journal.entries.len() {
+            let entry = &journal.entries[index];
+            if entry.original_present {
+                ensure_private_directory(
+                    entry
+                        .backup
+                        .parent()
+                        .ok_or_else(|| invalid("reset backup target has no parent"))?,
+                )?;
+                fs::rename(&entry.active, &entry.backup)
+                    .map_err(io_error("move active reset target to backup"))?;
+                sync_parent(&entry.active)?;
+                sync_parent(&entry.backup)?;
+            }
+            if index == 0 {
+                "first_original_moved".clone_into(&mut journal.phase);
+                persist_reset_journal(&journal, true)?;
+                self.fail_reset(ResetStage::FirstOriginalMoved)?;
+            }
+            if entry.staged_present {
+                let staged = entry
+                    .staged
+                    .as_ref()
+                    .ok_or_else(|| invariant("staged reset target is missing from journal"))?;
+                if let Some(parent) = entry.active.parent() {
+                    ensure_private_directory(parent)?;
+                }
+                fs::rename(staged, &entry.active)
+                    .map_err(io_error("install staged reset target"))?;
+                sync_parent(staged)?;
+                sync_parent(&entry.active)?;
+            }
+            if index == 0 {
+                "first_replacement_installed".clone_into(&mut journal.phase);
+                persist_reset_journal(&journal, true)?;
+                self.fail_reset(ResetStage::FirstReplacementInstalled)?;
+            }
+            journal.applied_entries = index + 1;
+            journal.phase = format!("applied_{}", journal.applied_entries);
+            persist_reset_journal(&journal, true)?;
+        }
+        "swapped".clone_into(&mut journal.phase);
+        persist_reset_journal(&journal, true)?;
+        self.fail_reset(ResetStage::Swapped)?;
+        smoke_pristine_reset_root(&self.context.root)?;
+        "smoke_tested".clone_into(&mut journal.phase);
+        persist_reset_journal(&journal, true)?;
+        self.fail_reset(ResetStage::SmokeTested)?;
+
+        let report = reset_report(
+            &self.context.root,
+            DataResetReportMaterial {
+                dry_run: false,
+                reset_id: Some(id),
+                backup: Some(backup_dir),
+                had_remote: remote_detached,
+                repository_count_cleared: repository_count,
+                cleared_targets,
+            },
+        );
+        "complete".clone_into(&mut journal.phase);
+        journal.complete = true;
+        persist_reset_journal(&journal, false)?;
+        remove_reset_marker(&self.context.root)?;
+        Ok(report)
+    }
+
+    fn fail_reset(&self, stage: ResetStage) -> Result<()> {
+        if self.reset_crash_after == Some(stage) {
+            Err(Error::new(
+                ErrorKind::External,
+                format!("injected reset crash after {stage:?}"),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn preflight(&self) -> Result<PreflightReport> {
@@ -868,18 +1680,51 @@ impl Installer {
     }
 
     fn capabilities(&self, options: &SetupOptions) -> Vec<sctx_agent_adapter::AgentCapabilities> {
+        let versions = self.agent_versions(options);
+        self.capabilities_with_versions(options, &versions)
+    }
+
+    fn agent_versions(&self, options: &SetupOptions) -> BTreeMap<Agent, Option<String>> {
+        self.agent_versions_with_fallback(options, &BTreeMap::new())
+    }
+
+    fn agent_versions_with_fallback(
+        &self,
+        options: &SetupOptions,
+        fallback: &BTreeMap<Agent, String>,
+    ) -> BTreeMap<Agent, Option<String>> {
+        options
+            .agents
+            .iter()
+            .copied()
+            .map(|agent| {
+                let version = self
+                    .host
+                    .agent_version(agent)
+                    .and_then(|value| normalize_agent_version_argument(&value))
+                    .or_else(|| fallback.get(&agent).cloned());
+                (agent, version)
+            })
+            .collect()
+    }
+
+    fn capabilities_with_versions(
+        &self,
+        options: &SetupOptions,
+        versions: &BTreeMap<Agent, Option<String>>,
+    ) -> Vec<sctx_agent_adapter::AgentCapabilities> {
         let mut capabilities = Vec::new();
         if options.agents.contains(&Agent::Cursor) {
-            let version = self.host.agent_version(Agent::Cursor);
+            let version = versions.get(&Agent::Cursor).and_then(Option::as_deref);
             capabilities.push(sctx_adapter_cursor::capabilities(
-                version.as_deref(),
+                version,
                 hooks_available(&self.context.home, Agent::Cursor),
             ));
         }
         if options.agents.contains(&Agent::Codex) {
-            let version = self.host.agent_version(Agent::Codex);
+            let version = versions.get(&Agent::Codex).and_then(Option::as_deref);
             capabilities.push(sctx_adapter_codex::capabilities(
-                version.as_deref(),
+                version,
                 hooks_available(&self.context.home, Agent::Codex),
                 self.codex_trust,
             ));
@@ -926,6 +1771,37 @@ struct SetupJournal {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct DataResetJournal {
+    version: u32,
+    id: String,
+    root: PathBuf,
+    backup_dir: PathBuf,
+    staging_root: PathBuf,
+    phase: String,
+    complete: bool,
+    applied_entries: usize,
+    entries: Vec<DataResetEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DataResetEntry {
+    active: PathBuf,
+    backup: PathBuf,
+    staged: Option<PathBuf>,
+    original_present: bool,
+    staged_present: bool,
+}
+
+struct DataResetReportMaterial {
+    dry_run: bool,
+    reset_id: Option<String>,
+    backup: Option<PathBuf>,
+    had_remote: bool,
+    repository_count_cleared: usize,
+    cleared_targets: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Snapshot {
     path: PathBuf,
     original: Original,
@@ -944,6 +1820,9 @@ enum Original {
     },
     Symlink {
         target: PathBuf,
+    },
+    Directory {
+        backup: PathBuf,
     },
 }
 
@@ -1021,6 +1900,41 @@ impl Transaction {
         self.persist()
     }
 
+    fn move_directory_to_backup(&mut self, path: &Path) -> Result<bool> {
+        if self.journal.entries.iter().any(|entry| entry.path == path) {
+            return Err(invariant(format!(
+                "transaction target was already recorded: {}",
+                path.display()
+            )));
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "legacy Capture directory must be a non-symlink directory: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(io_error("inspect legacy Capture directory")(error)),
+        }
+        let backup = self
+            .backup_dir
+            .join(format!("directory-{}", self.journal.entries.len()));
+        self.journal.entries.push(Snapshot {
+            path: path.to_path_buf(),
+            original: Original::Directory {
+                backup: backup.clone(),
+            },
+            cleanup_empty_dirs: Vec::new(),
+        });
+        self.persist()?;
+        fs::rename(path, &backup).map_err(io_error("back up legacy Capture directory"))?;
+        sync_parent(path)?;
+        sync_parent(&backup)?;
+        Ok(true)
+    }
+
     fn original(&self, path: &Path) -> Option<&Original> {
         self.journal
             .entries
@@ -1054,9 +1968,799 @@ struct InstallManifest {
     version: u32,
     installed_version: String,
     architecture: Architecture,
+    #[serde(default)]
+    installation_id: String,
+    #[serde(default)]
+    agent_versions: BTreeMap<Agent, String>,
+    #[serde(default)]
+    knowledge_store: KnowledgeStoreSource,
     configs: Vec<OwnedConfig>,
     #[serde(default)]
     skills: Vec<OwnedSkill>,
+    /// Username portion of the global Git identity, cached at setup and upgrade.
+    ///
+    /// It is provenance for Candidate confirmations, not installation identity: `sctx` works
+    /// exactly the same without it, and a machine with no global Git identity simply leaves it
+    /// unset. Optional with `#[serde(default)]`, so a manifest written before this field existed
+    /// still reads back at `MANIFEST_VERSION` 1 — nothing about the manifest contract changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    author: Option<String>,
+    /// The maintenance `LaunchAgent` this installation wrote, if it wrote one.
+    ///
+    /// Ownership works exactly like `configs` and `skills`: the digest recorded here is the only
+    /// thing that authorizes a later run to rewrite or remove the file. Optional with
+    /// `#[serde(default)]`, so a manifest written before the scheduled track existed still reads
+    /// back at `MANIFEST_VERSION` 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    launch_agent: Option<OwnedLaunchAgent>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+enum KnowledgeStoreSource {
+    #[default]
+    Local,
+    Remote {
+        remote_type: KnowledgeRemoteType,
+        default_branch: String,
+        work_branch: String,
+        url_digest: String,
+    },
+}
+
+impl KnowledgeStoreSource {
+    fn report(&self, installation_id: &str) -> KnowledgeStoreReport {
+        match self {
+            Self::Local => KnowledgeStoreReport {
+                installation_id: installation_id.to_owned(),
+                source: "local".to_owned(),
+                remote_type: None,
+                default_branch: "main".to_owned(),
+                work_branch: None,
+                url_digest: None,
+            },
+            Self::Remote {
+                remote_type,
+                default_branch,
+                work_branch,
+                url_digest,
+            } => KnowledgeStoreReport {
+                installation_id: installation_id.to_owned(),
+                source: "remote".to_owned(),
+                remote_type: Some(*remote_type),
+                default_branch: default_branch.clone(),
+                work_branch: Some(work_branch.clone()),
+                url_digest: Some(url_digest.clone()),
+            },
+        }
+    }
+}
+
+struct KnowledgeStoreInstall {
+    store: GitStore,
+    source: KnowledgeStoreSource,
+    changed: bool,
+}
+
+fn sync_knowledge_locked(root: &Path, network_timeout: Duration) -> Result<KnowledgeSyncReport> {
+    let manifest = read_manifest(root)?
+        .ok_or_else(|| invalid("knowledge sync requires an install manifest"))?;
+    let installation_id = installation_id(Some(&manifest))?;
+    let KnowledgeStoreSource::Remote {
+        default_branch,
+        work_branch,
+        url_digest,
+        ..
+    } = &manifest.knowledge_store
+    else {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            "knowledge sync requires a remotely bootstrapped Knowledge Store",
+        ));
+    };
+    let expected_work_branch = format!("shared-context/{installation_id}");
+    if work_branch != &expected_work_branch || work_branch == default_branch {
+        return Err(invalid(
+            "install manifest Knowledge Store branches are inconsistent",
+        ));
+    }
+
+    let store = GitStore::open_existing(root)?;
+    verify_remote_store(&store, default_branch, work_branch, url_digest)?;
+    if !store.list_pending()?.is_empty() {
+        return Err(invalid(
+            "knowledge sync requires all pending batches to be committed or moved aside",
+        ));
+    }
+    validate_sync_head(&store, None)?;
+    let repository = store.repository();
+    let original_head = git_output(
+        repository,
+        &["rev-parse", "--verify", "HEAD"],
+        "inspect Knowledge Store HEAD",
+    )?;
+    let base_ref = format!("refs/remotes/origin/{default_branch}");
+    let work_ref = format!("refs/remotes/origin/{work_branch}");
+
+    fetch_required_branch(repository, default_branch, &base_ref, network_timeout)?;
+    let remote_work_oid =
+        fetch_optional_work_branch(repository, work_branch, &work_ref, network_timeout)?;
+    let merge_result = (|| {
+        if remote_work_oid.is_some() {
+            merge_sync_ref(repository, &work_ref)?;
+        }
+        merge_sync_ref(repository, &base_ref)?;
+        validate_sync_head(&store, Some(&original_head))
+    })();
+    if let Err(error) = merge_result {
+        rollback_sync_head(&store, &original_head)?;
+        return Err(error);
+    }
+
+    let pushed = push_synchronized_work_branch(
+        &store,
+        &original_head,
+        work_branch,
+        &work_ref,
+        remote_work_oid,
+        network_timeout,
+    )?;
+
+    let (behind, ahead) = divergence(repository, &base_ref)?;
+    if behind != 0 {
+        return Err(invariant(
+            "synchronized work branch is still behind the fetched default branch",
+        ));
+    }
+    Ok(KnowledgeSyncReport {
+        base_branch: default_branch.clone(),
+        work_branch: work_branch.clone(),
+        ahead,
+        behind,
+        pushed,
+        needs_merge: ahead > 0,
+    })
+}
+
+fn push_synchronized_work_branch(
+    store: &GitStore,
+    original_head: &str,
+    work_branch: &str,
+    work_ref: &str,
+    mut remote_work_oid: Option<String>,
+    network_timeout: Duration,
+) -> Result<bool> {
+    let repository = store.repository();
+    for attempt in 0..KNOWLEDGE_SYNC_PUSH_ATTEMPTS {
+        let local_head = git_output(
+            repository,
+            &["rev-parse", "--verify", "HEAD"],
+            "inspect synchronized Knowledge Store HEAD",
+        )?;
+        if remote_work_oid.as_deref() == Some(local_head.as_str()) {
+            return Ok(false);
+        }
+        let destination = format!("HEAD:refs/heads/{work_branch}");
+        let output = git_network_command(
+            repository,
+            &["push", "--porcelain", "origin", &destination],
+            "push Knowledge Store work branch",
+            network_timeout,
+        )?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        if attempt + 1 == KNOWLEDGE_SYNC_PUSH_ATTEMPTS {
+            return Err(Error::new(
+                ErrorKind::External,
+                "push Knowledge Store work branch failed after 3 attempts; verify write access and retry",
+            ));
+        }
+        remote_work_oid =
+            fetch_optional_work_branch(repository, work_branch, work_ref, network_timeout)?;
+        let race_merge = (|| {
+            if remote_work_oid.is_some() {
+                merge_sync_ref(repository, work_ref)?;
+            }
+            validate_sync_head(store, Some(original_head))
+        })();
+        if let Err(error) = race_merge {
+            rollback_sync_head(store, original_head)?;
+            return Err(error);
+        }
+    }
+    Err(invariant(
+        "Knowledge Store push retry loop did not terminate",
+    ))
+}
+
+fn validate_sync_head(store: &GitStore, base_revision: Option<&str>) -> Result<()> {
+    store.validate_committed_objects()?;
+    store.validate_committed_events()?;
+    if let Some(base_revision) = base_revision {
+        store.validate_append_only_since(base_revision)?;
+    }
+    let snapshot = ProjectionIndex::for_store(store).domain_snapshot()?;
+    if !snapshot.projection.quarantined_event_ids.is_empty() {
+        return Err(invariant(
+            "synchronized Knowledge Store contains quarantined Events",
+        ));
+    }
+    let status = git_output(
+        store.repository(),
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect synchronized Knowledge Store status",
+    )?;
+    if !status.is_empty() {
+        return Err(invalid(
+            "synchronized Knowledge Store worktree is not clean",
+        ));
+    }
+    Ok(())
+}
+
+fn fetch_required_branch(
+    repository: &Path,
+    branch: &str,
+    tracking_ref: &str,
+    network_timeout: Duration,
+) -> Result<()> {
+    let refspec = format!("refs/heads/{branch}:{tracking_ref}");
+    let output = git_network_command(
+        repository,
+        &["fetch", "--no-tags", "origin", &refspec],
+        "fetch Knowledge Store default branch",
+        network_timeout,
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_failure(
+            "fetch Knowledge Store default branch failed; verify read access and retry",
+            &output,
+        ))
+    }
+}
+
+fn fetch_optional_work_branch(
+    repository: &Path,
+    branch: &str,
+    tracking_ref: &str,
+    network_timeout: Duration,
+) -> Result<Option<String>> {
+    let remote_ref = format!("refs/heads/{branch}");
+    let probe = git_network_command(
+        repository,
+        &["ls-remote", "--exit-code", "--heads", "origin", &remote_ref],
+        "inspect remote Knowledge Store work branch",
+        network_timeout,
+    )?;
+    match probe.status.code() {
+        Some(0) => {
+            let refspec = format!("{remote_ref}:{tracking_ref}");
+            let fetch = git_network_command(
+                repository,
+                &["fetch", "--no-tags", "origin", &refspec],
+                "fetch Knowledge Store work branch",
+                network_timeout,
+            )?;
+            if !fetch.status.success() {
+                return Err(git_failure(
+                    "fetch Knowledge Store work branch failed; verify read access and retry",
+                    &fetch,
+                ));
+            }
+            git_output(
+                repository,
+                &["rev-parse", "--verify", tracking_ref],
+                "inspect fetched Knowledge Store work branch",
+            )
+            .map(Some)
+        }
+        Some(2) => {
+            let remove = git_command(
+                repository,
+                &["update-ref", "-d", tracking_ref],
+                "remove stale Knowledge Store work tracking ref",
+            )?;
+            if !remove.status.success() {
+                return Err(Error::new(
+                    ErrorKind::External,
+                    "remove stale Knowledge Store work tracking ref failed",
+                ));
+            }
+            Ok(None)
+        }
+        _ => Err(git_failure(
+            "inspect remote Knowledge Store work branch failed; verify read access and retry",
+            &probe,
+        )),
+    }
+}
+
+fn merge_sync_ref(repository: &Path, reference: &str) -> Result<()> {
+    let output = git_command(
+        repository,
+        &["merge", "--no-edit", reference],
+        "merge Knowledge Store branch",
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    abort_merge_if_needed(repository)?;
+    Err(Error::new(
+        ErrorKind::Conflict,
+        "Knowledge Store branch merge conflicted; local sync changes were rolled back",
+    ))
+}
+
+fn abort_merge_if_needed(repository: &Path) -> Result<()> {
+    let merge_head = git_command(
+        repository,
+        &["rev-parse", "--verify", "-q", "MERGE_HEAD"],
+        "inspect Knowledge Store merge state",
+    )?;
+    if !merge_head.status.success() {
+        return Ok(());
+    }
+    let abort = git_command(
+        repository,
+        &["merge", "--abort"],
+        "abort Knowledge Store merge",
+    )?;
+    if abort.status.success() {
+        Ok(())
+    } else {
+        Err(invariant("abort Knowledge Store merge failed"))
+    }
+}
+
+fn rollback_sync_head(store: &GitStore, original_head: &str) -> Result<()> {
+    abort_merge_if_needed(store.repository())?;
+    let reset = git_command(
+        store.repository(),
+        &["reset", "--hard", original_head],
+        "restore Knowledge Store after failed sync",
+    )?;
+    if !reset.status.success() {
+        return Err(invariant(
+            "restore Knowledge Store after failed sync failed",
+        ));
+    }
+    validate_sync_head(store, None)
+}
+
+fn divergence(repository: &Path, base_ref: &str) -> Result<(u64, u64)> {
+    let range = format!("{base_ref}...HEAD");
+    let counts = git_output(
+        repository,
+        &["rev-list", "--left-right", "--count", &range],
+        "measure Knowledge Store branch divergence",
+    )?;
+    let mut values = counts.split_whitespace();
+    let behind = values
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| invariant("Git returned invalid behind count"))?;
+    let ahead = values
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| invariant("Git returned invalid ahead count"))?;
+    if values.next().is_some() {
+        return Err(invariant("Git returned extra branch divergence fields"));
+    }
+    Ok((behind, ahead))
+}
+
+/// A typed Git failure that keeps what Git actually said.
+///
+/// The hand-written half of the message is the advice; Git's stderr is the evidence. Recording
+/// only the advice is how `fetch Knowledge Store default branch failed; verify read access and
+/// retry` came to be the entire durable record of a real outage --- true, and useless for telling
+/// an expired credential from an unreachable host. `sctx_log_sync::bounded_tool_diagnostic` bounds
+/// the excerpt, strips control characters, and keeps the last lines, which is where Git puts its
+/// conclusion.
+fn git_failure(message: &str, output: &Output) -> Error {
+    sctx_log_sync::bounded_tool_diagnostic(&output.stderr).map_or_else(
+        || Error::new(ErrorKind::External, message),
+        |detail| Error::new(ErrorKind::External, format!("{message} (git: {detail})")),
+    )
+}
+
+fn git_command(repository: &Path, args: &[&str], context: &str) -> Result<Output> {
+    run_git(repository, args, context, None)
+}
+
+/// Runs one Git operation that reaches the remote, under a wall-clock budget.
+///
+/// Two hardenings apply here and nowhere else. The budget kills a transfer that stopped making
+/// progress, so the exclusive maintenance lease `knowledge sync` holds can never be pinned by an
+/// unresponsive network for longer than the budget; the kill surfaces as an ordinary typed
+/// `External` error, so the caller's existing abort/rollback path runs exactly as it does for any
+/// other failed fetch or push. `BatchMode=yes` stops OpenSSH from blocking on a passphrase or
+/// host-key prompt, the same way `GIT_TERMINAL_PROMPT=0` already stops Git's own prompts -- and
+/// only when the operator has not set `GIT_SSH_COMMAND` themselves, because their command is the
+/// one that knows how their keys are held.
+///
+/// Local Git stays unbounded on purpose: it cannot hang on a network, and interrupting a merge or
+/// a reset halfway is strictly worse than waiting for it.
+fn git_network_command(
+    repository: &Path,
+    args: &[&str],
+    context: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    run_git(repository, args, context, Some(timeout))
+}
+
+fn run_git(
+    repository: &Path,
+    args: &[&str],
+    context: &str,
+    timeout: Option<Duration>,
+) -> Result<Output> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repository)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null());
+    if timeout.is_some() && env::var_os("GIT_SSH_COMMAND").is_none() {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let Some(timeout) = timeout else {
+        return command
+            .output()
+            .map_err(|error| Error::new(ErrorKind::External, format!("{context}: {error}")));
+    };
+    command_output_with_timeout(&mut command, context, timeout)
+}
+
+/// Spawns `command`, drains both pipes, and terminates it once `timeout` elapses.
+///
+/// The pipes are drained on their own threads because a full pipe blocks the child itself, and a
+/// blocked child is exactly the state the budget exists to bound.
+///
+/// The readers are joined only when the child exited on its own. On the timeout path they are
+/// abandoned deliberately: Git hands its pipe write ends to whatever it spawned -- a transport
+/// helper, and for a local remote a whole `receive-pack` with the remote's hooks under it -- so a
+/// read to end-of-file finishes only when the *last* of those exits. Waiting for that is precisely
+/// the wait the budget exists to refuse, and a terminated command's output is not wanted anyway.
+/// Each abandoned thread holds one pipe and ends when the writers do.
+fn command_output_with_timeout(
+    command: &mut Command,
+    context: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    let external =
+        |error: std::io::Error| Error::new(ErrorKind::External, format!("{context}: {error}"));
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(external)?;
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::new(
+                    ErrorKind::External,
+                    format!(
+                        "{context} made no progress for {} seconds and was terminated; \
+                         verify network access to the Knowledge Store remote and retry",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            Ok(None) => thread::sleep(COMMAND_POLL_INTERVAL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(external(error));
+            }
+        }
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.map(join_pipe).unwrap_or_default(),
+        stderr: stderr.map(join_pipe).unwrap_or_default(),
+    })
+}
+
+fn drain_pipe<R: std::io::Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = pipe.read_to_end(&mut buffer);
+        buffer
+    })
+}
+
+fn join_pipe(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
+}
+
+fn installation_id(prior: Option<&InstallManifest>) -> Result<String> {
+    let Some(existing) = prior
+        .map(|manifest| manifest.installation_id.as_str())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(Uuid::new_v4().to_string());
+    };
+    Uuid::parse_str(existing)
+        .map_err(|_| invalid("install manifest contains an invalid installation ID"))?;
+    Ok(existing.to_owned())
+}
+
+fn install_knowledge_store(
+    root: &Path,
+    requested_url: Option<&KnowledgeStoreUrl>,
+    prior: Option<&InstallManifest>,
+    installation_id: &str,
+    transaction: &mut Transaction,
+) -> Result<KnowledgeStoreInstall> {
+    let repository = root.join("repository");
+    let prior_source = prior.map(|manifest| &manifest.knowledge_store);
+    match prior_source {
+        Some(KnowledgeStoreSource::Remote {
+            remote_type,
+            default_branch,
+            work_branch,
+            url_digest,
+        }) => {
+            if let Some(url) = requested_url
+                && url.digest() != *url_digest
+            {
+                return Err(invalid(
+                    "Knowledge Store URL does not match the installed remote",
+                ));
+            }
+            let source = KnowledgeStoreSource::Remote {
+                remote_type: *remote_type,
+                default_branch: default_branch.clone(),
+                work_branch: work_branch.clone(),
+                url_digest: url_digest.clone(),
+            };
+            if fs::symlink_metadata(&repository).is_ok() {
+                let store = GitStore::open_existing(root)?;
+                verify_remote_store(&store, default_branch, work_branch, url_digest)?;
+                return Ok(KnowledgeStoreInstall {
+                    store,
+                    source,
+                    changed: false,
+                });
+            }
+            let url = requested_url.ok_or_else(|| {
+                invalid(
+                    "remote Knowledge Store is missing; rerun setup with the original --knowledge-store-url",
+                )
+            })?;
+            clone_remote_store(root, url, installation_id, transaction)
+        }
+        Some(KnowledgeStoreSource::Local) => {
+            if requested_url.is_some() {
+                return Err(invalid(
+                    "cannot replace an installed local Knowledge Store with a remote URL",
+                ));
+            }
+            let existed = repository.exists();
+            Ok(KnowledgeStoreInstall {
+                store: GitStore::bootstrap_local(root)?,
+                source: KnowledgeStoreSource::Local,
+                changed: !existed,
+            })
+        }
+        None => {
+            if let Some(url) = requested_url {
+                if fs::symlink_metadata(&repository).is_ok() {
+                    return Err(invalid(
+                        "cannot replace an existing Knowledge Store with a remote URL",
+                    ));
+                }
+                clone_remote_store(root, url, installation_id, transaction)
+            } else {
+                let existed = repository.exists();
+                Ok(KnowledgeStoreInstall {
+                    store: GitStore::bootstrap_local(root)?,
+                    source: KnowledgeStoreSource::Local,
+                    changed: !existed,
+                })
+            }
+        }
+    }
+}
+
+fn clone_remote_store(
+    root: &Path,
+    url: &KnowledgeStoreUrl,
+    installation_id: &str,
+    transaction: &mut Transaction,
+) -> Result<KnowledgeStoreInstall> {
+    UserConfigStore::initialize(root)?;
+    let work_branch = format!("shared-context/{installation_id}");
+    let staging_root = transaction.backup_dir.join("remote-bootstrap");
+    let (staged_store, bootstrap) =
+        GitStore::bootstrap_remote(&staging_root, url.as_str(), &work_branch)?;
+    staged_store.validate_committed_objects()?;
+    staged_store.validate_committed_events()?;
+    let snapshot = ProjectionIndex::for_store(&staged_store).domain_snapshot()?;
+    if !snapshot.projection.quarantined_event_ids.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvariantViolation,
+            "remote Knowledge Store contains quarantined Events",
+        ));
+    }
+
+    ensure_private_directory(&root.join("state/pending"))?;
+
+    let repository = root.join("repository");
+    if fs::symlink_metadata(&repository).is_ok() {
+        return Err(invalid(
+            "cannot replace an existing Knowledge Store with a remote URL",
+        ));
+    }
+    transaction.record(&repository)?;
+    fs::rename(staged_store.repository(), &repository)
+        .map_err(io_error("atomically install remote Knowledge Store"))?;
+    sync_directory(root)?;
+    transaction.phase("remote_repository_installed")?;
+
+    let source = KnowledgeStoreSource::Remote {
+        remote_type: url.remote_type(),
+        default_branch: bootstrap.default_branch,
+        work_branch: bootstrap.work_branch,
+        url_digest: url.digest(),
+    };
+    let store = GitStore::open_existing(root)?;
+    if let KnowledgeStoreSource::Remote {
+        default_branch,
+        work_branch,
+        url_digest,
+        ..
+    } = &source
+    {
+        verify_remote_store(&store, default_branch, work_branch, url_digest)?;
+    }
+    Ok(KnowledgeStoreInstall {
+        store,
+        source,
+        changed: true,
+    })
+}
+
+fn verify_remote_store(
+    store: &GitStore,
+    default_branch: &str,
+    work_branch: &str,
+    expected_url_digest: &str,
+) -> Result<()> {
+    let repository = store.repository();
+    let current_branch = git_output(
+        repository,
+        &["symbolic-ref", "--short", "HEAD"],
+        "inspect Knowledge Store branch",
+    )?;
+    if current_branch != work_branch {
+        return Err(invalid(
+            "remote Knowledge Store is not on its installation work branch",
+        ));
+    }
+    let remote_url = git_output(
+        repository,
+        &["config", "--get", "remote.origin.url"],
+        "inspect Knowledge Store origin",
+    )?;
+    if sha256(remote_url.as_bytes()) != expected_url_digest {
+        return Err(invalid(
+            "remote Knowledge Store origin does not match the install manifest",
+        ));
+    }
+    let default_ref = format!("refs/remotes/origin/{default_branch}");
+    git_output(
+        repository,
+        &["rev-parse", "--verify", &default_ref],
+        "verify remote default branch",
+    )?;
+    let status = git_output(
+        repository,
+        &["status", "--porcelain", "--untracked-files=all"],
+        "inspect Knowledge Store status",
+    )?;
+    if !status.is_empty() {
+        return Err(invalid("remote Knowledge Store worktree is not clean"));
+    }
+    Ok(())
+}
+
+fn git_output(repository: &Path, args: &[&str], context: &str) -> Result<String> {
+    // Every current caller is a local read, but the prompt suppression `git_command` has always
+    // carried belongs on this path too: an unattended maintenance run must never be the thing that
+    // parks a Git process on a terminal prompt nobody is watching.
+    let output = run_git(repository, args, context, None)?;
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::External,
+            format!("{context} failed with {}", output.status),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_owned())
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::External,
+                format!("{context} returned non-UTF-8 output"),
+            )
+        })
+}
+
+fn validate_knowledge_store_url(value: &str) -> Result<()> {
+    if value.is_empty() || value.trim() != value {
+        return Err(invalid(
+            "Knowledge Store URL must be non-empty and have no surrounding whitespace",
+        ));
+    }
+    if value.starts_with('-') || value.chars().any(char::is_control) {
+        return Err(invalid("Knowledge Store URL contains unsafe characters"));
+    }
+    if value.contains(['?', '#']) {
+        return Err(invalid(
+            "Knowledge Store URL must not contain query parameters or fragments",
+        ));
+    }
+    if let Some((scheme, remainder)) = value.split_once("://") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "file" | "http" | "https" | "ssh" | "git"
+        ) {
+            return Err(invalid("unsupported Knowledge Store URL scheme"));
+        }
+        let authority = remainder.split('/').next().unwrap_or_default();
+        if authority.is_empty() && !scheme.eq_ignore_ascii_case("file") {
+            return Err(invalid("Knowledge Store URL has no remote host"));
+        }
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            let ssh_username_only = scheme.eq_ignore_ascii_case("ssh")
+                && !userinfo.is_empty()
+                && !userinfo.contains(':');
+            if !ssh_username_only {
+                return Err(invalid(
+                    "Knowledge Store URL must not contain embedded credentials",
+                ));
+            }
+        }
+    } else if let Some((userinfo, tail)) = value.split_once('@')
+        && tail.contains(':')
+        && (userinfo.is_empty() || userinfo.contains(':'))
+    {
+        return Err(invalid(
+            "Knowledge Store URL must not contain embedded credentials",
+        ));
+    }
+    Ok(())
+}
+
+fn classify_remote_type(value: &str) -> KnowledgeRemoteType {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        KnowledgeRemoteType::Https
+    } else if lower.starts_with("http://") {
+        KnowledgeRemoteType::Http
+    } else if lower.starts_with("ssh://")
+        || value
+            .split_once('@')
+            .is_some_and(|(_, tail)| tail.contains(':'))
+    {
+        KnowledgeRemoteType::Ssh
+    } else if lower.starts_with("git://") {
+        KnowledgeRemoteType::Git
+    } else {
+        KnowledgeRemoteType::Local
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1102,16 +2806,28 @@ struct SkillInstall {
 #[derive(Default)]
 struct SkillAssetInstall {
     changed: bool,
-    modified: bool,
-    conflict: bool,
 }
 
+fn global_skills_root(home: &Path) -> PathBuf {
+    home.join(GLOBAL_SKILLS_DIRECTORY)
+}
+
+/// The bundle a [`SkillReport`] names. Every bundle installs and uninstalls together, so one path
+/// still describes the outcome; [`global_skill_roots`] is what the per-bundle work iterates.
 fn global_skill_root(home: &Path) -> PathBuf {
-    home.join(GLOBAL_SKILL_DIRECTORY)
+    global_skills_root(home).join(GLOBAL_SKILL_DIRECTORIES[0])
+}
+
+fn global_skill_roots(home: &Path) -> Vec<PathBuf> {
+    let root = global_skills_root(home);
+    GLOBAL_SKILL_DIRECTORIES
+        .iter()
+        .map(|directory| root.join(directory))
+        .collect()
 }
 
 fn global_skill_assets(home: &Path) -> Vec<(PathBuf, &'static [u8])> {
-    let root = global_skill_root(home);
+    let root = global_skills_root(home);
     SKILL_ASSETS
         .iter()
         .map(|(relative, bytes)| (root.join(relative), *bytes))
@@ -1141,13 +2857,37 @@ fn absent_parent_directories(path: &Path, stop_at: &Path) -> Result<Vec<PathBuf>
     Ok(directories)
 }
 
+/// Seeds `<root>/policy.md` with the built-in default the first time, and never again.
+///
+/// Deliberately outside the setup transaction and outside skill ownership tracking. This file is
+/// the operator's document from the moment it exists: an upgrade must not roll it back, reconcile
+/// it, or notice that it differs from what we shipped. `create_new` is the whole idempotence
+/// story -- a file that is already there is left exactly as it is, whatever it says.
+///
+/// Failing to write it is a notice, not a failed installation: the compiled-in default is what
+/// gets delivered either way, and `sctx policy reset` writes the file on demand.
+fn install_default_policy(root: &Path, notices: &mut Vec<String>) {
+    let path = root.join(POLICY_FILE_NAME);
+    let outcome = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut file| file.write_all(DEFAULT_POLICY_MARKDOWN.as_bytes()));
+    match outcome {
+        Ok(()) => notices.push(format!("wrote default team policy: {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => notices.push(format!("could not write {}: {error}", path.display())),
+    }
+}
+
 fn install_global_skill(
     transaction: &mut Transaction,
     home: &Path,
     prior_ownership: &[OwnedSkill],
     notices: &mut Vec<String>,
+    fail_after: Option<SetupStage>,
 ) -> Result<SkillInstall> {
-    let root = global_skill_root(home);
     let assets = global_skill_assets(home);
     let expected_paths = assets.iter().map(|(path, _)| path).collect::<BTreeSet<_>>();
     let mut ownership = prior_ownership.to_vec();
@@ -1161,11 +2901,16 @@ fn install_global_skill(
         }
     }
 
-    let owns_expected_file = prior_ownership
-        .iter()
-        .any(|owned| expected_paths.contains(&owned.path));
-    if let Some(status) = global_skill_location_conflict(home, &root, owns_expected_file, notices)?
-    {
+    // Every bundle is installed or preserved as one unit: a conflict in any single bundle stops
+    // the whole set, so an installation never ends up carrying half the managed Skills.
+    if let Some(status) = global_skill_location_conflict(home, prior_ownership, notices)? {
+        return Ok(SkillInstall {
+            changed: false,
+            status,
+            ownership,
+        });
+    }
+    if let Some(status) = global_skill_bundle_conflict(&assets, prior_ownership, notices)? {
         return Ok(SkillInstall {
             changed: false,
             status,
@@ -1176,25 +2921,19 @@ fn install_global_skill(
     let mut aggregate = SkillAssetInstall::default();
     for (path, desired) in assets {
         let prior = prior_ownership.iter().find(|owned| owned.path == path);
-        let result = install_global_skill_asset(
-            transaction,
-            home,
-            path,
-            desired,
-            prior,
-            &mut ownership,
-            notices,
-        )?;
+        let stage = global_skill_asset_stage(&path)?;
+        let result =
+            install_global_skill_asset(transaction, home, path, desired, prior, &mut ownership)?;
         aggregate.changed |= result.changed;
-        aggregate.modified |= result.modified;
-        aggregate.conflict |= result.conflict;
+        if fail_after == Some(stage) {
+            return Err(Error::new(
+                ErrorKind::Io,
+                format!("injected setup failure after {stage:?}"),
+            ));
+        }
     }
 
-    let status = if aggregate.modified {
-        SkillStatus::Modified
-    } else if aggregate.conflict {
-        SkillStatus::Conflict
-    } else if aggregate.changed {
+    let status = if aggregate.changed {
         SkillStatus::Installed
     } else {
         SkillStatus::Current
@@ -1206,34 +2945,134 @@ fn install_global_skill(
     })
 }
 
-fn global_skill_location_conflict(
-    home: &Path,
-    root: &Path,
-    owns_expected_file: bool,
+fn global_skill_asset_stage(path: &Path) -> Result<SetupStage> {
+    match global_skill_asset_relative(path) {
+        Some("shared-context/SKILL.md") => Ok(SetupStage::GlobalSkillGateWritten),
+        Some("shared-context/references/workflow.md") => Ok(SetupStage::GlobalSkillWorkflowWritten),
+        Some("shared-context/agents/openai.yaml") => Ok(SetupStage::GlobalSkillMetadataWritten),
+        Some("sctx-review/SKILL.md") => Ok(SetupStage::GlobalSkillReviewGateWritten),
+        Some("sctx-review/references/review.md") => {
+            Ok(SetupStage::GlobalSkillReviewReferenceWritten)
+        }
+        Some("sctx-review/agents/openai.yaml") => Ok(SetupStage::GlobalSkillReviewMetadataWritten),
+        _ => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!("unexpected global Agent Skill asset: {}", path.display()),
+        )),
+    }
+}
+
+/// The [`SKILL_ASSETS`] key an installed path carries, matched by suffix so it stays independent
+/// of the home directory the caller resolved against.
+fn global_skill_asset_relative(path: &Path) -> Option<&'static str> {
+    SKILL_ASSETS
+        .iter()
+        .map(|(relative, _)| *relative)
+        .find(|relative| path.ends_with(relative))
+}
+
+fn global_skill_bundle_conflict(
+    assets: &[(PathBuf, &'static [u8])],
+    prior_ownership: &[OwnedSkill],
     notices: &mut Vec<String>,
 ) -> Result<Option<SkillStatus>> {
-    match fs::symlink_metadata(root) {
-        Ok(_) if !owns_expected_file => {
-            notices.push(format!(
-                "preserved user-owned global Agent Skill at {}; Shared Context did not overwrite or claim it",
-                root.display()
-            ));
-            return Ok(Some(SkillStatus::Conflict));
+    let mut modified = false;
+    let mut conflict = false;
+    for (path, _) in assets {
+        let prior = prior_ownership.iter().find(|owned| owned.path == *path);
+        if let Some(parent) = path.parent() {
+            match fs::symlink_metadata(parent) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    notices.push(format!(
+                        "preserved global Agent Skill bundle because an asset parent is not a non-symlink directory: {}",
+                        parent.display()
+                    ));
+                    modified |= prior.is_some();
+                    conflict |= prior.is_none();
+                    continue;
+                }
+                Err(error) => {
+                    return Err(io_error("inspect global Agent Skill bundle parent")(error));
+                }
+            }
         }
-        Ok(metadata)
-            if owns_expected_file && (!metadata.is_dir() || metadata.file_type().is_symlink()) =>
-        {
-            notices.push(format!(
-                "preserved managed global Agent Skill because its directory is no longer a non-symlink directory: {}",
-                root.display()
-            ));
-            return Ok(Some(SkillStatus::Modified));
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let current =
+                    fs::read(path).map_err(io_error("read global Agent Skill bundle asset"))?;
+                match prior {
+                    Some(owned) if sha256(&current) == owned.sha256 => {}
+                    Some(_) => {
+                        notices.push(format!(
+                            "preserved user-modified global Agent Skill file: {}",
+                            path.display()
+                        ));
+                        modified = true;
+                    }
+                    None => {
+                        notices.push(format!(
+                            "preserved user-owned global Agent Skill file: {}; Shared Context did not overwrite or claim it",
+                            path.display()
+                        ));
+                        conflict = true;
+                    }
+                }
+            }
+            Ok(_) => {
+                notices.push(format!(
+                    "preserved global Agent Skill path because it is not a regular file: {}",
+                    path.display()
+                ));
+                modified |= prior.is_some();
+                conflict |= prior.is_none();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect global Agent Skill bundle asset")(error)),
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io_error("inspect global Agent Skill")(error)),
-        _ => {}
     }
-    for ancestor in [home.join(".agents"), home.join(".agents/skills")] {
+    if modified {
+        Ok(Some(SkillStatus::Modified))
+    } else if conflict {
+        Ok(Some(SkillStatus::Conflict))
+    } else {
+        Ok(None)
+    }
+}
+
+fn global_skill_location_conflict(
+    home: &Path,
+    prior_ownership: &[OwnedSkill],
+    notices: &mut Vec<String>,
+) -> Result<Option<SkillStatus>> {
+    for root in global_skill_roots(home) {
+        // Ownership is judged per bundle: a `sctx-review` directory an older build never wrote is
+        // a user's Skill of the same name, not a managed one this run may claim.
+        let owns_expected_file = prior_ownership
+            .iter()
+            .any(|owned| owned.path.starts_with(&root));
+        match fs::symlink_metadata(&root) {
+            Ok(_) if !owns_expected_file => {
+                notices.push(format!(
+                    "preserved user-owned global Agent Skill at {}; Shared Context did not overwrite or claim it",
+                    root.display()
+                ));
+                return Ok(Some(SkillStatus::Conflict));
+            }
+            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
+                notices.push(format!(
+                    "preserved managed global Agent Skill because its directory is no longer a non-symlink directory: {}",
+                    root.display()
+                ));
+                return Ok(Some(SkillStatus::Modified));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect global Agent Skill")(error)),
+            Ok(_) => {}
+        }
+    }
+    for ancestor in [home.join(".agents"), global_skills_root(home)] {
         match fs::symlink_metadata(&ancestor) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
@@ -1257,51 +3096,41 @@ fn install_global_skill_asset(
     desired: &'static [u8],
     prior: Option<&OwnedSkill>,
     ownership: &mut Vec<OwnedSkill>,
-    notices: &mut Vec<String>,
 ) -> Result<SkillAssetInstall> {
     if let Some(parent) = path.parent() {
         match fs::symlink_metadata(parent) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
-                notices.push(format!(
-                    "preserved global Agent Skill file because its parent is not a non-symlink directory: {}",
-                    parent.display()
+                return Err(Error::new(
+                    ErrorKind::InvariantViolation,
+                    format!(
+                        "global Agent Skill bundle parent changed after preflight: {}",
+                        parent.display()
+                    ),
                 ));
-                return Ok(SkillAssetInstall {
-                    modified: prior.is_some(),
-                    conflict: prior.is_none(),
-                    ..SkillAssetInstall::default()
-                });
             }
             Err(error) => return Err(io_error("inspect global Agent Skill file parent")(error)),
         }
     }
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            install_existing_skill_asset(transaction, path, desired, prior, ownership, notices)
+            install_existing_skill_asset(transaction, path, desired, prior, ownership)
         }
-        Ok(_) => {
-            notices.push(format!(
-                "preserved global Agent Skill path because it is not a regular file: {}",
+        Ok(_) => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!(
+                "global Agent Skill bundle asset changed after preflight: {}",
                 path.display()
-            ));
-            Ok(SkillAssetInstall {
-                modified: prior.is_some(),
-                conflict: prior.is_none(),
-                ..SkillAssetInstall::default()
-            })
-        }
+            ),
+        )),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let cleanup_empty_dirs = absent_parent_directories(&path, home)?;
             transaction.record_with_cleanup(&path, cleanup_empty_dirs)?;
             atomic_write(&path, desired, 0o644)?;
             transaction.phase("global_skill_installed")?;
             upsert_owned_skill(ownership, path, sha256(desired));
-            Ok(SkillAssetInstall {
-                changed: true,
-                ..SkillAssetInstall::default()
-            })
+            Ok(SkillAssetInstall { changed: true })
         }
         Err(error) => Err(io_error("inspect global Agent Skill file")(error)),
     }
@@ -1313,7 +3142,6 @@ fn install_existing_skill_asset(
     desired: &'static [u8],
     prior: Option<&OwnedSkill>,
     ownership: &mut Vec<OwnedSkill>,
-    notices: &mut Vec<String>,
 ) -> Result<SkillAssetInstall> {
     let current = fs::read(&path).map_err(io_error("read global Agent Skill file"))?;
     match prior {
@@ -1325,31 +3153,15 @@ fn install_existing_skill_asset(
                 transaction.phase("global_skill_updated")?;
             }
             upsert_owned_skill(ownership, path, sha256(desired));
-            Ok(SkillAssetInstall {
-                changed,
-                ..SkillAssetInstall::default()
-            })
+            Ok(SkillAssetInstall { changed })
         }
-        Some(_) => {
-            notices.push(format!(
-                "preserved user-modified global Agent Skill file: {}",
+        Some(_) | None => Err(Error::new(
+            ErrorKind::InvariantViolation,
+            format!(
+                "global Agent Skill bundle asset changed after preflight: {}",
                 path.display()
-            ));
-            Ok(SkillAssetInstall {
-                modified: true,
-                ..SkillAssetInstall::default()
-            })
-        }
-        None => {
-            notices.push(format!(
-                "preserved user-owned global Agent Skill file: {}; Shared Context did not overwrite or claim it",
-                path.display()
-            ));
-            Ok(SkillAssetInstall {
-                conflict: true,
-                ..SkillAssetInstall::default()
-            })
-        }
+            ),
+        )),
     }
 }
 
@@ -1489,14 +3301,52 @@ fn merge_json_named_entry(
     Ok(changed)
 }
 
+/// What [`merge_json_hooks`] did, for the caller that has to follow up on it.
+///
+/// Codex needs the follow-up: a hook it does not *trust* never runs, and the trust hash is keyed on
+/// the hook command, which this merge rewrites on every upgrade. See [`codex_trust`].
+struct HookMerge {
+    changed: bool,
+    /// The `hooks.<Event>[index]` group addresses this installer authored, byte for byte.
+    ///
+    /// Only these may be re-trusted. An address the merge *preserved* because the operator had
+    /// edited the entry stays out, so `sctx setup` can never grant Codex's execution trust to a
+    /// command it did not write.
+    owned_groups: Vec<(&'static str, usize)>,
+    /// The hooks document as it now stands on disk.
+    document: Map<String, Value>,
+}
+
+/// The one hook entry this installer writes into each of an Agent's hook events.
+///
+/// Cursor takes a bare handler; Codex takes a matcher group wrapping one handler. Note that the
+/// command embeds the *detected* Agent version, which is why installing a hook can never be a
+/// once-only act: the command changes with the host, and for Codex the trust hash changes with the
+/// command (see [`codex_trust`]).
+fn desired_hook_entry(agent: Agent, binary: &Path, agent_version: Option<&str>) -> Result<Value> {
+    let command = format!(
+        "{} hook --agent {} --agent-version {}",
+        shell_quote(binary)?,
+        agent_name(agent),
+        shell_quote(Path::new(agent_version.unwrap_or("unavailable")))?
+    );
+    Ok(match agent {
+        Agent::Cursor => json!({"command": command}),
+        Agent::Codex => json!({
+            "hooks": [{"type": "command", "command": command, "statusMessage": "Shared Context"}]
+        }),
+    })
+}
+
 fn merge_json_hooks(
     transaction: &mut Transaction,
     path: &Path,
     agent: Agent,
     binary: &Path,
+    agent_version: Option<&str>,
     ownership: &mut Vec<OwnedConfig>,
     notices: &mut Vec<String>,
-) -> Result<bool> {
+) -> Result<HookMerge> {
     let kind = match agent {
         Agent::Cursor => ConfigKind::CursorHooks,
         Agent::Codex => ConfigKind::CodexHooks,
@@ -1514,23 +3364,14 @@ fn merge_json_hooks(
     }
     let mut changed = document != original;
     let hooks = object_field_mut(&mut document, "hooks")?;
-    let command = format!(
-        "{} hook --agent {}",
-        shell_quote(binary)?,
-        agent_name(agent)
-    );
-    let desired = match agent {
-        Agent::Cursor => json!({"command": command}),
-        Agent::Codex => json!({
-            "hooks": [{"type": "command", "command": command, "statusMessage": "Shared Context"}]
-        }),
-    };
+    let desired = desired_hook_entry(agent, binary, agent_version)?;
     let desired_hash = hash_value(&desired)?;
     let prior_entries = ownership
         .iter()
         .find(|config| config.kind == kind)
         .map_or_else(Vec::new, |config| config.entries.clone());
     let mut entries = Vec::new();
+    let mut owned_groups = Vec::new();
     for event in events {
         let item = hooks
             .entry((*event).to_owned())
@@ -1547,16 +3388,31 @@ fn merge_json_hooks(
                 hash: desired_hash.clone(),
                 original_index: Some(index),
             });
+            owned_groups.push((*event, index));
             continue;
         }
         let prior = prior_entries.iter().find(|entry| entry.selector == *event);
         if let Some(index) = prior.and_then(|entry| entry.original_index) {
             if index < array.len() {
+                let prior = prior.expect("prior entry exists");
+                if hash_value(&array[index])? == prior.hash {
+                    array[index] = desired.clone();
+                    changed = true;
+                    entries.push(OwnedEntry {
+                        selector: (*event).to_owned(),
+                        hash: desired_hash.clone(),
+                        original_index: Some(index),
+                    });
+                    owned_groups.push((*event, index));
+                    continue;
+                }
                 notices.push(format!(
                     "preserved user-modified {event} hook at index {index} in {}",
                     path.display()
                 ));
-                entries.push(prior.cloned().expect("prior entry exists"));
+                // Deliberately not an owned group: the entry at this address is the operator's
+                // now, so its Codex trust hash is theirs to grant and not ours to re-stamp.
+                entries.push(prior.clone());
                 continue;
             }
         }
@@ -1568,6 +3424,7 @@ fn merge_json_hooks(
             hash: desired_hash.clone(),
             original_index: Some(index),
         });
+        owned_groups.push((*event, index));
     }
     if changed {
         transaction.record(path)?;
@@ -1576,7 +3433,93 @@ fn merge_json_hooks(
     }
     let originally_absent = prior_originally_absent(ownership, kind, absent);
     upsert_owned_config(ownership, path, kind, originally_absent, entries);
-    Ok(changed)
+    Ok(HookMerge {
+        changed,
+        owned_groups,
+        document,
+    })
+}
+
+/// Re-stamps the Codex `[hooks.state]` trust hashes for the hook groups `merge` just authored.
+///
+/// Codex refuses to run a hook whose recomputed identity hash does not match the `trusted_hash`
+/// stored in `config.toml`, and the hash covers the hook *command*, which embeds
+/// `--agent-version`. So every upgrade that rewrites `hooks.json` invalidates the operator's trust
+/// and every Codex hook stops firing -- silently, with no error anywhere, the failure mode this
+/// exists to close. Measured on the dev.10 install: `hooks.json` said `0.154.0`, all six stored
+/// hashes still described `0.153.4`, and a full replay produced zero `<shared-context-active>`
+/// markers.
+///
+/// Scope discipline is in [`codex_trust::apply_trust`]: only the groups this installer authored are
+/// stamped, only dead keys addressing our own `hooks.json` are pruned, and no other key source is
+/// read or written.
+///
+/// # Errors
+///
+/// Returns an error when `config.toml` cannot be read, parsed, or replaced. The caller degrades
+/// that to a notice: `config.toml` is the operator's hand-written file, and a hook that will not
+/// run is worth reporting but never worth failing an otherwise complete install over.
+fn restamp_codex_hook_trust(
+    transaction: &mut Transaction,
+    config_path: &Path,
+    hooks_path: &Path,
+    merge: &HookMerge,
+) -> Result<codex_trust::TrustUpdate> {
+    let key_source = path_text(hooks_path)?;
+    let mut desired = BTreeMap::new();
+    for (event, group_index) in &merge.owned_groups {
+        let group = merge
+            .document
+            .get("hooks")
+            .and_then(|hooks| hooks.get(*event))
+            .and_then(Value::as_array)
+            .and_then(|groups| groups.get(*group_index))
+            .ok_or_else(|| invalid(format!("{event} hook group {group_index} vanished")))?;
+        let matcher = group.get("matcher").and_then(Value::as_str);
+        let handlers = group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid(format!("{event} hook group {group_index} has no handlers")))?;
+        for (handler_index, handler) in handlers.iter().enumerate() {
+            if let Some(digest) = codex_trust::hook_hash(event, matcher, handler)? {
+                desired.insert(
+                    codex_trust::hook_key(&key_source, event, *group_index, handler_index)?,
+                    digest,
+                );
+            }
+        }
+    }
+    let addressed = codex_trust::addressed_keys(&merge.document, &key_source)?;
+
+    let _lock = ConfigLock::acquire(config_path)?;
+    let mut document = read_utf8_or_empty(config_path)?
+        .parse::<DocumentMut>()
+        .map_err(|error| {
+            invalid(format!(
+                "invalid Codex TOML in {}: {error}",
+                config_path.display()
+            ))
+        })?;
+    let update = codex_trust::apply_trust(&mut document, &key_source, &desired, &addressed)?;
+    if update.changed() {
+        let rendered = document.to_string();
+        // Validated before the replacement rather than after it: the operator's `config.toml` is
+        // the one file here whose corruption would cost them their own settings.
+        rendered.parse::<DocumentMut>().map_err(|error| {
+            invalid(format!(
+                "re-stamping Codex hook trust would have produced invalid TOML: {error}"
+            ))
+        })?;
+        transaction.record(config_path)?;
+        atomic_write(
+            config_path,
+            rendered.as_bytes(),
+            existing_mode(config_path, 0o600)?,
+        )?;
+        parse_toml_file(config_path)?;
+        transaction.phase("restamped_codex_hook_trust")?;
+    }
+    Ok(update)
 }
 
 fn merge_codex_mcp(
@@ -1652,6 +3595,63 @@ fn merge_codex_mcp(
         }],
     );
     Ok(changed)
+}
+
+/// Removes the Codex trust keys that this uninstall has just made dead.
+///
+/// [`uninstall_json_hooks`] takes our hook entries out of `~/.codex/hooks.json`, which leaves the
+/// `[hooks.state]` keys that addressed them pointing at nothing — the same stale-key litter setup
+/// prunes, except self-inflicted and with no later setup coming to clear it. Keys addressing a
+/// position the file still has (the operator's own hooks in the same file) are untouched, and so is
+/// every other key source.
+///
+/// Best effort by design: an uninstall that removed everything it owns must not fail over a
+/// leftover in a file that is the operator's to begin with.
+fn prune_codex_hook_trust(home: &Path, report: &mut UninstallReport) {
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    if !config_path.is_file() {
+        return;
+    }
+    let pruned = || -> Result<usize> {
+        let key_source = path_text(&hooks_path)?;
+        let addressed = if hooks_path.is_file() {
+            codex_trust::addressed_keys(&read_json_object(&hooks_path)?, &key_source)?
+        } else {
+            BTreeSet::new()
+        };
+        let _lock = ConfigLock::acquire(&config_path)?;
+        let mut document = read_utf8_or_empty(&config_path)?
+            .parse::<DocumentMut>()
+            .map_err(|error| {
+                invalid(format!(
+                    "invalid Codex TOML in {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+        let update =
+            codex_trust::apply_trust(&mut document, &key_source, &BTreeMap::new(), &addressed)?;
+        if update.changed() {
+            let rendered = document.to_string();
+            rendered.parse::<DocumentMut>().map_err(|error| {
+                invalid(format!(
+                    "pruning Codex hook trust would break the TOML: {error}"
+                ))
+            })?;
+            atomic_write(
+                &config_path,
+                rendered.as_bytes(),
+                existing_mode(&config_path, 0o600)?,
+            )?;
+        }
+        Ok(update.pruned)
+    }();
+    if let Err(error) = pruned {
+        report.warnings.push(format!(
+            "preserved the Codex hook trust keys in {}: {error}",
+            config_path.display()
+        ));
+    }
 }
 
 fn uninstall_config(config: &OwnedConfig, report: &mut UninstallReport) -> Result<()> {
@@ -1829,6 +3829,17 @@ fn skill_parent_directories_are_safe(home: &Path, path: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn global_skill_directory_is_safe(home: &Path, directory: &Path) -> Result<bool> {
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            skill_parent_directories_are_safe(home, &directory.join(".sctx-prune-check"))
+        }
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(io_error("inspect global Agent Skill directory")(error)),
+    }
+}
+
 fn uninstall_owned_skill(
     home: &Path,
     skill: &OwnedSkill,
@@ -1913,6 +3924,45 @@ fn manifest_path(root: &Path) -> PathBuf {
     root.join("state/install-manifest.json")
 }
 
+/// How long the global Git identity lookup may take before setup stops waiting for it.
+const AUTHOR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Longest author this system will cache. An author is a username, not prose.
+const MAX_AUTHOR_CHARS: usize = 64;
+
+/// Resolves the username to record with this installation's Candidate confirmations.
+///
+/// Deliberately infallible: an installation with no global Git identity, or a `git` that does not
+/// answer promptly, is a perfectly good installation. It caches nothing and refuses nothing — it
+/// returns `None` and setup carries on.
+///
+/// Only the *global* identity is read. The knowledge repository's local config holds a fixed
+/// writer identity (`Shared Context Writer <shared-context@localhost>`) that identifies this
+/// software, not the person using it.
+fn resolve_manifest_author() -> Option<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new("git")
+            .args(["config", "--global", "--get", "user.email"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let _ = sender.send(output);
+    });
+    let output = receiver.recv_timeout(AUTHOR_LOOKUP_TIMEOUT).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8(output.stdout).ok()?;
+    let email = email.trim();
+    let username = email.split_once('@').map_or(email, |(name, _)| name).trim();
+    (!username.is_empty()
+        && username.chars().count() <= MAX_AUTHOR_CHARS
+        && !username.chars().any(char::is_whitespace)
+        && !username.contains('@'))
+    .then(|| username.to_owned())
+}
+
 fn upsert_owned_config(
     configs: &mut Vec<OwnedConfig>,
     path: &Path,
@@ -1949,7 +3999,10 @@ fn finalize_ownership(transaction: &mut Transaction, configs: &mut [OwnedConfig]
             (None, _) => true,
             (Some(prior), None) => current_hash == *prior,
             (Some(prior), Some(Original::File { sha256, .. })) => sha256 == prior,
-            (Some(_), Some(Original::Absent | Original::Symlink { .. })) => false,
+            (
+                Some(_),
+                Some(Original::Absent | Original::Symlink { .. } | Original::Directory { .. }),
+            ) => false,
         };
         if safe_to_refresh {
             config.installed_file_hash = Some(current_hash);
@@ -1992,6 +4045,15 @@ fn restore_unchanged_config(config: &OwnedConfig, report: &mut UninstallReport) 
                 ErrorKind::InvariantViolation,
                 format!(
                     "Agent config baseline cannot be a symlink: {}",
+                    config.path.display()
+                ),
+            ));
+        }
+        Some(Original::Directory { .. }) => {
+            return Err(Error::new(
+                ErrorKind::InvariantViolation,
+                format!(
+                    "Agent config baseline cannot be a directory: {}",
                     config.path.display()
                 ),
             ));
@@ -2086,6 +4148,9 @@ fn recover_incomplete_journals(root: &Path) -> Result<()> {
     }
     for entry in fs::read_dir(&backups).map_err(io_error("read backups directory"))? {
         let entry = entry.map_err(io_error("read backup entry"))?;
+        if !entry.file_name().to_string_lossy().starts_with("setup-") {
+            continue;
+        }
         let path = entry.path().join("journal.json");
         if path.is_file() {
             journals.push(path);
@@ -2108,6 +4173,303 @@ fn recover_incomplete_journals(root: &Path) -> Result<()> {
         atomic_write(&path, &bytes, 0o600)?;
     }
     Ok(())
+}
+
+fn reset_marker_path(root: &Path) -> PathBuf {
+    root.join("state/reset-journal.json")
+}
+
+fn reset_relative_targets() -> Vec<PathBuf> {
+    let mut targets = vec![PathBuf::from("repository"), PathBuf::from("config.toml")];
+    for database in [
+        "index.sqlite",
+        "runtime.sqlite",
+        "engineering.sqlite",
+        "repository-registry.sqlite",
+        // Derived vectors. A reset must clear them with everything else, or the next model load
+        // would repopulate a channel against a corpus that no longer exists.
+        "semantic.sqlite",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            targets.push(PathBuf::from(format!("state/{database}{suffix}")));
+        }
+    }
+    targets.extend([
+        PathBuf::from("state/pending"),
+        PathBuf::from("state/pending-aside"),
+        PathBuf::from("state/authorized-session-scopes"),
+        PathBuf::from("state/capture"),
+        PathBuf::from("state/capture.lock"),
+        PathBuf::from("state/capture-metadata.json"),
+    ]);
+    targets
+}
+
+fn validate_reset_active_targets(root: &Path) -> Result<()> {
+    for relative in reset_relative_targets() {
+        let active = root.join(&relative);
+        match fs::symlink_metadata(&active) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid(format!(
+                    "data reset target must not be a symlink: {}",
+                    active.display()
+                )));
+            }
+            Ok(metadata) if relative == Path::new("repository") && !metadata.is_dir() => {
+                return Err(invalid("data reset repository target must be a directory"));
+            }
+            Ok(metadata) if relative == Path::new("config.toml") && !metadata.is_file() => {
+                return Err(invalid("data reset config target must be a regular file"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect data reset target")(error)),
+        }
+    }
+    Ok(())
+}
+
+fn build_pristine_reset_root(final_root: &Path, staging_root: &Path) -> Result<()> {
+    ensure_private_directory(staging_root)?;
+    let store = GitStore::bootstrap_local(staging_root)?;
+    ProjectionIndex::for_store(&store).synchronize()?;
+    let _runtime = TaskRuntime::initialize(staging_root.to_path_buf())?;
+    let registry = RepositoryRegistry::initialize(staging_root.to_path_buf())?;
+    registry.sync_catalog(&[])?;
+    let _engineering = EngineeringProjectionStore::initialize(staging_root.to_path_buf())?;
+    let _scopes = AuthorizedSessionScopeStore::initialize(staging_root)?;
+    ensure_private_directory(&staging_root.join("state/pending-aside"))?;
+    let empty_config = UserConfigStore::empty_document(final_root)?;
+    atomic_write(
+        &staging_root.join("config.toml"),
+        empty_config.as_bytes(),
+        0o600,
+    )?;
+    Ok(())
+}
+
+fn build_reset_entries(
+    root: &Path,
+    backup_dir: &Path,
+    staging_root: &Path,
+) -> Result<Vec<DataResetEntry>> {
+    reset_relative_targets()
+        .into_iter()
+        .map(|relative| {
+            let active = root.join(&relative);
+            let staged = staging_root.join(&relative);
+            Ok(DataResetEntry {
+                original_present: reset_path_present(&active)?,
+                staged_present: reset_path_present(&staged)?,
+                backup: backup_dir.join("old").join(&relative),
+                active,
+                staged: Some(staged),
+            })
+        })
+        .collect()
+}
+
+fn persist_reset_journal(journal: &DataResetJournal, active_marker: bool) -> Result<()> {
+    validate_reset_journal(journal, &journal.root)?;
+    let bytes = serde_json::to_vec_pretty(journal)
+        .map_err(|error| io_value("serialize data reset journal", error))?;
+    atomic_write(&journal.backup_dir.join("journal.json"), &bytes, 0o600)?;
+    if active_marker {
+        atomic_write(&reset_marker_path(&journal.root), &bytes, 0o600)?;
+    }
+    Ok(())
+}
+
+fn validate_reset_journal(journal: &DataResetJournal, root: &Path) -> Result<()> {
+    if journal.version != RESET_JOURNAL_VERSION || journal.root != root {
+        return Err(invalid("data reset journal version or root is invalid"));
+    }
+    let raw_id = journal
+        .id
+        .strip_prefix("reset-")
+        .ok_or_else(|| invalid("data reset journal ID prefix is invalid"))?;
+    Uuid::parse_str(raw_id).map_err(|_| invalid("data reset journal ID is invalid"))?;
+    let expected_backup = root.join("backups").join(&journal.id);
+    if journal.backup_dir != expected_backup
+        || journal.staging_root != expected_backup.join("new")
+        || journal.entries.len() != reset_relative_targets().len()
+    {
+        return Err(invalid("data reset journal paths are invalid"));
+    }
+    for (entry, relative) in journal.entries.iter().zip(reset_relative_targets()) {
+        if entry.active != root.join(&relative)
+            || entry.backup != expected_backup.join("old").join(&relative)
+            || entry.staged.as_ref() != Some(&expected_backup.join("new").join(&relative))
+        {
+            return Err(invalid("data reset journal target is invalid"));
+        }
+    }
+    if journal.applied_entries > journal.entries.len() {
+        return Err(invalid("data reset journal applied count is invalid"));
+    }
+    Ok(())
+}
+
+fn read_active_reset_journal(root: &Path) -> Result<Option<DataResetJournal>> {
+    let marker = reset_marker_path(root);
+    let metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(io_error("inspect data reset journal")(error)),
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(invalid(
+            "active data reset journal must be a private regular file",
+        ));
+    }
+    let bytes = fs::read(&marker).map_err(io_error("read data reset journal"))?;
+    let journal: DataResetJournal = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(format!("invalid data reset journal: {error}")))?;
+    validate_reset_journal(&journal, root)?;
+    Ok(Some(journal))
+}
+
+fn recover_incomplete_data_reset(root: &Path) -> Result<Option<PathBuf>> {
+    let Some(mut journal) = read_active_reset_journal(root)? else {
+        return Ok(None);
+    };
+    if journal.complete {
+        remove_reset_marker(root)?;
+        return Ok(Some(journal.backup_dir));
+    }
+    for entry in journal.entries.iter().rev() {
+        if reset_path_present(&entry.backup)? {
+            remove_any(&entry.active)?;
+            if let Some(parent) = entry.active.parent() {
+                ensure_private_directory(parent)?;
+            }
+            fs::rename(&entry.backup, &entry.active)
+                .map_err(io_error("restore data reset backup"))?;
+            sync_parent(&entry.backup)?;
+            sync_parent(&entry.active)?;
+        } else if !entry.original_present {
+            remove_any(&entry.active)?;
+        }
+    }
+    "recovered_rollback".clone_into(&mut journal.phase);
+    journal.complete = true;
+    persist_reset_journal(&journal, false)?;
+    remove_reset_marker(root)?;
+    Ok(Some(journal.backup_dir))
+}
+
+fn remove_reset_marker(root: &Path) -> Result<()> {
+    let marker = reset_marker_path(root);
+    match fs::remove_file(&marker) {
+        Ok(()) => sync_directory(
+            marker
+                .parent()
+                .ok_or_else(|| invalid("reset marker has no parent"))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error("remove data reset journal")(error)),
+    }
+}
+
+fn smoke_pristine_reset_root(root: &Path) -> Result<()> {
+    let store = GitStore::bootstrap_local(root)?;
+    let snapshot = ProjectionIndex::for_store(&store).domain_snapshot()?;
+    if !snapshot.projection.spaces.is_empty()
+        || !snapshot.projection.candidates.is_empty()
+        || !snapshot.projection.engineering_references.is_empty()
+    {
+        return Err(invariant("reset Index is not empty"));
+    }
+    let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
+    if !catalog.repositories.is_empty() {
+        return Err(invariant("reset Repository Catalog is not empty"));
+    }
+    let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
+    if !RepositoryRegistry::initialize(root.to_path_buf())?
+        .list()?
+        .is_empty()
+    {
+        return Err(invariant("reset Repository Registry is not empty"));
+    }
+    if EngineeringProjectionStore::initialize(root.to_path_buf())?
+        .read_projection()?
+        .is_some()
+    {
+        return Err(invariant("reset Engineering projection is not empty"));
+    }
+    if knowledge_has_remote(store.repository())? {
+        return Err(invariant("reset Knowledge Store retained a Git remote"));
+    }
+    Ok(())
+}
+
+fn reset_report(root: &Path, material: DataResetReportMaterial) -> DataResetReport {
+    DataResetReport {
+        root: root.to_path_buf(),
+        dry_run: material.dry_run,
+        reset_id: material.reset_id,
+        backup: material.backup,
+        repository_count_cleared: material.repository_count_cleared,
+        cleared_targets: material.cleared_targets,
+        preserved: vec![
+            root.join("bin"),
+            root.join("state/install-manifest.json"),
+            root.join("logs"),
+            root.join("backups"),
+        ],
+        remote_detached: !material.dry_run && material.had_remote,
+        remote_mutated: false,
+    }
+}
+
+fn existing_reset_targets(root: &Path) -> Vec<PathBuf> {
+    reset_relative_targets()
+        .into_iter()
+        .map(|relative| root.join(relative))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn reset_path_present(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid(format!(
+            "data reset path must not be a symlink: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect data reset path")(error)),
+    }
+}
+
+fn knowledge_has_remote(repository: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["remote"])
+        .output()
+        .map_err(external_error("inspect Knowledge Store remotes"))?;
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::External,
+            "inspect Knowledge Store remotes failed",
+        ));
+    }
+    Ok(!output.stdout.is_empty())
+}
+
+fn sync_parent(path: &Path) -> Result<()> {
+    sync_directory(
+        path.parent()
+            .ok_or_else(|| invalid("reset target has no parent"))?,
+    )
+}
+
+fn is_injected_reset_crash(error: &Error) -> bool {
+    error.kind() == ErrorKind::External && error.message().starts_with("injected reset crash after")
 }
 
 fn restore_journal(journal: &SetupJournal) -> Result<()> {
@@ -2135,6 +4497,47 @@ fn restore_journal(journal: &SetupJournal) -> Result<()> {
                 }
                 atomic_write(&snapshot.path, &bytes, *mode)?;
             }
+            Original::Directory { backup } => match fs::symlink_metadata(backup) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    remove_any(&snapshot.path)?;
+                    if let Some(parent) = snapshot.path.parent() {
+                        ensure_private_directory(parent)?;
+                    }
+                    fs::rename(backup, &snapshot.path)
+                        .map_err(io_error("restore original directory"))?;
+                    sync_parent(backup)?;
+                }
+                Ok(_) => {
+                    return Err(invariant(format!(
+                        "rollback directory backup is not a non-symlink directory: {}",
+                        backup.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match fs::symlink_metadata(&snapshot.path) {
+                        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                        }
+                        Ok(_) => {
+                            return Err(invariant(format!(
+                                "rollback directory target is not a non-symlink directory: {}",
+                                snapshot.path.display()
+                            )));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Err(invariant(format!(
+                                "rollback directory backup is missing: {}",
+                                backup.display()
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(io_error("inspect rollback directory target")(error));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(io_error("inspect rollback directory backup")(error));
+                }
+            },
         }
         if let Some(parent) = snapshot.path.parent() {
             sync_directory(parent)?;
@@ -2146,7 +4549,86 @@ fn restore_journal(journal: &SetupJournal) -> Result<()> {
     Ok(())
 }
 
+fn ensure_current_task_runtime(transaction: &mut Transaction, root: &Path) -> Result<bool> {
+    let state = root.join("state");
+    let paths = [
+        state.join("runtime.sqlite"),
+        state.join("runtime.sqlite-wal"),
+        state.join("runtime.sqlite-shm"),
+    ];
+    for path in &paths {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "Task Runtime state must be a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error("inspect Task Runtime state")(error)),
+        }
+        transaction.record(path)?;
+    }
+    let database_existed = paths[0].is_file();
+    match TaskRuntime::initialize(root.to_path_buf()) {
+        Ok(_) => Ok(!database_existed),
+        Err(error) if is_discardable_task_runtime_schema(&error) => {
+            for path in paths.iter().rev() {
+                remove_any(path)?;
+            }
+            sync_directory(&state)?;
+            let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_discardable_task_runtime_schema(error: &Error) -> bool {
+    // Matched by version prefix only, deliberately not the full message: `TaskRuntime` migrates
+    // version 13 forward in place (adding `hook_event`) rather than erroring, and the "expected
+    // N" suffix names whatever `sctx_task_runtime::TaskRuntime`'s current `SCHEMA_VERSION` is,
+    // which this crate does not otherwise depend on. Versions below 13 predate that in-place
+    // migration and have no supported upgrade path, so their databases are discarded and
+    // rebuilt from scratch instead.
+    error.kind() == ErrorKind::InvariantViolation
+        && [
+            "unsupported task runtime schema version 11;",
+            "unsupported task runtime schema version 12;",
+        ]
+        .iter()
+        .any(|prefix| error.message().starts_with(prefix))
+}
+
+fn remove_legacy_capture_state(transaction: &mut Transaction, root: &Path) -> Result<bool> {
+    let state = root.join("state");
+    let mut changed = transaction.move_directory_to_backup(&state.join("capture"))?;
+    for path in [
+        state.join("capture.lock"),
+        state.join("capture-metadata.json"),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(invalid(format!(
+                    "legacy Capture state must be a regular file: {}",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_error("inspect legacy Capture state")(error)),
+        }
+        transaction.record(&path)?;
+        remove_any(&path)?;
+        sync_directory(&state)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn mcp_smoke(root: &Path) -> Result<()> {
+    let _runtime = TaskRuntime::initialize(root.to_path_buf())?;
     for client in [ClientKind::Cursor, ClientKind::Codex] {
         let mut server = McpServer::new(root, client)?;
         let input = concat!(
@@ -2173,16 +4655,18 @@ fn mcp_smoke(root: &Path) -> Result<()> {
         if values.len() != 2
             || values.iter().any(|value| value.get("error").is_some())
             || tools.is_none_or(|tools| {
-                tools.len() != 16
+                tools.len() != 17
                     || [
                         "task_checkpoint",
                         "candidate_list",
                         "candidate_get",
                         "candidate_discard",
                         "candidate_confirm",
+                        "space_create",
                     ]
                     .iter()
                     .any(|name| !tools.iter().any(|tool| tool["name"] == *name))
+                    || tools.iter().any(|tool| tool["name"] == "task_capture_list")
             })
         {
             return Err(Error::new(
@@ -2307,6 +4791,32 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
         )),
         Err(error) => checks.push(failed("indexed_tree", error.to_string())),
     }
+    // WP-V6 fix 4: `APPEND_PROTOCOL_BYPASSED` used to reach only whichever `sctx index sync` (or
+    // automatic retrieval call) happened to trigger the rebuild that found it, as one line in that
+    // one call's own JSON -- gone the moment that process exited. It is now persisted in `meta`
+    // (`ProjectionIndex::last_rebuild_operational_warnings`), so a later `sctx doctor` sees it too.
+    match index.last_rebuild_operational_warnings() {
+        Ok(warnings) if warnings.is_empty() => checks.push(ok(
+            "append_protocol",
+            "the most recent rebuild that compared history found no bypass",
+        )),
+        Ok(warnings) => {
+            let paths = warnings
+                .iter()
+                .flat_map(|warning| warning.paths.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            checks.push(warning(
+                "append_protocol",
+                format!(
+                    "知识仓库历史出现非追加变更 (committed history was found modified outside the \
+                     append protocol): {paths}"
+                ),
+            ));
+        }
+        Err(error) => checks.push(failed("append_protocol", error.to_string())),
+    }
     match index.domain_snapshot() {
         Ok(snapshot) if snapshot.diagnostics.is_empty() => {
             checks.push(ok(
@@ -2327,12 +4837,401 @@ fn check_index(root: &Path, checks: &mut Vec<DoctorCheck>) {
         query: String::new(),
         filters: SearchFilters::default(),
         page_size: 1,
-        cursor: None,
+        ..SearchRequest::default()
     };
     match SearchEngine::new(index).search(&request) {
         Ok(_) => checks.push(ok("fts", "FTS query smoke passed")),
         Err(error) => checks.push(failed("fts", error.to_string())),
     }
+}
+
+/// Diagnoses the one failure that leaves an installation quietly without a Graph channel.
+///
+/// Engineering References live in the Knowledge Store and the Artifacts they name live in a local
+/// checkout; only a scan joins the two. An installation that has recorded References but has never
+/// produced a `graph_context_snapshot` retrieves nothing through the Graph and says nothing about
+/// it, because every Task Context Pack degrades to text and the degradation is the normal path
+/// when no Graph exists at all. So the count comparison is the check: References without Contexts
+/// is the shape of that silence, and it has one command as its fix.
+/// Names the one repair every Engineering Graph warning below points at.
+const GRAPH_REPAIR: &str = "Run `sctx association rebuild` (or `sctx doctor --fix`), and check \
+     that `[engineering] auto_scan` is not disabled.";
+
+/// What an operator has to do to repair a `[retrieval]` that is present but wrong.
+///
+/// Separate from [`RETRIEVAL_ENABLE`] because the two situations want different advice: an
+/// installation with no `[retrieval]` at all can be handed one command, while one whose configured
+/// files have gone missing has a decision to make about the paths it already chose.
+const RETRIEVAL_SETUP: &str = "Run `sctx embedding install` to download and configure both halves, \
+     or download an ONNX export (`model.onnx`, its `model.onnx_data` if the export is split, \
+     `tokenizer.json`, and `config.json` so the encoder can tell which family it loaded) plus an \
+     ONNX Runtime shared library for this platform and set `[retrieval] embedding_model_path` to \
+     the model directory and `[retrieval] embedding_runtime_path` to the library in `config.toml`.";
+
+/// What an operator has to do to turn the embedding channel on from nothing.
+const RETRIEVAL_ENABLE: &str = "run `sctx embedding install`, which downloads the \
+     codefuse-ai/F2LLM-v2-0.6B ONNX export and an ONNX Runtime library, proves the model loads, \
+     and writes `[retrieval]` for you. It needs about 2.4 GB of disk. `sctx embedding install \
+     --model bge-m3` installs the older BAAI/bge-m3 export instead, and `--model-url <BASE>` \
+     fetches whichever one from an internal mirror.";
+
+/// Reports the optional embedding recall channel (ADR-0004).
+///
+/// It never reports [`CheckStatus::Error`]. The channel is opt-in and additive: an installation
+/// without it is a healthy installation with lexical retrieval, which is what every installation
+/// had before ADR-0004. What doctor owes the operator is the difference between "off" and "on but
+/// broken", because only the second one silently costs recall they think they are paying for.
+/// Reports what the last `sctx maintain run` found, in three states.
+///
+/// Never having run maintenance is informational, not a warning: a freshly installed machine has
+/// nothing to maintain yet, and a doctor that greets every new installation with a complaint about
+/// a command it has not heard of teaches operators to ignore the warnings that matter. The warning
+/// is reserved for a run that had work to do and did not finish it -- and it stays a warning, never
+/// an error, because `healthy` is about whether this installation works, and a Knowledge Store that
+/// could not be reached last night does not stop it from working.
+fn check_logging(home: &Path, checks: &mut Vec<DoctorCheck>) {
+    const NAME: &str = "logging";
+    let process_home = env::var_os("HOME").map(PathBuf::from);
+    let logs_root = if process_home.as_deref() == Some(home) {
+        sctx_telemetry::default_logs_root().unwrap_or_else(|| home.join(".shared-context-logs"))
+    } else {
+        home.join(".shared-context-logs")
+    };
+    let status = match sctx_log_service::status(&logs_root) {
+        Ok(status) => status,
+        Err(error) => {
+            checks.push(warning(
+                NAME,
+                format!(
+                    "independent logging status is unavailable ({error}); run `sctx logs doctor --probe`"
+                ),
+            ));
+            return;
+        }
+    };
+    if !status.configured {
+        if status.config_error == Some(sctx_log_service::ErrorCode::NotConfigured) {
+            checks.push(ok(
+                NAME,
+                "Independent structured logging is not configured. Run `sctx logs init` to enable local collection.",
+            ));
+        } else {
+            checks.push(warning(
+                NAME,
+                format!(
+                    "independent logging configuration is unreadable ({:?}); run `sctx logs doctor --probe`",
+                    status.config_error
+                ),
+            ));
+        }
+        return;
+    }
+    if status.enabled == Some(false) {
+        checks.push(ok(
+            NAME,
+            format!(
+                "Independent structured logging is disabled; {} sealed batch(es) remain preserved.",
+                status.ready_batches
+            ),
+        ));
+        return;
+    }
+    let endpoint_ready = status.endpoint == sctx_log_service::ProbeStatus::Ok;
+    if !endpoint_ready || status.storage_pressure || status.last_error.is_some() {
+        checks.push(warning(
+            NAME,
+            format!(
+                "independent logging needs attention: endpoint={:?}, storage_pressure={}, ready_batches={}, last_error={}. Run `sctx logs doctor --probe`.",
+                status.endpoint,
+                status.storage_pressure,
+                status.ready_batches,
+                status.last_error.as_deref().unwrap_or("none")
+            ),
+        ));
+    } else {
+        checks.push(ok(
+            NAME,
+            format!(
+                "Independent structured logging is enabled; {} sealed batch(es) await synchronization.",
+                status.ready_batches
+            ),
+        ));
+    }
+}
+
+fn check_maintain(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    const NAME: &str = "maintain";
+    let digest = match maintain::read_digest(root) {
+        Ok(digest) => digest,
+        Err(error) => {
+            checks.push(warning(
+                NAME,
+                format!(
+                    "the last maintenance digest is unreadable, so recent maintenance cannot be \
+                     confirmed: {error}. Run `sctx maintain run` to write a fresh one."
+                ),
+            ));
+            return;
+        }
+    };
+    let last_run = maintain::read_last_run(root).ok().flatten();
+    let (Some(digest), Some(last_run)) = (digest, last_run) else {
+        checks.push(ok(
+            NAME,
+            "No maintenance run has been recorded yet. Run `sctx maintain run` on a cycle to \
+             rebuild the Engineering Graph, count Candidate Reviews awaiting a decision, and \
+             synchronize the Knowledge Store.",
+        ));
+        return;
+    };
+    let failures = digest.failed_steps();
+    if failures.is_empty() {
+        checks.push(ok(
+            NAME,
+            format!(
+                "Last run at Unix second {last_run} completed every step. {} Candidate Reviews \
+                 pending ({} expiring within a week), {} provisional Spaces.",
+                digest.counts.pending_candidate_reviews,
+                digest.counts.expiring_candidate_reviews,
+                digest.counts.provisional_spaces,
+            ),
+        ));
+        return;
+    }
+    let detail = failures
+        .iter()
+        .map(|step| {
+            format!(
+                "{}: {}{}",
+                step.name,
+                step.reason.as_deref().unwrap_or("no reason recorded"),
+                if step.needs_human {
+                    " (needs a human decision)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    checks.push(warning(
+        NAME,
+        format!("The maintenance run at Unix second {last_run} left {detail}"),
+    ));
+}
+
+fn check_retrieval(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let settings = match UserConfigStore::open_existing(root)
+        .and_then(|config| config.retrieval_settings())
+    {
+        Ok(settings) => settings,
+        Err(error) => {
+            checks.push(warning(
+                "retrieval_embedding",
+                format!("`[retrieval]` is unreadable, so the embedding channel is off: {error}"),
+            ));
+            return;
+        }
+    };
+    if settings.embedding_half_configured() {
+        checks.push(warning(
+            "retrieval_embedding",
+            format!(
+                "`[retrieval]` sets only one of `embedding_model_path` and \
+                 `embedding_runtime_path`, so the embedding channel stays off. {RETRIEVAL_SETUP}"
+            ),
+        ));
+        return;
+    }
+    let (Some(model_path), Some(runtime_path)) = (
+        settings.embedding_model_path.as_deref(),
+        settings.embedding_runtime_path.as_deref(),
+    ) else {
+        checks.push(ok(
+            "retrieval_embedding",
+            format!(
+                "Off. Retrieval is lexical only, which is the default. To add semantic recall: \
+                 {RETRIEVAL_ENABLE}"
+            ),
+        ));
+        return;
+    };
+    // Which files are required depends on the export: only the identified families pin a full
+    // list, and an unidentified directory is held to the two every export must have. Identification
+    // survives a `config.json` that itself went missing -- the graph size still names the family --
+    // which is the whole reason that file can be reported as missing rather than silently
+    // downgrading the directory to "unknown, and therefore fine".
+    let required: Vec<&str> = embedding::installed_model(model_path).map_or_else(
+        || vec!["model.onnx", "tokenizer.json"],
+        |model| model.files().iter().map(|file| file.name).collect(),
+    );
+    let mut missing = required
+        .into_iter()
+        .filter(|name| !model_path.join(name).is_file())
+        .map(|name| format!("{}/{name}", model_path.display()))
+        .collect::<Vec<_>>();
+    if !runtime_path.is_file() {
+        missing.push(runtime_path.display().to_string());
+    }
+    if !missing.is_empty() {
+        checks.push(warning(
+            "retrieval_embedding",
+            format!(
+                "`[retrieval]` is configured but these files are missing, so the embedding \
+                 channel stays off and retrieval falls back to lexical recall: {}. \
+                 {RETRIEVAL_SETUP}",
+                missing.join(", ")
+            ),
+        ));
+        return;
+    }
+    // Loading the model here would cost doctor 9--12 seconds and a gigabyte of memory to learn
+    // something the server reports on stderr anyway. Doctor checks that the files a load needs are
+    // present; the load itself belongs to `serve`.
+    checks.push(configured_retrieval_check(root, model_path, runtime_path));
+}
+
+/// Grades a `[retrieval]` whose files are all present, on what its encodes have actually cost.
+///
+/// A channel whose encodes mostly time out is configured, loaded, and useless: every automatic
+/// retrieval reports `embedding_unavailable` and answers lexically, which is indistinguishable
+/// from a healthy installation unless someone says so here. That indistinguishability is what let
+/// a budget calibrated on the wrong query length ship as working.
+fn configured_retrieval_check(root: &Path, model_path: &Path, runtime_path: &Path) -> DoctorCheck {
+    let cache = SemanticVectorCache::open(&semantic_cache_path(root));
+    let cached = cache
+        .as_ref()
+        .ok()
+        .and_then(|cache| {
+            model_fingerprint(model_path)
+                .and_then(|fingerprint| {
+                    cache.cached_revisions(&SemanticCacheKey::new(
+                        fingerprint,
+                        SEARCH_RANKING_VERSION,
+                    ))
+                })
+                .ok()
+        })
+        .map_or(0, |revisions| revisions.len());
+    // No encode-budget warning any more, and its absence is the point. That warning read a
+    // frozen history: the rows came from `similar_revisions`, ADR-0007 retired the last caller of
+    // it, and the check then kept advising operators to raise `[retrieval]
+    // embedding_encode_budget_ms` -- a key that governed nothing -- on the strength of encodes
+    // taken before the release that removed the path. The check reports what this installation
+    // holds, which is the fact that is still true.
+    // Named rather than inferred: two exports are installable and they do not share a vector
+    // space, so "which model is this" is the first thing anyone comparing two machines needs.
+    let model = embedding::installed_model(model_path).map_or_else(
+        || "unrecognized export".to_owned(),
+        |model| model.slug().to_owned(),
+    );
+    ok(
+        "retrieval_embedding",
+        format!(
+            "Configured: model {model} at {}, runtime {}, {cached} Context revision(s) embedded \
+             so far.",
+            model_path.display(),
+            runtime_path.display(),
+        ),
+    )
+}
+
+fn check_engineering_graph(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let index = ProjectionIndex::new(root.join("repository"), root.join("state"));
+    let (reference_count, indexed_tree_oid) = match index.domain_snapshot() {
+        Ok(snapshot) => (
+            snapshot.projection.engineering_references.len(),
+            snapshot.metadata.indexed_tree_oid,
+        ),
+        Err(error) => {
+            checks.push(failed("engineering_graph", error.to_string()));
+            return;
+        }
+    };
+    let graph = match EngineeringProjectionStore::initialize(root)
+        .and_then(|store| store.read_snapshot())
+    {
+        Ok(graph) => graph,
+        Err(error) => {
+            checks.push(failed(
+                "engineering_graph",
+                format!("Engineering projection is unreadable: {error}"),
+            ));
+            return;
+        }
+    };
+    let context_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.projection.contexts.len());
+    let resolved_count = graph
+        .as_ref()
+        .map_or(0, |graph| graph.projection.references.len());
+    let graph_tree_oid = graph
+        .as_ref()
+        .and_then(|graph| graph.context_tree_oid.clone());
+    let unfinished_scans = graph
+        .as_ref()
+        .map_or(0, |graph| graph.projection.incomplete_scans.len());
+
+    if reference_count == 0 {
+        checks.push(ok(
+            "engineering_graph",
+            "no Engineering Reference is recorded yet",
+        ));
+        return;
+    }
+    if context_count == 0 {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "{reference_count} Engineering References resolve against no Graph Context \
+                 snapshot; Artifact-anchored retrieval is silently unavailable. {GRAPH_REPAIR}"
+            ),
+        ));
+        return;
+    }
+    // A Graph with snapshots in it can still be behind the Store. Both symptoms below were
+    // reported as healthy by the check above while Artifact-anchored retrieval quietly missed the
+    // newest Contexts, which is the one failure mode a doctor exists to catch.
+    if graph_tree_oid.as_deref() != Some(indexed_tree_oid.as_str()) {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "the Engineering projection was built from Context Tree {} while the index is at \
+                 {indexed_tree_oid}; Confirmations since then are absent from Artifact-anchored \
+                 retrieval. {GRAPH_REPAIR}",
+                graph_tree_oid.as_deref().unwrap_or("an unrecorded Tree")
+            ),
+        ));
+        return;
+    }
+    if resolved_count < reference_count {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "{reference_count} Engineering References are recorded but only {resolved_count} \
+                 carry a resolution; the rest are invisible to Artifact-anchored retrieval. \
+                 {GRAPH_REPAIR}"
+            ),
+        ));
+        return;
+    }
+    if unfinished_scans > 0 {
+        checks.push(warning(
+            "engineering_graph",
+            format!(
+                "{unfinished_scans} Repository scans stopped before reading their whole plan, so \
+                 the Graph is authoritative only for what they reached. {GRAPH_REPAIR}"
+            ),
+        ));
+        return;
+    }
+    checks.push(ok(
+        "engineering_graph",
+        format!(
+            "{reference_count} Engineering References over {context_count} Graph Context snapshots"
+        ),
+    ));
 }
 
 fn check_repository_catalog(root: &Path, checks: &mut Vec<DoctorCheck>) {
@@ -2464,10 +5363,13 @@ fn check_global_skill(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
     }
 
     for (path, desired) in assets {
-        let name = if path.ends_with("SKILL.md") {
-            "global_skill.skill_md"
-        } else {
-            "global_skill.openai_yaml"
+        let name = match global_skill_asset_relative(&path) {
+            Some("shared-context/SKILL.md") => "global_skill.skill_md",
+            Some("shared-context/references/workflow.md") => "global_skill.workflow_reference",
+            Some("shared-context/agents/openai.yaml") => "global_skill.openai_yaml",
+            Some("sctx-review/SKILL.md") => "global_skill.review_skill_md",
+            Some("sctx-review/references/review.md") => "global_skill.review_reference",
+            _ => "global_skill.review_openai_yaml",
         };
         let Some(owned) = manifest.skills.iter().find(|owned| owned.path == path) else {
             checks.push(action_required(
@@ -2540,6 +5442,22 @@ fn check_global_skill_asset(
     }
 }
 
+/// Reports the one thing an operator cannot see from the policy file itself: whether what they
+/// wrote is what the model is actually being told.
+///
+/// Delivery is fail-open, so a broken `policy.md` costs a Session nothing and says nothing --
+/// which is exactly why it has to be said here. A degraded status is a warning, not an error: the
+/// installation is healthy, the team's wording is not being delivered.
+fn check_policy(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    let resolved = installation_policy(root);
+    let message = resolved.summary();
+    if resolved.status.is_degraded() {
+        checks.push(warning("policy", message));
+    } else {
+        checks.push(ok("policy", message));
+    }
+}
+
 fn check_configs(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
     let stable = root.join("bin/current/sctx");
     for (name, path) in [
@@ -2588,6 +5506,124 @@ fn check_configs(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
     }
 }
 
+/// Reports whether Codex will actually *run* the hooks that are registered.
+///
+/// [`check_configs`] above answers "is the hook written", which is the question that used to be
+/// mistaken for the whole story. Codex adds a second condition: it recomputes each hook's identity
+/// hash at discovery time and skips any hook whose hash does not match the `trusted_hash` stored in
+/// `config.toml`. It reports nothing when it skips one. So a stale hash is a total, silent loss of
+/// every hook -- exactly what the dev.10 install was in when a full session replay produced zero
+/// `<shared-context-active>` markers -- and an absence is the only symptom an operator can see.
+/// This check turns that absence into a sentence.
+///
+/// `ActionRequired`, not `Error`: nothing about the installation is broken, and re-running
+/// `sctx setup` re-stamps the hashes. Only hooks whose command targets the current runtime are
+/// judged, so somebody else's hooks in the same file are neither checked nor blamed.
+fn check_codex_trusted_hash(root: &Path, home: &Path, checks: &mut Vec<DoctorCheck>) {
+    const NAME: &str = "codex_trusted_hash";
+    let hooks_path = home.join(".codex/hooks.json");
+    let config_path = home.join(".codex/config.toml");
+    let stable = root.join("bin/current/sctx");
+    let report = read_json_object(&hooks_path).and_then(|hooks| {
+        let key_source = path_text(&hooks_path)?;
+        let stored = read_utf8_or_empty(&config_path)?
+            .parse::<DocumentMut>()
+            .map(|document| codex_trust::stored_trust_hashes(&document))
+            .map_err(|error| {
+                invalid(format!(
+                    "invalid Codex TOML in {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+        let mut ours = 0_usize;
+        let mut untrusted = Vec::new();
+        for handler in codex_trust::iter_hook_handlers(&hooks)? {
+            let targets_runtime = handler
+                .handler
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|command| command.contains(&stable.to_string_lossy().to_string()));
+            if !targets_runtime {
+                continue;
+            }
+            ours += 1;
+            let Some(digest) =
+                codex_trust::hook_hash(handler.event, handler.matcher, handler.handler)?
+            else {
+                continue;
+            };
+            let key = codex_trust::hook_key(
+                &key_source,
+                handler.event,
+                handler.group_index,
+                handler.handler_index,
+            )?;
+            if stored.get(&key) != Some(&digest) {
+                untrusted.push(handler.event);
+            }
+        }
+        let addressed = codex_trust::addressed_keys(&hooks, &key_source)?;
+        let dead = stored
+            .keys()
+            .filter(|key| {
+                codex_trust::key_source(key) == Some(key_source.as_str())
+                    && !addressed.contains(*key)
+            })
+            .count();
+        Ok((ours, untrusted, dead))
+    });
+    match report {
+        Ok((0, _, _)) => checks.push(ok(
+            NAME,
+            format!(
+                "{} registers no Shared Context hook, so none needs trusting",
+                hooks_path.display()
+            ),
+        )),
+        Ok((ours, untrusted, dead)) if !untrusted.is_empty() => checks.push(action_required(
+            NAME,
+            format!(
+                "{} of {ours} Shared Context hooks in {} are not trusted by {} ({}), so Codex \
+                 silently skips them{}. Run `sctx setup` (or `sctx upgrade`) to re-stamp the \
+                 trust hashes; a Codex upgrade invalidates them every time, because the hash \
+                 covers the hook command and the command carries --agent-version",
+                untrusted.len(),
+                hooks_path.display(),
+                config_path.display(),
+                untrusted.join(", "),
+                if dead == 0 {
+                    String::new()
+                } else {
+                    format!(", and {dead} stale trust keys address hooks that no longer exist")
+                },
+            ),
+        )),
+        Ok((ours, _, dead)) if dead > 0 => checks.push(warning(
+            NAME,
+            format!(
+                "all {ours} Shared Context hooks in {} are trusted, but {dead} stale trust keys \
+                 in {} still address hooks that no longer exist; `sctx setup` clears them",
+                hooks_path.display(),
+                config_path.display()
+            ),
+        )),
+        Ok((ours, _, _)) => checks.push(ok(
+            NAME,
+            format!(
+                "all {ours} Shared Context hooks in {} are trusted by {}",
+                hooks_path.display(),
+                config_path.display()
+            ),
+        )),
+        // Whatever made these unreadable is already reported by `check_configs`, which owns the
+        // parse verdict for both files; saying it twice at Error severity would double-count it.
+        Err(error) => checks.push(warning(
+            NAME,
+            format!("Codex hook trust cannot be verified: {error}"),
+        )),
+    }
+}
+
 fn hooks_available(home: &Path, agent: Agent) -> bool {
     let hooks = match agent {
         Agent::Cursor => home.join(".cursor/hooks.json"),
@@ -2615,6 +5651,98 @@ fn hooks_available(home: &Path, agent: Agent) -> bool {
         }
     }
     true
+}
+
+/// Drops the removed `[[repository_groups]]` section from an existing `config.toml`.
+///
+/// Explicit Groups were the hand-registered form of "this parent directory activates these
+/// Repositories". Activation now derives that from the registered checkouts themselves, so the
+/// section names no decision any more — and, because the Catalog document rejects unknown keys,
+/// a document that still carries it cannot be read at all. Rewriting it here is what lets an
+/// installation that used Groups keep working after the upgrade; the transaction retains the
+/// original document, and nothing else in the file is touched.
+fn migrate_repository_groups(
+    transaction: &mut Transaction,
+    root: &Path,
+    notices: &mut Vec<String>,
+) -> Result<bool> {
+    let config_path = root.join("config.toml");
+    let document = match fs::read_to_string(&config_path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(io_error("read config.toml for migration")(error)),
+    };
+    let Some(migrated) = migrate_legacy_repository_groups(&document)? else {
+        return Ok(false);
+    };
+    transaction.record(&config_path)?;
+    atomic_write(&config_path, migrated.as_bytes(), 0o600)?;
+    notices.push(
+        "repository groups are deprecated; activation is now derived from registered checkouts \
+         and their parent directories"
+            .to_owned(),
+    );
+    Ok(true)
+}
+
+/// Removes activation leases left behind by Sessions that never delivered
+/// `SessionEnd`.
+///
+/// Leases are permanently bound to their Agent Session and never expire, and
+/// Codex desktop in particular never sends `SessionEnd`, so `setup`, `upgrade`,
+/// and `doctor --fix` are the only paths that bound the record directory over a
+/// machine's lifetime. Failure is never fatal: this is disposable local
+/// authorization state, so an unreadable or busy store is silently left alone.
+fn reclaim_orphan_leases(root: &Path, notices: &mut Vec<String>) {
+    let Ok(reclaim) = AuthorizedSessionScopeStore::initialize(root)
+        .and_then(|store| store.reclaim_stale_leases(ORPHAN_LEASE_MAX_AGE))
+    else {
+        return;
+    };
+    let removed = reclaim
+        .removed_entry_keys
+        .len()
+        .saturating_add(reclaim.removed_unreadable_entry_keys.len());
+    if removed > 0 {
+        notices.push(format!(
+            "reclaimed {removed} orphaned Agent Session activation lease(s); {} remain",
+            reclaim.retained_entries
+        ));
+    }
+}
+
+/// Reports how many activation leases orphan reclamation would remove. This
+/// check never fails the installation: leases are disposable local state, and it
+/// stays read-only by skipping an installation that has no lease directory yet.
+fn check_session_scope_leases(root: &Path, checks: &mut Vec<DoctorCheck>) {
+    if !root.join("state/authorized-session-scopes").is_dir() {
+        checks.push(ok(
+            "session_scope_leases",
+            "no Agent Session activation lease has been issued on this machine",
+        ));
+        return;
+    }
+    let survey = match AuthorizedSessionScopeStore::initialize(root)
+        .and_then(|store| store.survey_stale_leases(ORPHAN_LEASE_MAX_AGE))
+    {
+        Ok(survey) => survey,
+        Err(error) => {
+            checks.push(warning("session_scope_leases", error.to_string()));
+            return;
+        }
+    };
+    let reclaimable = survey
+        .stale_entries
+        .saturating_add(survey.unreadable_entries);
+    let message = format!(
+        "{} activation lease(s); {reclaimable} reclaimable by sctx doctor --fix ({} older than 30d, {} unreadable)",
+        survey.total_entries, survey.stale_entries, survey.unreadable_entries
+    );
+    checks.push(if reclaimable == 0 {
+        ok("session_scope_leases", message)
+    } else {
+        warning("session_scope_leases", message)
+    });
 }
 
 fn ok(name: impl Into<String>, message: impl Into<String>) -> DoctorCheck {
@@ -2751,6 +5879,22 @@ const fn agent_name(agent: Agent) -> &'static str {
         Agent::Cursor => "cursor",
         Agent::Codex => "codex",
     }
+}
+
+fn normalize_agent_version_argument(value: &str) -> Option<String> {
+    value
+        .split_ascii_whitespace()
+        .find(|part| {
+            part.len() <= 64
+                && part
+                    .bytes()
+                    .next()
+                    .is_some_and(|byte| byte.is_ascii_digit())
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-'))
+        })
+        .map(str::to_owned)
 }
 
 fn path_text(path: &Path) -> Result<String> {
@@ -2932,6 +6076,10 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message)
 }
 
+fn invariant(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvariantViolation, message)
+}
+
 fn io_error(operation: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |error| Error::new(ErrorKind::Io, format!("failed to {operation}: {error}"))
 }
@@ -2953,7 +6101,7 @@ fn io_value(operation: &'static str, error: impl std::fmt::Display) -> Error {
 mod tests {
     use std::{process::Command, time::Duration};
 
-    use super::command_stdout_with_timeout;
+    use super::{command_stdout_with_timeout, normalize_agent_version_argument};
 
     #[test]
     fn agent_version_probe_has_a_hard_timeout() {
@@ -2966,5 +6114,19 @@ mod tests {
             .is_none()
         );
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn embedded_agent_version_is_one_bounded_semver_like_token() {
+        assert_eq!(
+            normalize_agent_version_argument("codex-cli 0.147.0 (build secret)"),
+            Some("0.147.0".to_owned())
+        );
+        assert_eq!(
+            normalize_agent_version_argument("Cursor 3.13.10-beta.1"),
+            Some("3.13.10-beta.1".to_owned())
+        );
+        assert!(normalize_agent_version_argument("unavailable token=secret").is_none());
+        assert!(normalize_agent_version_argument(&"1".repeat(65)).is_none());
     }
 }

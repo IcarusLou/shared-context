@@ -11,7 +11,7 @@ use sctx_event_schema::{
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionId, ReviewSummary, RevisionId,
     RevisionLifecycle, SemanticConflictOpenReason, SemanticConflictStatus, SpaceAssociationId,
     SpaceId, SubmissionId, TaskId, TaskSessionId, TopicKeyEdit, WorkEpisodeId, WorkEpisodeRef,
-    context_revision_content_hash, reduce,
+    context_revision_as_draft, context_revision_content_hash, reduce,
 };
 use serde_json::Value;
 
@@ -112,6 +112,8 @@ fn confirmation_intent(title: &str) -> IntentSnapshot {
 
 fn confirmation_content(statement: &str) -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Decision,
         topic_key: Some("confirmation/fact".to_owned()),
         statement: statement.to_owned(),
@@ -241,6 +243,7 @@ fn confirmation_fixture(new_primary: bool, withdraw_after: bool) -> Confirmation
                 context_revision_event_id: revision.event_id(),
                 space_association_event_id: association.event_id(),
                 publication_event_id: publication.event_id(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000802",
@@ -767,6 +770,43 @@ fn dangling_relation_quarantines_only_owning_revision_and_causal_children() {
             "concurrent children and merge must follow the invalid parent into quarantine"
         );
     }
+}
+
+#[test]
+fn problem_view_and_hints_project_and_stay_absent_for_legacy_revisions() {
+    let events = reducer_events("problem-view-hints.json");
+    let projection = reduce(&events);
+    let space = &projection.spaces[&space("spc_00000000-0000-4000-8000-000000000031")];
+
+    let enriched = &space.contexts[&context("ctx_00000000-0000-4000-8000-000000000301")].revisions
+        [&revision("rev_00000000-0000-4000-8000-000000000311")]
+        .revision;
+    assert_eq!(
+        enriched.problem_view.as_deref(),
+        Some("Why does the stored Context stay invisible when the question is restated?")
+    );
+    assert_eq!(
+        enriched.hints,
+        vec![
+            "SampleBottomBarManager".to_owned(),
+            "app/src/SampleEntranceAssem.kt".to_owned()
+        ]
+    );
+
+    let legacy = &space.contexts[&context("ctx_00000000-0000-4000-8000-000000000302")].revisions
+        [&revision("rev_00000000-0000-4000-8000-000000000312")]
+        .revision;
+    assert_eq!(legacy.problem_view, None);
+    assert!(legacy.hints.is_empty());
+
+    let draft = context_revision_as_draft(legacy);
+    let encoded = serde_json::to_value(&draft).unwrap();
+    assert!(encoded.get("problem_view").is_none());
+    assert!(encoded.get("hints").is_none());
+    assert_eq!(
+        context_revision_content_hash(&draft),
+        context_revision_content_hash(&context_revision_as_draft(legacy))
+    );
 }
 
 #[test]

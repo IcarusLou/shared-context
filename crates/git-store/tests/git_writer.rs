@@ -16,7 +16,7 @@ use sctx_event_schema::{
     ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, EngineeringReferenceDraft, Event,
     EventId, EvidenceSnapshotDraft, EvidenceType, IntentSnapshot, OptionalCandidateEdits,
     PublicationId, ReferenceRelation, RepoRelativePath, RepositoryId, RevisionId, SpaceId,
-    SubmissionId, TaskId, TaskSessionId, WorkEpisodeId, WorkEpisodeRef,
+    SubmissionId, TaskId, TaskSessionId, V1_JSON_SCHEMA, WorkEpisodeId, WorkEpisodeRef,
 };
 use sctx_git_store::{
     AppendRequest, CrashInjector, CrashSeam, Error, ErrorKind, GitStore, OBJECT_PENDING,
@@ -53,7 +53,7 @@ impl Fixture {
         let temporary = tempfile::tempdir().unwrap();
         let home = temporary.path().join("temporary home 中文");
         fs::create_dir(&home).unwrap();
-        let store = GitStore::initialize_for_home(&home).unwrap();
+        let store = GitStore::bootstrap_local_for_home(&home).unwrap();
         Self {
             _temporary: temporary,
             home,
@@ -106,6 +106,8 @@ fn candidate_event(submission_id: SubmissionId, statement: &str) -> Event {
             task_id: TaskId::new(),
         },
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Discovery,
             topic_key: None,
             statement: statement.to_owned(),
@@ -214,7 +216,7 @@ fn git_append_boundary_rejects_every_shared_privacy_fixture() {
 #[test]
 fn initialization_is_idempotent_and_uses_one_fixed_repository() {
     let fixture = Fixture::new();
-    let reopened = GitStore::initialize_for_home(&fixture.home).unwrap();
+    let reopened = GitStore::open_existing(fixture.home.join(".shared-context")).unwrap();
 
     assert_eq!(fixture.store.repository(), reopened.repository());
     assert_eq!(
@@ -222,12 +224,81 @@ fn initialization_is_idempotent_and_uses_one_fixed_repository() {
         fixture.home.join(".shared-context/repository")
     );
     assert_eq!(fixture.git(&["rev-list", "--count", "HEAD"]), "1");
+    assert_eq!(
+        fs::read_to_string(reopened.repository().join("schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    assert_eq!(
+        fixture.git(&["ls-files", "--", "schemas/event-v1.schema.json"]),
+        "schemas/event-v1.schema.json"
+    );
     assert!(
         fixture
             .home
             .join(".shared-context/state/writer.lock")
             .is_file()
     );
+}
+
+#[test]
+fn missing_bundled_schema_is_repaired_once_for_a_legacy_repository() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("legacy installation");
+    let config = sctx_local_state::UserConfigStore::initialize(&root).unwrap();
+    fs::create_dir_all(root.join("state/pending")).unwrap();
+    let repository = config.repository();
+    fs::create_dir_all(repository).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(repository, &["config", "user.name", "Legacy Writer"]);
+    git(
+        repository,
+        &["config", "user.email", "legacy-writer@localhost"],
+    );
+    git(
+        repository,
+        &[
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "legacy empty repository",
+        ],
+    );
+
+    let store = GitStore::open_existing(&root).unwrap();
+    assert!(store.ensure_bundled_schemas().unwrap());
+    assert!(!store.ensure_bundled_schemas().unwrap());
+    assert_eq!(git(repository, &["rev-list", "--count", "HEAD"]), "2");
+    assert_eq!(
+        fs::read_to_string(repository.join("schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    assert_eq!(git(repository, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn conflicting_committed_schema_is_rejected_without_overwrite() {
+    let fixture = Fixture::new();
+    let schema = fixture
+        .store
+        .repository()
+        .join("schemas/event-v1.schema.json");
+    fs::write(&schema, b"{\"conflicting\":true}\n").unwrap();
+    fixture.git(&["add", "--", "schemas/event-v1.schema.json"]);
+    fixture.git(&["commit", "-m", "conflicting schema fixture"]);
+    let head = fixture.git(&["rev-parse", "HEAD"]);
+
+    let error = fixture.store.ensure_bundled_schemas().unwrap_err();
+    assert!(error.message().contains("immutable contract"));
+    assert_eq!(fixture.git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(fs::read(schema).unwrap(), b"{\"conflicting\":true}\n");
 }
 
 #[test]
@@ -335,6 +406,7 @@ fn generic_append_rejects_candidate_confirmation_and_candidate_origin_associatio
                 context_revision_event_id: EventId::new(),
                 space_association_event_id: EventId::new(),
                 publication_event_id: EventId::new(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000821",
@@ -632,7 +704,7 @@ fn every_crash_seam_recovers_stable_content_with_at_most_one_semantic_commit() {
             "{seam:?}"
         );
 
-        let reopened = GitStore::initialize_for_home(&fixture.home).unwrap();
+        let reopened = GitStore::open_existing(fixture.home.join(".shared-context")).unwrap();
         reopened.recover_pending().unwrap();
         assert!(reopened.list_pending().unwrap().is_empty(), "{seam:?}");
         let matches = fixture.git(&["ls-tree", "-r", "--name-only", "HEAD", "--", "events"]);
@@ -747,6 +819,19 @@ fn recovery_rejects_missing_payload_and_a_partially_committed_batch() {
         error.message().contains("partially present in HEAD"),
         "{error}"
     );
+}
+
+#[test]
+fn open_existing_never_bootstraps_missing_repository_state() {
+    let temporary = TempDir::new().unwrap();
+    let root = temporary.path().join("missing-installation");
+    let error = GitStore::open_existing(&root).err().unwrap();
+    assert!(matches!(
+        error.kind(),
+        ErrorKind::InvalidInput | ErrorKind::InvariantViolation | ErrorKind::Io
+    ));
+    assert!(!root.join("repository").exists());
+    assert!(!root.join("config.toml").exists());
 }
 
 fn sha256(bytes: &[u8]) -> String {

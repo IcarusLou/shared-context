@@ -1,0 +1,6 @@
+interface:
+  display_name: "Shared Context Review"
+  short_description: "Review Candidates and govern Spaces after trusted activation"
+  default_prompt: "Use $sctx-review only when this session contains the trusted activation marker."
+policy:
+  allow_implicit_invocation: false

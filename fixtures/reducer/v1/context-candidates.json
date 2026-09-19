@@ -16,7 +16,7 @@
         "statement": "The current task can surface unassigned knowledge",
         "rationale": "The governing Requirement is not yet certain",
         "applicability": {
-          "domains": ["capture"],
+          "domains": ["direct-evidence"],
           "platforms": ["agent"],
           "conditions": ["during implementation"]
         },

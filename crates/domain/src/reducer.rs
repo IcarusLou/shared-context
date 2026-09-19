@@ -248,6 +248,20 @@ pub struct ContextSpaceProjection {
     pub contexts: BTreeMap<ContextId, ContextProjection>,
 }
 
+/// Whether the Space's unique current Intent head is a server-proposed boundary.
+///
+/// Conflicting, absent or unresolved heads cannot speak for a Space and return false.
+#[must_use]
+pub fn space_is_provisional(space: &ContextSpaceProjection) -> bool {
+    space.intent.heads.len() == 1
+        && space
+            .intent
+            .heads
+            .first()
+            .and_then(|revision_id| space.intent.revisions.get(revision_id))
+            .is_some_and(|revision| revision.provisional)
+}
+
 /// Projection of one unassigned Candidate creation event.
 ///
 /// Candidate projections deliberately have no Space, publication, conflict, or
@@ -1819,6 +1833,20 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             }),
             None => confirmation.causal_refs.space_created_event_id.is_none(),
         };
+        let engineering_reference_events_match = confirmation
+            .causal_refs
+            .engineering_reference_event_ids
+            .iter()
+            .all(|event_id| {
+                reference_definitions.values().any(|definitions| {
+                    definitions.len() == 1
+                        && definitions[0].event_id == *event_id
+                        && definitions[0].context_id == confirmation.result_context_id
+                        && definitions[0].revision_id == confirmation.result_revision_id
+                        && definitions[0].reference.validate().is_ok()
+                        && !invalid_event_ids.contains(event_id)
+                })
+            });
         let content_matches = candidate
             .and_then(|candidate| confirmation.edits.apply(&candidate.content).ok())
             .zip(result_revision)
@@ -1838,6 +1866,7 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
             && causal_publication_matches
             && publication_event_matches
             && created_space_matches
+            && engineering_reference_events_match
             && content_matches
             && spaces_match
         {
@@ -2247,5 +2276,188 @@ pub fn reduce(events: &[ReducerEvent]) -> DomainProjection {
         semantic_conflicts,
         quarantined_event_ids,
         diagnostics: diagnostics.into_iter().collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ContextGovernanceStatus, ContextProjection, ContextSpaceProjection, IntentProjection,
+        RevisionProjection, conflict_candidates,
+    };
+    use crate::{
+        Applicability, AutoInjectionEligibility, ContextId, ContextKind, ContextRevision,
+        ContextRevisionDraft, EvidenceSnapshotDraft, EvidenceType, PublicationId, ReviewSummary,
+        RevisionLifecycle, SpaceId,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn accepted_context(topic_key: Option<&str>, statement: &str) -> ContextProjection {
+        let revision = ContextRevision::from_draft(
+            Vec::new(),
+            ContextRevisionDraft {
+                kind: ContextKind::Decision,
+                topic_key: topic_key.map(ToOwned::to_owned),
+                problem_view: None,
+                statement: statement.to_owned(),
+                rationale: "the reducer only needs valid content".to_owned(),
+                applicability: Applicability {
+                    domains: vec!["mcp".to_owned()],
+                    platforms: Vec::new(),
+                    conditions: Vec::new(),
+                },
+                assumptions: Vec::new(),
+                recheck_when: Vec::new(),
+                hints: Vec::new(),
+                relations: Vec::new(),
+                evidence: vec![EvidenceSnapshotDraft {
+                    kind: EvidenceType::ExperimentRecord,
+                    supports: statement.to_owned(),
+                    content: serde_json::json!({"actual": "observed"}),
+                    interpretation: "the fixture holds".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let revision_id = revision.revision_id;
+        let publication_id = PublicationId::new();
+        ContextProjection {
+            context_id: ContextId::new(),
+            revisions: BTreeMap::from([(
+                revision_id,
+                RevisionProjection {
+                    revision,
+                    is_head: true,
+                    review_summary: ReviewSummary::Approved,
+                    review_event_ids: BTreeSet::new(),
+                    lifecycle: RevisionLifecycle::Accepted,
+                },
+            )]),
+            revision_heads: BTreeSet::from([revision_id]),
+            reviews: BTreeMap::new(),
+            publications: BTreeMap::new(),
+            publication_heads: BTreeSet::new(),
+            governance: ContextGovernanceStatus::Accepted {
+                publication_id,
+                revision_id,
+            },
+            auto_injection: AutoInjectionEligibility {
+                eligible: true,
+                blockers: BTreeSet::new(),
+            },
+        }
+    }
+
+    fn one_space(contexts: Vec<ContextProjection>) -> BTreeMap<SpaceId, ContextSpaceProjection> {
+        let space_id = SpaceId::new();
+        BTreeMap::from([(
+            space_id,
+            ContextSpaceProjection {
+                space_id,
+                intent: IntentProjection {
+                    revisions: BTreeMap::new(),
+                    heads: BTreeSet::new(),
+                },
+                contexts: contexts
+                    .into_iter()
+                    .map(|context| (context.context_id, context))
+                    .collect(),
+            },
+        )])
+    }
+
+    /// The duplicate detector keys on `topic_key`, so it only sees a pair once Candidate Build
+    /// derives one. Two accepted Decisions restating one fact under the same server-derived topic
+    /// are exactly the pair a reviewer has to settle.
+    #[test]
+    fn same_topic_key_and_overlapping_scope_is_one_duplicate_pair() {
+        let spaces = one_space(vec![
+            accepted_context(
+                Some("decision:text:productanchorassem"),
+                "ProductAnchorAssem returns before the live entry resolves",
+            ),
+            accepted_context(
+                Some("decision:text:productanchorassem"),
+                "ProductAnchorAssem 在直播入口解析前提前返回",
+            ),
+        ]);
+        let candidates = conflict_candidates(&spaces);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].topic_key, "decision:text:productanchorassem");
+        assert_eq!(candidates[0].participants.len(), 2);
+    }
+
+    /// The pre-derivation behaviour: an absent topic key is not a topic two Contexts share, so an
+    /// unkeyed pair stays invisible to the detector however similar the two statements are.
+    #[test]
+    fn an_absent_topic_key_never_pairs() {
+        let spaces = one_space(vec![
+            accepted_context(
+                None,
+                "ProductAnchorAssem returns before the live entry resolves",
+            ),
+            accepted_context(None, "ProductAnchorAssem 在直播入口解析前提前返回"),
+        ]);
+        assert!(conflict_candidates(&spaces).is_empty());
+    }
+    #[test]
+    fn provisional_space_requires_one_resolved_current_head() {
+        let mut space = one_space(Vec::new()).into_values().next().unwrap();
+        assert!(!super::space_is_provisional(&space), "no head");
+        let revision_id = crate::RevisionId::new();
+        space.intent.heads.insert(revision_id);
+        assert!(!super::space_is_provisional(&space), "dangling head");
+        let revision = crate::IntentRevision {
+            revision_id,
+            parent_revision_ids: Vec::new(),
+            intent: crate::IntentSnapshot {
+                title: "Proposed boundary".to_owned(),
+                problem: "a boundary needs review".to_owned(),
+                desired_outcome: "one current boundary".to_owned(),
+                in_scope: vec!["Space state".to_owned()],
+                out_of_scope: Vec::new(),
+                acceptance_conditions: vec!["a current head decides".to_owned()],
+                domain_terms: Vec::new(),
+            },
+            provisional: true,
+        };
+        space.intent.revisions.insert(revision_id, revision.clone());
+        assert!(super::space_is_provisional(&space), "unique proposed head");
+        space
+            .intent
+            .revisions
+            .get_mut(&revision_id)
+            .unwrap()
+            .provisional = false;
+        assert!(!super::space_is_provisional(&space), "unique named head");
+        let other_id = crate::RevisionId::new();
+        space.intent.revisions.insert(
+            other_id,
+            crate::IntentRevision {
+                revision_id: other_id,
+                ..revision
+            },
+        );
+        assert!(
+            !super::space_is_provisional(&space),
+            "old proposal is not current"
+        );
+        space
+            .intent
+            .revisions
+            .get_mut(&revision_id)
+            .unwrap()
+            .provisional = true;
+        space.intent.heads.insert(other_id);
+        assert!(
+            !super::space_is_provisional(&space),
+            "two proposed heads conflict"
+        );
+        space.intent.heads.clear();
+        assert!(
+            !super::space_is_provisional(&space),
+            "history alone has no current head"
+        );
     }
 }

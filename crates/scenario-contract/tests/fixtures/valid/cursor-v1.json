@@ -1,0 +1,147 @@
+{
+  "schema": "shared-context.dynamic-scenario",
+  "version": "1",
+  "name": "cursor_checkpoint_then_session_end",
+  "agent": {
+    "vendor": "cursor",
+    "version": "3.13.2",
+    "framing": "newline_delimited_json"
+  },
+  "actors": [
+    {
+      "id": "session",
+      "kind": { "type": "session" }
+    },
+    {
+      "id": "task",
+      "kind": { "type": "task", "session": "session" }
+    }
+  ],
+  "actions": [
+    {
+      "id": "session-start",
+      "actor": "session",
+      "after": [],
+      "action": {
+        "type": "hook_event",
+        "event": "sessionStart",
+        "payload": {
+          "type": "object",
+          "fields": {
+            "source": { "type": "string", "value": "startup" }
+          }
+        }
+      }
+    },
+    {
+      "id": "intent-update",
+      "actor": "task",
+      "after": ["session-start"],
+      "action": {
+        "type": "cli_json",
+        "arguments": [
+          { "type": "string", "value": "task" },
+          { "type": "string", "value": "intent-update" }
+        ]
+      }
+    },
+    {
+      "id": "checkpoint",
+      "actor": "task",
+      "after": ["intent-update"],
+      "action": {
+        "type": "mcp_request",
+        "method": "task_checkpoint",
+        "params": {
+          "type": "object",
+          "fields": {
+            "agent_kind": { "type": "string", "value": "cursor" },
+            "external_session_id": { "type": "builtin", "builtin": { "type": "actor_session_key", "actor": "session" } },
+            "claims": { "type": "array", "items": [] },
+            "unknowns": { "type": "array", "items": [] }
+          }
+        }
+      }
+    },
+    {
+      "id": "session-end",
+      "actor": "session",
+      "after": ["checkpoint"],
+      "action": {
+        "type": "hook_event",
+        "event": "sessionEnd",
+        "payload": {
+          "type": "object",
+          "fields": {
+            "reason": { "type": "string", "value": "completed" }
+          }
+        }
+      }
+    },
+    {
+      "id": "runtime-observation",
+      "actor": "task",
+      "after": ["session-end"],
+      "action": {
+        "type": "observe",
+        "source": "runtime",
+        "selector": {
+          "type": "object",
+          "fields": {
+            "entity": { "type": "string", "value": "work_episode" },
+            "identity": { "type": "variable", "name": "episode-id" }
+          }
+        }
+      }
+    }
+  ],
+  "variables": [
+    {
+      "name": "task-id",
+      "value_type": "task_id",
+      "capture": { "step": "intent-update", "pointer": "/task_id" }
+    },
+    {
+      "name": "intent-revision-id",
+      "value_type": "intent_revision_id",
+      "capture": { "step": "intent-update", "pointer": "/intent_revision_id" }
+    },
+    {
+      "name": "episode-id",
+      "value_type": "work_episode_id",
+      "capture": { "step": "checkpoint", "pointer": "/episode_id" }
+    }
+  ],
+  "faults": [],
+  "assertions": [
+    {
+      "id": "session-end-keeps-episode",
+      "invariant": {
+        "type": "session_end_does_not_close_episode",
+        "session_end": "session-end",
+        "observation": "runtime-observation",
+        "episode": "episode-id"
+      }
+    }
+  ],
+  "events": [
+    {
+      "event": "sessionStart",
+      "classification": "supported",
+      "product_action": "session_start"
+    },
+    {
+      "event": "sessionEnd",
+      "classification": "supported",
+      "product_action": "session_end"
+    },
+    {
+      "event": "beforeSubmitPrompt",
+      "classification": "observed_only"
+    },
+    {
+      "event": "beforeTabFileRead",
+      "classification": "unsupported"
+    }
+  ]
+}

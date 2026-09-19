@@ -23,12 +23,18 @@ cargo test --locked -p sctx-installer --test installer_matrix
 cargo test --locked -p sctx-cli --test cli_contract
 cargo test --locked -p sctx-cli --test milestone_one_contract
 
+# Association recall: two blocking probe sets over hand-written fixtures, with
+# asserted floors of 18/22 and 19/24. These tests are the authority for the
+# recall numbers; prose elsewhere only describes them.
+cargo test --locked -p sctx-cli --test association_probe_workflow
+cargo test --locked -p sctx-cli --test association_probe_zh_workflow
+
 # 18.1 and the end-to-end loop: the Python oracle reads Git/config directly and
 # speaks MCP itself; it never derives expected values from production output.
 cargo build --locked -p sctx-cli
 python3 tests/scripts/demo_acceptance.py --binary target/debug/sctx
 
-# arm64 execution plus arm64/x64/offline package structure (12 Node tests).
+# arm64 execution plus arm64/x64/offline package structure (16 Node tests).
 (cd npm && npm test)
 
 # Fixed 100k-row, four-query, 30-sample release benchmark with an asserted P95.

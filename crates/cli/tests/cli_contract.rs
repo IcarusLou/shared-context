@@ -9,9 +9,10 @@ use std::{
     thread,
 };
 
+use sctx_agent_adapter::{AgentKind, shared_context_activation_marker_with_policy};
 use sctx_domain::{
-    Applicability, CaptureUnknown, ContextKind, ContextRevisionDraft, Error, ErrorKind, EventId,
-    EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
+    Applicability, CandidateReviewStatus, ContextKind, ContextRevisionDraft, Error, ErrorKind,
+    EventId, EvidenceSnapshotDraft, ExternalSessionLocator, IntentSnapshot, PublicationAction,
     PublicationDraft, Result, SpaceId, SubmissionId, TaskSignalKind, WorkEpisodeId,
     WorkingIntentSnapshot,
 };
@@ -21,11 +22,13 @@ use sctx_git_store::{
     AppendRequest, CandidateSubmissionRequest, CrashInjector, CrashSeam, GitStore,
 };
 use sctx_index::ProjectionIndex;
-use sctx_local_state::UserConfigStore;
+use sctx_local_state::Policy;
+use sctx_local_state::{MaintenanceLock, UserConfigStore};
 use sctx_mcp::{
-    ExpectedRevisionId, TaskBoundary, TaskCheckpointBoundary, TaskCheckpointClaimInput,
-    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskIntentUpdateInput,
-    task_checkpoint_at_root, task_intent_update_at_root,
+    CandidateListInput, ExpectedRevisionId, TaskBoundary, TaskCheckpointClaimInput,
+    TaskCheckpointEvidenceInput, TaskCheckpointInput, TaskCheckpointUnknownInput,
+    TaskIntentUpdateInput, candidate_list_at_root, task_checkpoint_at_root,
+    task_intent_update_at_root,
 };
 use sctx_task_runtime::TaskRuntime;
 use serde_json::Value;
@@ -36,6 +39,31 @@ const EVIDENCE: &str = r#"{"kind":"experiment_record","supports":"CLI command co
 struct Harness {
     _temporary: TempDir,
     home: PathBuf,
+}
+
+#[test]
+fn business_cli_returns_typed_busy_while_exclusive_maintenance_is_active() {
+    let harness = Harness::new();
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
+    let before = git_output(store.repository(), &["rev-parse", "HEAD"]);
+    let maintenance = MaintenanceLock::open_or_create(harness.root()).unwrap();
+    let exclusive = maintenance.try_exclusive().unwrap();
+
+    let busy = harness.failure(&["repository", "list"]);
+    assert_eq!(busy["error"]["code"], "maintenance_busy");
+    assert_eq!(
+        git_output(store.repository(), &["rev-parse", "HEAD"]),
+        before
+    );
+
+    drop(exclusive);
+    let listed = harness.success(&["repository", "list"]);
+    assert!(
+        listed["data"]["repositories"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 impl Harness {
@@ -53,6 +81,7 @@ impl Harness {
         Command::new(env!("CARGO_BIN_EXE_sctx"))
             .arg("--json")
             .args(args)
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
             .env("HOME", &self.home)
             .output()
             .expect("sctx should start")
@@ -69,7 +98,10 @@ impl Harness {
         environment: &[(&str, &Path)],
     ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_sctx"));
-        command.args(args).env("HOME", &self.home);
+        command
+            .args(args)
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
+            .env("HOME", &self.home);
         for (name, value) in environment {
             command.env(name, value);
         }
@@ -90,6 +122,9 @@ impl Harness {
     }
 
     fn success(&self, args: &[&str]) -> Value {
+        if !self.repository().is_dir() {
+            GitStore::bootstrap_local(self.root()).unwrap();
+        }
         let output = self.run(args);
         assert!(
             output.status.success(),
@@ -100,6 +135,18 @@ impl Harness {
         assert!(value["tree"].as_str().is_some_and(|tree| !tree.is_empty()));
         assert!(value["generation"].as_u64().is_some());
         value
+    }
+
+    /// Runs a lifecycle command, which reports its own shape rather than the `tree`/`generation`
+    /// envelope the knowledge commands share.
+    fn success_lifecycle(&self, args: &[&str]) -> Value {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
     }
 
     fn failure(&self, args: &[&str]) -> Value {
@@ -144,6 +191,23 @@ struct Published {
     publication_id: String,
 }
 
+/// The exact Codex `PostToolUse` output of an event that had to build its own activation lease.
+///
+/// `SessionStart` is the only event that renders the marker, so a Session whose `SessionStart`
+/// never reached the Hook — or failed open — gets it re-stated on the event that self-heals the
+/// lease instead, once.
+fn self_healed_marker(agent: &str, session_id: &str) -> Value {
+    let kind = if agent == "codex" {
+        AgentKind::Codex
+    } else {
+        AgentKind::Cursor
+    };
+    serde_json::json!({"hookSpecificOutput": {
+        "hookEventName": "PostToolUse",
+        "additionalContext": shared_context_activation_marker(kind, session_id),
+    }})
+}
+
 fn create_space(harness: &Harness, title: &str) -> (String, String) {
     let value = harness.success(&[
         "space",
@@ -165,10 +229,62 @@ fn create_space(harness: &Harness, title: &str) -> (String, String) {
     )
 }
 
+/// The file every CLI fixture Context is recorded against, and the hint that reaches it.
+///
+/// ADR-0007 injects a Context because the Session touched a file it is recorded against. None of
+/// the CLI contract tests is about retrieval quality -- they are about JSON envelopes, session
+/// isolation and command wiring -- so they need the cheapest honest anchor, and the `artifact_hints`
+/// spelling is it.
+const CLI_REPOSITORY: &str = "Cli";
+const CLI_FILE: &str = "src/cli/output.rs";
+
+/// The file a fixture Context is recorded against: the one its own statement names, when it names
+/// one, and the shared default otherwise.
+///
+/// Several of these fixtures already write the path into the statement -- `"alphaquartz
+/// src/alpha_feature.rs test runner succeeded"` -- because the old retrieval matched it as text.
+/// Reading the same spelling as a coordinate keeps those tests saying what they were written to
+/// say, including the session-isolation ones, where two Contexts naming two different files must
+/// not reach each other.
+/// Records one Engineering Reference against an already-appended revision.
+fn anchor_context(harness: &Harness, context_id: &str, revision_id: &str, path: &str) {
+    GitStore::bootstrap_local(harness.root())
+        .unwrap()
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                sctx_domain::ContextId::from_str(context_id).unwrap(),
+                sctx_domain::RevisionId::from_str(revision_id).unwrap(),
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: CLI_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(path).unwrap(),
+                    },
+                    supports: "the CLI fixture anchors this Context to the output module"
+                        .to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+}
+
+fn anchored_path(statement: &str) -> String {
+    statement
+        .split_whitespace()
+        .find(|token| token.contains('/') && token.contains('.'))
+        .map_or_else(|| CLI_FILE.to_owned(), ToOwned::to_owned)
+}
+
 fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, String) {
     let event = Event::context_revision_added(
         SpaceId::from_str(space_id).unwrap(),
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Decision,
             topic_key: Some("cli/output".to_owned()),
             statement: statement.to_owned(),
@@ -193,9 +309,28 @@ fn seed_context(harness: &Harness, space_id: &str, statement: &str) -> (String, 
         } => (*context_id, revision.revision_id),
         _ => unreachable!(),
     };
-    GitStore::initialize(harness.root())
-        .unwrap()
-        .append_event(AppendRequest::event(event))
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
+    store.append_event(AppendRequest::event(event)).unwrap();
+    store
+        .append_event(AppendRequest::event(
+            Event::engineering_reference_recorded(
+                context_id,
+                revision_id,
+                sctx_domain::EngineeringReferenceDraft {
+                    repository_id: CLI_REPOSITORY.parse().unwrap(),
+                    artifact_kind: sctx_domain::ArtifactKind::File,
+                    relation: sctx_domain::ReferenceRelation::Implements,
+                    locator: sctx_domain::ArtifactLocator::File {
+                        path: sctx_domain::RepoRelativePath::new(anchored_path(statement)).unwrap(),
+                    },
+                    supports: "the CLI fixture anchors this Context to the output module"
+                        .to_owned(),
+                    limitations: vec!["synthetic fixture".to_owned()],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
         .unwrap();
     (context_id.to_string(), revision_id.to_string())
 }
@@ -206,6 +341,16 @@ struct CandidateOwner {
 }
 
 fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
+    task_owned_candidate_source(harness, session).1
+}
+
+/// Establishes one fresh `ActiveTask` for `session` and closes an unknown-only Checkpoint,
+/// returning both the Task Intent response (for CLI CAS arguments) and the resulting Candidate
+/// ownership so a caller can submit git-only Candidates and then confirm/discard them by CLI.
+fn task_owned_candidate_source(
+    harness: &Harness,
+    session: &str,
+) -> (sctx_mcp::TaskIntentUpdateResponse, CandidateOwner) {
     let task = task_intent_update_at_root(
         harness.root(),
         &TaskIntentUpdateInput {
@@ -234,22 +379,22 @@ fn closed_candidate_owner(harness: &Harness, session: &str) -> CandidateOwner {
         &TaskCheckpointInput {
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
-            expected_task_id: task.context.task_id.to_string(),
-            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
-            expected_episode_version: 0,
-            boundary: TaskCheckpointBoundary::Close,
             claims: Vec::new(),
-            unknowns: vec![CaptureUnknown {
+            unknowns: vec![TaskCheckpointUnknownInput {
                 statement: "Candidate confirmation remains outside creation".to_owned(),
                 blocking: false,
-                recheck_when: Vec::new(),
             }],
         },
     )
-    .unwrap();
-    CandidateOwner {
-        source_episode_id: closed.episode_id,
-    }
+    .unwrap()
+    .into_accepted()
+    .expect("unknown-only Checkpoint must be accepted");
+    (
+        task,
+        CandidateOwner {
+            source_episode_id: closed.episode_id,
+        },
+    )
 }
 
 fn submit_git_only_candidate(
@@ -264,13 +409,15 @@ fn submit_git_only_candidate(
         .unwrap()
         .unwrap()
         .ownership;
-    let base = GitStore::initialize(harness.root()).unwrap();
+    let base = GitStore::bootstrap_local(harness.root()).unwrap();
     let index = ProjectionIndex::for_store(&base);
     base.with_candidate_submission_index(Arc::new(index))
         .submit_candidate(CandidateSubmissionRequest {
             submission_id,
             source_episode,
             content: ContextRevisionDraft {
+                problem_view: None,
+                hints: Vec::new(),
                 kind: ContextKind::Discovery,
                 topic_key: None,
                 statement: statement.to_owned(),
@@ -314,7 +461,7 @@ fn establish_cli_task(harness: &Harness, session: &str, goal: &str, current_dire
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifact_hints: vec![],
+                artifact_hints: vec![CLI_FILE.to_owned()],
                 interface_hints: vec![],
                 open_questions: vec![],
             },
@@ -380,6 +527,19 @@ fn git_output(repository: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
+fn init_cli_repo(path: &Path) -> PathBuf {
+    fs::create_dir_all(path.join("src")).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::canonicalize(path).unwrap()
+}
+
 #[test]
 fn help_and_version_expose_the_complete_lifecycle_surface() {
     let help = Command::new(env!("CARGO_BIN_EXE_sctx"))
@@ -388,18 +548,24 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&help.stdout);
     assert!(help.status.success());
+    assert!(stdout.contains("--knowledge-store-url GIT_URL"));
     for command in [
-        "setup [--demo] [--agents cursor,codex]",
+        "setup [--demo] [--embedding] [--agents cursor,codex]",
         "demo",
         "doctor [--fix]",
         "upgrade [--agents cursor,codex]",
         "uninstall [--root PATH]",
-        "knowledge delete --confirm-path PATH",
+        "data reset [--dry-run] [--yes]",
+        "knowledge sync|delete",
+        "embedding install|status|remove",
         "space create|intent revise|list|get",
-        "candidate list|get|discard|confirm|build-closed-episode|analyze",
+        "candidate list|get|discard|confirm|stats|build-closed-episode|analyze",
+        "recall stats",
+        "context withdraw --decision-source human|agent_policy",
         "context revise|review|publish|withdraw|get",
         "semantic conflict open|resolve",
         "task context",
+        "repository add|list|doctor|rename|scan",
         "search",
         "pending list|commit|move-aside",
         "validate --staged",
@@ -417,12 +583,243 @@ fn help_and_version_expose_the_complete_lifecycle_surface() {
         .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&version.stdout),
-        format!("sctx {}\n", env!("CARGO_PKG_VERSION"))
+        format!("sctx {}\n", sctx_telemetry::VERSION)
+    );
+    // The version line carries the build it came from, not only the number every build between
+    // two version bumps shares. Tests run from this checkout, so the fingerprint is a real commit.
+    let stamped = String::from_utf8_lossy(&version.stdout);
+    let fingerprint = stamped
+        .trim_end()
+        .strip_prefix(&format!("sctx {}", env!("CARGO_PKG_VERSION")))
+        .unwrap_or_else(|| {
+            panic!("version line does not start with the package version: {stamped}")
+        })
+        .trim();
+    let commit = fingerprint
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|inner| inner.split_once(", "))
+        .unwrap_or_else(|| panic!("version line carries no `(<commit>, <state>)`: {stamped}"));
+    assert_eq!(commit.0.len(), 7, "{stamped}");
+    assert!(
+        commit.0.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{stamped}"
+    );
+    assert!(matches!(commit.1, "clean" | "dirty"), "{stamped}");
+}
+
+#[test]
+fn setup_rejects_embedded_remote_credentials_without_echoing_them() {
+    let harness = Harness::new();
+    let secret = "https://private-token@example.invalid/team/context.git";
+    let error = harness.failure(&["setup", "--knowledge-store-url", secret]);
+    assert_eq!(error["error"]["code"], "invalid_input");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("embedded credentials")
+    );
+    assert!(
+        !serde_json::to_string(&error)
+            .unwrap()
+            .contains("private-token")
+    );
+    assert!(!harness.root().join("repository").exists());
+}
+
+#[test]
+fn business_cli_never_bootstraps_a_missing_knowledge_store() {
+    let harness = Harness::new();
+    let error = harness.failure(&["space", "list"]);
+    assert!(matches!(
+        error["error"]["code"].as_str(),
+        Some("io_error" | "invalid_input" | "invariant_violation")
+    ));
+    assert!(!harness.repository().exists());
+    assert!(!harness.root().join("config.toml").exists());
+}
+
+#[test]
+fn data_reset_requires_explicit_confirmation_before_initializing_state() {
+    let harness = Harness::new();
+    let rejected = harness.failure(&["data", "reset"]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--yes")
+    );
+    assert!(!harness.root().exists());
+}
+
+#[test]
+fn embedding_remove_requires_explicit_confirmation() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["embedding", "remove"]);
+
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--yes")
     );
 }
 
 #[test]
-fn hook_capabilities_expose_version_fallback_and_codex_trust_action() {
+fn embedding_status_reports_an_unconfigured_channel_without_calling_it_broken() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let status = harness.success_lifecycle(&["embedding", "status"]);
+
+    assert_eq!(status["configured"], serde_json::Value::Bool(false));
+    assert_eq!(status["ready"], serde_json::Value::Bool(false));
+    assert_eq!(status["embedded_revisions"], 0);
+    // `--verify` was not asked for, so no 9--12 second load was attempted.
+    assert_eq!(status["loads"], serde_json::Value::Null);
+}
+
+#[test]
+fn embedding_remove_is_idempotent_on_an_installation_that_never_enabled_it() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+    let before = fs::read_to_string(harness.root().join("config.toml")).unwrap();
+
+    let removed = harness.success_lifecycle(&["embedding", "remove", "--yes"]);
+
+    assert_eq!(removed["config_cleared"], serde_json::Value::Bool(false));
+    assert_eq!(removed["removed"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        fs::read_to_string(harness.root().join("config.toml")).unwrap(),
+        before,
+        "removing a channel that was never enabled must not rewrite config.toml"
+    );
+}
+
+#[test]
+fn embedding_rejects_an_unknown_subcommand_and_a_malformed_digest() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let unknown = harness.failure(&["embedding", "reinstall"]);
+    assert_eq!(unknown["error"]["code"], "invalid_input");
+    assert!(
+        unknown["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("install, status, or remove")
+    );
+
+    // The digest is validated while the plan is built, so a typo costs nothing but the message.
+    let malformed = harness.failure(&[
+        "embedding",
+        "install",
+        "--runtime-url",
+        "file:///nonexistent.tgz",
+        "--expected-sha256",
+        "not-a-digest",
+    ]);
+    assert_eq!(malformed["error"]["code"], "invalid_input");
+    assert!(
+        malformed["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("64 hexadecimal")
+    );
+    assert!(!harness.root().join("embedding").exists());
+}
+
+#[test]
+fn an_unknown_model_is_rejected_before_anything_is_downloaded() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["embedding", "install", "--model", "f2llm"]);
+
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    let message = rejected["error"]["message"].as_str().unwrap();
+    // Both accepted values are named: the alternative is an operator learning the right spelling
+    // by downloading the wrong two gigabytes.
+    assert!(message.contains("f2llm-v2-0.6b"), "{message}");
+    assert!(message.contains("bge-m3"), "{message}");
+    assert!(
+        !harness.root().join("embedding").exists(),
+        "a rejected --model must not have created the install directory"
+    );
+}
+
+#[test]
+fn embedding_status_names_no_model_when_no_model_is_installed() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let status = harness.success_lifecycle(&["embedding", "status"]);
+
+    // Two exports are installable and they do not share a vector space, so `status` reports which
+    // one is on disk -- and reports nothing rather than the default when nothing is on disk.
+    assert_eq!(status["model"], serde_json::Value::Null);
+}
+
+#[test]
+fn embedding_help_documents_both_installable_models() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["embedding"]);
+
+    let message = rejected["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--model"), "{message}");
+    assert!(message.contains("f2llm-v2-0.6b"), "{message}");
+    assert!(message.contains("bge-m3"), "{message}");
+}
+
+#[test]
+fn upgrade_refuses_the_setup_only_embedding_flag() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let rejected = harness.failure(&["upgrade", "--embedding"]);
+
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    let message = rejected["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("--embedding applies only to setup"),
+        "{message}"
+    );
+    assert!(message.contains("sctx embedding install"), "{message}");
+}
+
+#[test]
+fn doctor_points_an_unconfigured_installation_at_the_install_command() {
+    let harness = Harness::new();
+    harness.success_lifecycle(&["setup"]);
+
+    let doctor = harness.success_lifecycle(&["doctor"]);
+
+    let check = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "retrieval_embedding")
+        .unwrap();
+    // Off is a healthy state, not a failure: lexical retrieval is the default.
+    assert_eq!(check["status"], "ok");
+    assert!(
+        check["message"]
+            .as_str()
+            .unwrap()
+            .contains("sctx embedding install"),
+        "{check:#}"
+    );
+}
+
+#[test]
+fn hook_capabilities_depend_only_on_hook_availability_and_codex_trust() {
     let harness = Harness::new();
     let output = harness.run(&[
         "hook",
@@ -452,6 +849,24 @@ fn hook_capabilities_expose_version_fallback_and_codex_trust_action() {
     let output = harness.run(&[
         "hook",
         "--agent",
+        "codex",
+        "--capabilities",
+        "--agent-version",
+        "codex-cli 0.149.1",
+        "--hook-available",
+        "true",
+        "--trust",
+        "confirmed",
+    ]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "verified_hooks");
+    assert_eq!(report["detected_version"], "codex-cli 0.149.1");
+    assert_eq!(report["fixture_profile_version"], "0.147.0");
+
+    let output = harness.run(&[
+        "hook",
+        "--agent",
         "cursor",
         "--capabilities",
         "--agent-version",
@@ -461,18 +876,50 @@ fn hook_capabilities_expose_version_fallback_and_codex_trust_action() {
     ]);
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "verified_hooks");
+    assert_eq!(report["detected_version"], "99.0.0");
+    assert_eq!(report["fixture_profile_version"], "3.13.0");
+
+    // `cursor-agent --version` reports a date-like build id that is not semver; it must still
+    // keep every Hook capability.
+    let output = harness.run(&[
+        "hook",
+        "--agent",
+        "cursor",
+        "--capabilities",
+        "--agent-version",
+        "2026.08.25-3e8eec8",
+        "--hook-available",
+        "true",
+    ]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["mode"], "verified_hooks");
+    assert_eq!(report["session_start"], true);
+    assert_eq!(report["detected_version"], "2026.08.25-3e8eec8");
+
+    let output = harness.run(&[
+        "hook",
+        "--agent",
+        "cursor",
+        "--capabilities",
+        "--agent-version",
+        "3.12.99",
+        "--hook-available",
+        "false",
+    ]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["mode"], "mcp_cli_fallback");
     assert_eq!(report["session_start"], false);
-    assert!(
-        report["diagnostic"]
-            .as_str()
-            .unwrap()
-            .contains("MCP + CLI fallback")
-    );
+    assert_eq!(report["detected_version"], "3.12.99");
+    let diagnostic = report["diagnostic"].as_str().unwrap();
+    assert!(diagnostic.contains("MCP + CLI fallback"));
+    assert!(!diagnostic.contains("version"));
 }
 
 #[test]
-fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() {
+fn disabled_session_start_and_prompt_submit_are_agent_neutral() {
     let harness = Harness::new();
     let (alpha_space_id, _) = create_space(&harness, "Alpha Hook contract");
     let alpha = approve_publish(&harness, &alpha_space_id, "alpha needle accepted context");
@@ -510,13 +957,7 @@ fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() 
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
     let response_text = serde_json::to_string(&response).unwrap();
-    assert_eq!(response.as_object().unwrap().len(), 1);
-    assert!(
-        response["systemMessage"]
-            .as_str()
-            .is_some_and(|message| message.contains("MCP and CLI"))
-    );
-    assert!(response.get("hookSpecificOutput").is_none());
+    assert_eq!(response, serde_json::json!({}));
     assert!(!response_text.contains("alpha needle accepted context"));
     assert!(!response_text.contains("beta decoy accepted context"));
     assert!(!response_text.contains("untrusted-data"));
@@ -541,16 +982,7 @@ fn session_start_and_prompt_submit_emit_capabilities_without_inferred_context() 
         String::from_utf8_lossy(&output.stderr)
     );
     let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let context = response["systemMessage"].as_str().unwrap();
-    assert!(
-        context.contains("PromptEnvelope") && context.contains("task_intent_update"),
-        "unexpected Prompt guidance: {context}"
-    );
-    assert!(!context.contains("alpha needle"));
-    assert!(!context.contains("alpha needle accepted context"));
-    assert!(!context.contains("beta decoy accepted context"));
-    assert!(!context.contains("SCTX_MUST_NOT_EXECUTE"));
-    assert!(response.get("hookSpecificOutput").is_none());
+    assert_eq!(response, serde_json::json!({}));
     assert!(
         TaskRuntime::initialize(harness.root())
             .unwrap()
@@ -570,13 +1002,13 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     approve_publish(
         &harness,
         &alpha_space_id,
-        "alphaquartz src/alpha_feature.rs AlphaContractTest succeeded",
+        "alphaquartz src/alpha_feature.rs test runner succeeded",
     );
     let (beta_space_id, _) = create_space(&harness, "betacobalt");
     approve_publish(
         &harness,
         &beta_space_id,
-        "betacobalt src/beta_feature.rs BetaContractTest succeeded",
+        "betacobalt src/beta_feature.rs test runner succeeded",
     );
 
     let workspace = harness.home.join("repo-9x7");
@@ -594,12 +1026,19 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         .status()
         .unwrap();
     assert!(git.success());
-    let configured = harness.success(&["repository", "add", "--path", workspace.to_str().unwrap()]);
+    let configured = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        workspace.to_str().unwrap(),
+    ]);
     let configured_repository_id = configured["data"]["catalog"]["repository"]["repository_id"]
         .as_str()
         .unwrap()
         .to_owned();
-    assert!(configured_repository_id.starts_with("rpo_"));
+    assert_eq!(configured_repository_id, "FE");
 
     let prompt = |session_id: &str, text: &str| {
         serde_json::json!({
@@ -625,6 +1064,17 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
+    let start = |session_id: &str, cwd: &Path| {
+        hook(&serde_json::json!({
+            "session_id": session_id,
+            "transcript_path": null,
+            "cwd": cwd,
+            "hook_event_name": "SessionStart",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "source": "startup"
+        }))
+    };
     let intent_update =
         |session_id: &str, goal: &str, expected: Option<String>| TaskIntentUpdateInput {
             agent_kind: "codex".to_owned(),
@@ -645,7 +1095,14 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
                 platforms: vec![],
                 constraints: vec![],
                 acceptance_conditions: vec![],
-                artifact_hints: vec![],
+                // Each Session names the file it is working on. That is what keeps the isolation
+                // assertion below meaningful under ADR-0007: alpha and beta reach their own
+                // Contexts because they anchor on their own files, not because their goal strings
+                // happen to differ.
+                artifact_hints: vec![format!(
+                    "src/{}_feature.rs",
+                    session_id.rsplit('-').next().unwrap_or_default()
+                )],
                 interface_hints: vec![],
                 open_questions: vec![],
             },
@@ -664,7 +1121,25 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         "tool_input": {"file_path": alpha_file},
         "tool_response": {"output": "passed"}
     }));
-    assert_eq!(before_prompt, serde_json::json!({}));
+    // No SessionStart ever reached the Hook for this Session, so this event both creates
+    // the lease and delivers the one Intent bootstrap reminder; it still creates no Task.
+    // The model-visible field carries the re-stated activation marker rather than a second copy
+    // of the reminder, because the marker says everything the reminder says *and* names the
+    // host Session id the Agent has to send back.
+    let bootstrap_reminder = "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing.";
+    assert_eq!(
+        before_prompt,
+        serde_json::json!({
+            "systemMessage": bootstrap_reminder,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": shared_context_activation_marker(
+                    AgentKind::Codex,
+                    "session-without-prompt",
+                )
+            }
+        })
+    );
     assert!(
         TaskRuntime::initialize(harness.root())
             .unwrap()
@@ -676,14 +1151,27 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         "PostToolUse without a Prompt must not invent a Task Session"
     );
 
-    let alpha_initial = hook(&prompt("session-alpha", "alphaquartz"));
-    let beta_initial = hook(&prompt("session-beta", "betacobalt"));
-    for guidance in [alpha_initial, beta_initial] {
-        let guidance = guidance["systemMessage"].as_str().unwrap();
-        assert!(guidance.contains("task_intent_update"));
-        assert!(!guidance.contains("alphaquartz"));
-        assert!(!guidance.contains("betacobalt"));
+    for (session, response) in [
+        ("session-alpha", start("session-alpha", &workspace)),
+        ("session-beta", start("session-beta", &workspace)),
+    ] {
+        assert_eq!(
+            response,
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "additionalContext":
+                    shared_context_activation_marker(AgentKind::Codex, session)
+            }})
+        );
     }
+    assert_eq!(
+        hook(&prompt("session-alpha", "alphaquartz")),
+        serde_json::json!({})
+    );
+    assert_eq!(
+        hook(&prompt("session-beta", "betacobalt")),
+        serde_json::json!({})
+    );
     let alpha_created = task_intent_update_at_root(
         harness.root(),
         &intent_update("session-alpha", "alphaquartz", None),
@@ -695,19 +1183,9 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
     )
     .unwrap();
 
-    for (session_id, tool_name, file, raw_marker) in [
-        (
-            "session-alpha",
-            "AlphaContractTest",
-            &alpha_file,
-            "RAW_ALPHA_MUST_NOT_PERSIST",
-        ),
-        (
-            "session-beta",
-            "BetaContractTest",
-            &beta_file,
-            "RAW_BETA_MUST_NOT_PERSIST",
-        ),
+    for (session_id, file, raw_marker) in [
+        ("session-alpha", &alpha_file, "RAW_ALPHA_MUST_NOT_PERSIST"),
+        ("session-beta", &beta_file, "RAW_BETA_MUST_NOT_PERSIST"),
     ] {
         let response = hook(&serde_json::json!({
             "session_id": session_id,
@@ -717,18 +1195,39 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
             "model": "gpt-5.6-sol",
             "permission_mode": "default",
             "turn_id": format!("turn-{session_id}"),
-            "tool_name": tool_name,
+            "tool_name": "Shell",
             "tool_use_id": format!("tool-{session_id}"),
             "tool_input": {
-                "file_path": file,
-                "command": raw_marker,
-                "outside": {"path": outside_file},
-                "missing": {"path": workspace.join("src/missing.rs")}
+                "working_directory": workspace,
+                "command": "cargo test",
+                "ignored_file_path": file,
+                "raw_marker": raw_marker
             },
             "tool_response": {"output": raw_marker}
         }));
         assert_eq!(response, serde_json::json!({}));
     }
+
+    assert_eq!(
+        hook(&serde_json::json!({
+            "session_id": "session-alpha",
+            "transcript_path": "/tmp/RAW_MIXED_TEST_MUST_NOT_PERSIST.jsonl",
+            "cwd": workspace,
+            "hook_event_name": "PostToolUse",
+            "model": "gpt-5.6-sol",
+            "permission_mode": "default",
+            "turn_id": "turn-session-alpha",
+            "tool_name": "DroppedContractTest",
+            "tool_use_id": "tool-mixed",
+            "tool_input": {
+                "file_path": alpha_file,
+                "outside": {"path": outside_file},
+                "missing": {"path": workspace.join("src/missing.rs")}
+            },
+            "tool_response": {"output": "RAW_MIXED_TEST_MUST_NOT_PERSIST"}
+        })),
+        serde_json::json!({})
+    );
 
     let alpha_updated = task_intent_update_at_root(
         harness.root(),
@@ -784,6 +1283,14 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         &intent_update("session-subdir", "subdirectory task", None),
     )
     .unwrap();
+    assert_eq!(
+        start("session-subdir", &workspace.join("src")),
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext":
+                shared_context_activation_marker(AgentKind::Codex, "session-subdir")
+        }})
+    );
     let subdirectory_post = hook(&serde_json::json!({
         "session_id": "session-subdir",
         "transcript_path": null,
@@ -808,12 +1315,9 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         registered.identity.repository_id
     );
     assert_eq!(after_subdirectory.locators.len(), 1);
-    for (snapshot, own_test) in [
-        (&alpha_snapshot, "AlphaContractTest succeeded"),
-        (&beta_snapshot, "BetaContractTest succeeded"),
-    ] {
+    for snapshot in [&alpha_snapshot, &beta_snapshot] {
         assert!(snapshot.task_signals.iter().any(|signal| {
-            signal.kind == TaskSignalKind::TestOutcome && signal.content == own_test
+            signal.kind == TaskSignalKind::TestOutcome && signal.content == "test runner succeeded"
         }));
         assert!(!snapshot.task_signals.iter().any(|signal| {
             signal.content.contains("outside.rs") || signal.content.contains("missing.rs")
@@ -821,6 +1325,8 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
         assert!(snapshot.task_signals.iter().all(|signal| {
             !signal.content.contains("RAW_ALPHA_MUST_NOT_PERSIST")
                 && !signal.content.contains("RAW_BETA_MUST_NOT_PERSIST")
+                && !signal.content.contains("DroppedContractTest")
+                && !signal.content.contains("RAW_MIXED_TEST_MUST_NOT_PERSIST")
         }));
     }
 }
@@ -829,7 +1335,7 @@ fn codex_dynamic_task_sessions_isolate_prompts_files_and_updated_signal_lifecycl
 #[allow(clippy::too_many_lines)]
 fn hook_catalog_mapping_never_discovers_sibling_repositories() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let siblings = harness.home.join("三个 sibling repos");
     let repositories = ["alpha", "明确 beta", "gamma"]
         .into_iter()
@@ -861,7 +1367,10 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
     let explicit = &repositories[1];
     let configured = UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(explicit))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(explicit),
+        )
         .unwrap();
     sctx_mcp::sync_repository_catalog_at_root(harness.root()).unwrap();
     let fake_bin = harness.home.join("no-git-hot-path/bin");
@@ -929,9 +1438,11 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // No SessionStart reached the Hook, so this event self-heals the lease and re-states
+        // the activation marker `SessionStart` never delivered. It still records no clue.
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            serde_json::json!({})
+            self_healed_marker("codex", session_id)
         );
     };
 
@@ -971,7 +1482,7 @@ fn hook_catalog_mapping_never_discovers_sibling_repositories() {
 #[allow(clippy::too_many_lines)]
 fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamination() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let cross = harness.home.join("workspace cross");
     let repositories = [
         cross.join("fe/search_web_monorepo"),
@@ -1008,8 +1519,15 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
         .map(|repository| fs::canonicalize(repository).unwrap())
         .collect::<Vec<_>>();
     let mut configured_ids = Vec::new();
-    for repository in &repositories[..3] {
-        let added = harness.success(&["repository", "add", "--path", repository.to_str().unwrap()]);
+    for (repository, repository_id) in repositories[..3].iter().zip(["FE", "Android", "iOS"]) {
+        let added = harness.success(&[
+            "repository",
+            "add",
+            "--repository-id",
+            repository_id,
+            "--path",
+            repository.to_str().unwrap(),
+        ]);
         configured_ids.push(
             added["data"]["catalog"]["repository"]["repository_id"]
                 .as_str()
@@ -1069,9 +1587,10 @@ fn cross_parent_workspace_maps_three_catalog_repositories_without_cross_contamin
             }),
         );
         assert!(output.status.success());
+        // The lease is created by this very event, so it also re-states the activation marker.
         assert_eq!(
             serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-            serde_json::json!({})
+            self_healed_marker("codex", &session_id)
         );
         let snapshot = TaskRuntime::initialize(harness.root())
             .unwrap()
@@ -1185,12 +1704,17 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
         "src/contract.rs",
     ]);
     assert_eq!(unconfigured["error"]["code"], "repository_not_configured");
-    let added = harness.success(&["repository", "add", "--path", repository.to_str().unwrap()]);
-    assert!(
-        added["data"]["catalog"]["repository"]["repository_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("rpo_")
+    let added = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        repository.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        added["data"]["catalog"]["repository"]["repository_id"],
+        "FE"
     );
     let listed = harness.success(&["repository", "list"]);
     assert_eq!(listed["data"]["repositories"].as_array().unwrap().len(), 1);
@@ -1252,10 +1776,10 @@ fn engineering_graph_cli_commands_scan_record_rebuild_and_explain() {
 #[test]
 fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let config_path = harness.root().join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
-    config.push_str("\n[[repositories]]\nid = \"rpo_short\"\npaths = []\n");
+    config.push_str("\n[[repositories]]\nid = \"FE/mobile\"\npaths = []\n");
     fs::write(config_path, config).unwrap();
 
     let doctor = harness.failure(&["repository", "doctor"]);
@@ -1264,9 +1788,79 @@ fn repository_doctor_rejects_invalid_catalog_identity_with_typed_error() {
         doctor["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("rpo_short")
+            .contains("FE/mobile")
     );
 }
+
+#[test]
+fn repository_add_requires_a_readable_id_and_upserts_only_the_exact_spelling() {
+    let harness = Harness::new();
+    let first = init_cli_repo(&harness.home.join("frontend-a"));
+    let worktree = init_cli_repo(&harness.home.join("frontend-b"));
+    let case_conflict = init_cli_repo(&harness.home.join("frontend-case-conflict"));
+
+    let missing = harness.failure(&["repository", "add", "--path", first.to_str().unwrap()]);
+    assert_eq!(missing["error"]["code"], "invalid_input");
+    assert!(
+        missing["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--repository-id")
+    );
+
+    let created = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        first.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        created["data"]["catalog"]["repository"]["repository_id"],
+        "FE"
+    );
+    assert_eq!(created["data"]["catalog"]["created_identity"], true);
+
+    let extended = harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        worktree.to_str().unwrap(),
+    ]);
+    assert_eq!(extended["data"]["catalog"]["created_identity"], false);
+    assert_eq!(extended["data"]["catalog"]["added_paths"], 1);
+
+    let rejected = harness.failure(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "fe",
+        "--path",
+        case_conflict.to_str().unwrap(),
+    ]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert!(
+        rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("differs only by ASCII case")
+    );
+
+    let listed = harness.success(&["repository", "list"]);
+    assert_eq!(listed["data"]["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["data"]["repositories"][0]["repository_id"], "FE");
+    assert_eq!(
+        listed["data"]["repositories"][0]["checkout_paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
@@ -1301,37 +1895,43 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
         &TaskCheckpointInput {
             agent_kind: "codex".to_owned(),
             external_session_id: session.to_owned(),
-            expected_task_id: task.context.task_id.to_string(),
-            expected_intent_revision_id: task.context.intent_revision_id.to_string(),
-            expected_episode_version: 0,
-            boundary: TaskCheckpointBoundary::Close,
             claims: vec![TaskCheckpointClaimInput {
-                context_kind_hint: Some(ContextKind::Decision),
-                topic_key_hint: Some("cli/confirmation".to_owned()),
+                context_kind: ContextKind::Decision,
                 statement: "CLI processes share one Confirmation operation".to_owned(),
                 rationale: "The Writer lock and Runtime reservation converge".to_owned(),
-                applicability: Applicability::default(),
-                assumptions: Vec::new(),
-                recheck_when: Vec::new(),
-                evidence: vec![TaskCheckpointEvidenceInput::InlineValidation {
-                    evidence: EvidenceSnapshotDraft {
-                        kind: sctx_domain::EvidenceType::ExperimentRecord,
-                        supports: "The CLI confirmation fixture passed".to_owned(),
-                        content: serde_json::json!({"actual": "passed"}),
-                        interpretation: "The Candidate is confirmable".to_owned(),
-                        limitations: Vec::new(),
-                    },
+                conditions: Vec::new(),
+                evidence: vec![TaskCheckpointEvidenceInput {
+                    evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                    summary: "The CLI confirmation fixture passed".to_owned(),
+                    limitations: Vec::new(),
                 }],
-                artifact_refs: Vec::new(),
-                related_contexts: Vec::new(),
             }],
             unknowns: Vec::new(),
         },
     )
-    .unwrap();
-    let candidate_id = closed.candidate_build.unwrap().items[0]
-        .candidate_id
-        .unwrap();
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    assert_eq!(
+        closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let candidate_id = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews[0]
+        .0
+        .candidate_id;
     let input_path = harness.home.join("candidate-confirm.json");
     fs::write(
         &input_path,
@@ -1366,6 +1966,7 @@ fn twenty_cli_processes_confirm_one_review_in_one_atomic_commit() {
                         "--input",
                         input_path.to_str().unwrap(),
                     ])
+                    .env("SCTX_SKIP_LAUNCHCTL", "1")
                     .env("HOME", home)
                     .output()
                     .unwrap()
@@ -1465,7 +2066,7 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
     assert!(first["data"]["task_id"].as_str().is_some());
     assert!(first["data"]["candidate_spaces"].as_array().is_some());
     assert!(first["data"]["candidate_spaces"].as_array().unwrap().len() <= 1);
-    assert!(first["data"]["retrieval_paths"].as_array().is_some());
+    assert!(first["data"]["items"].as_array().is_some());
     assert_eq!(
         first["data"]["task_session_id"],
         changed["data"]["task_session_id"]
@@ -1521,9 +2122,162 @@ fn task_context_cli_entry_is_locator_only_and_read_only() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn task_context_and_candidate_list_cli_entries_support_compact_detail_level() {
+    let harness = Harness::new();
+    GitStore::bootstrap_local(harness.root()).unwrap();
+    let session = "cli-compact-detail-level";
+    task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot {
+                goal: "exercise the CLI --compact flag".to_owned(),
+                current_direction: None,
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+
+    // `task context` defaults to the Rust entry point's Full detail level, matching the direct
+    // `task_context_readonly_at_root` behavior; `--compact` switches to a genuinely re-budgeted
+    // Compact payload rather than a client-side re-shaping of the Full result.
+    let full_context = harness.success(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+    ]);
+    assert_eq!(full_context["data"]["detail_level"], "full");
+    // Neither shape carries a top-level `retrieval_paths` any more: it was a flattened duplicate
+    // of what every item already holds. The explainable shape is still the one with `items`
+    // carrying their own paths.
+    assert!(full_context["data"].get("retrieval_paths").is_none());
+    assert!(full_context["data"]["items"].is_array());
+    assert!(full_context["data"]["candidate_spaces"].is_array());
+
+    let compact_context = harness.success(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--compact",
+    ]);
+    assert_eq!(compact_context["data"]["detail_level"], "compact");
+    assert!(compact_context["data"]["candidate_spaces"].is_array());
+    assert!(compact_context["data"]["items"].is_array());
+    assert_eq!(
+        compact_context["data"]["task_session_id"],
+        full_context["data"]["task_session_id"]
+    );
+
+    let rejected_compact_value = harness.failure(&[
+        "task",
+        "context",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--compact",
+        "true",
+    ]);
+    assert_eq!(rejected_compact_value["error"]["code"], "invalid_input");
+
+    // Produce one Pending Candidate so the compact/full Candidate list shapes are observably
+    // different, not merely both empty.
+    task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![TaskCheckpointClaimInput {
+                context_kind: ContextKind::Discovery,
+                statement: "The CLI --compact flag reaches candidate_list_with_detail_at_root"
+                    .to_owned(),
+                rationale: "The compact and full rows are observably different shapes".to_owned(),
+                conditions: Vec::new(),
+                evidence: vec![TaskCheckpointEvidenceInput {
+                    evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                    summary: "cli_contract.rs exercised both detail levels".to_owned(),
+                    limitations: Vec::new(),
+                }],
+            }],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+
+    let full_list = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+    ]);
+    assert_eq!(full_list["data"]["detail_level"], "full");
+    let full_row = &full_list["data"]["reviews"][0];
+    assert!(full_row["content"].is_object());
+    assert!(full_row["analysis"].is_object());
+    assert!(full_row.get("top_assessment").is_none());
+
+    let compact_list = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--compact",
+    ]);
+    assert_eq!(compact_list["data"]["detail_level"], "compact");
+    let compact_row = &compact_list["data"]["reviews"][0];
+    assert_eq!(compact_row["untrusted_data"], true);
+    assert!(compact_row.get("content").is_none());
+    assert!(compact_row.get("analysis").is_none());
+    assert_eq!(compact_row["candidate_id"], full_row["candidate_id"]);
+
+    // Leaving `--status` at its default still recovers the same Pending Candidate under a
+    // repeated `--compact` call, so the flag composes with the existing filters unchanged.
+    let compact_pending = harness.success(&[
+        "candidate",
+        "list",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        session,
+        "--status",
+        "pending",
+        "--compact",
+    ]);
+    assert_eq!(
+        compact_pending["data"]["reviews"][0]["candidate_id"],
+        compact_row["candidate_id"]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts() {
     let harness = Harness::new();
-    GitStore::initialize(harness.root()).unwrap();
+    GitStore::bootstrap_local(harness.root()).unwrap();
     let update_path = harness.home.join("task-update.json");
     fs::write(
         &update_path,
@@ -1559,28 +2313,16 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         serde_json::to_vec(&serde_json::json!({
             "agent_kind": "codex",
             "external_session_id": "cli-authoritative",
-            "expected_task_id": updated["data"]["task_id"],
-            "expected_intent_revision_id": updated["data"]["intent_revision_id"],
-            "expected_episode_version": 0,
-            "boundary": "continue",
             "claims": [{
+                "context_kind": "validation",
                 "statement": "The CLI Checkpoint completed",
                 "rationale": "The strict JSON entry called the shared MCP workflow",
-                "applicability": {"domains": ["cli"], "platforms": [], "conditions": ["checkpoint"]},
-                "assumptions": [],
-                "recheck_when": ["the CLI contract changes"],
+                "conditions": ["checkpoint"],
                 "evidence": [{
-                    "kind": "inline_validation",
-                    "evidence": {
-                        "kind": "experiment_record",
-                        "supports": "the CLI returned a Checkpoint",
-                        "content": {"command": "task.checkpoint", "actual": "success"},
-                        "interpretation": "the explicit workflow is executable",
-                        "limitations": []
-                    }
-                }],
-                "artifact_refs": [],
-                "related_contexts": []
+                    "evidence_type": "experiment_record",
+                    "summary": "the CLI returned a Checkpoint",
+                    "limitations": []
+                }]
             }],
             "unknowns": []
         }))
@@ -1594,51 +2336,12 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         checkpoint_path.to_str().unwrap(),
     ]);
     assert_eq!(checkpoint["command"], "task.checkpoint");
-    assert_eq!(checkpoint["data"]["created"], true);
+    assert_eq!(checkpoint["data"]["status"], "accepted");
+    assert_eq!(checkpoint["data"]["replayed"], false);
     assert_eq!(checkpoint["data"]["episode_version"], 1);
     assert!(text(&checkpoint, "checkpoint_id").starts_with("ckp_"));
-    let retried_checkpoint = harness.success(&[
-        "task",
-        "checkpoint",
-        "--input",
-        checkpoint_path.to_str().unwrap(),
-    ]);
-    assert_eq!(retried_checkpoint["data"]["created"], false);
-    assert_eq!(
-        retried_checkpoint["data"]["checkpoint_id"],
-        checkpoint["data"]["checkpoint_id"]
-    );
-    let close_path = harness.home.join("task-checkpoint-close.json");
-    fs::write(
-        &close_path,
-        serde_json::to_vec(&serde_json::json!({
-            "agent_kind": "codex",
-            "external_session_id": "cli-authoritative",
-            "expected_task_id": updated["data"]["task_id"],
-            "expected_intent_revision_id": updated["data"]["intent_revision_id"],
-            "expected_episode_version": 1,
-            "boundary": "close",
-            "claims": [],
-            "unknowns": [{
-                "statement": "Candidate confirmation remains separate",
-                "blocking": false,
-                "recheck_when": []
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-    let closed = harness.success(&[
-        "task",
-        "checkpoint",
-        "--input",
-        close_path.to_str().unwrap(),
-    ]);
-    assert_eq!(closed["data"]["candidate_build"]["status"], "complete");
-    assert_eq!(
-        closed["data"]["candidate_build"]["items"][0]["status"],
-        "created"
-    );
+    let closed = checkpoint;
+    assert_eq!(closed["data"]["candidate_build"]["status"], "pending");
     let episode_id = closed["data"]["episode_id"].as_str().unwrap();
     let rebuilt = harness.success(&[
         "candidate",
@@ -1651,11 +2354,8 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         rebuilt["data"]["build_id"],
         closed["data"]["candidate_build"]["build_id"]
     );
-    assert_eq!(
-        rebuilt["data"]["items"][0]["submission_id"],
-        closed["data"]["candidate_build"]["items"][0]["submission_id"]
-    );
-    let candidate_id = closed["data"]["candidate_build"]["items"][0]["candidate_id"]
+    assert_eq!(rebuilt["data"]["items"][0]["status"], "created");
+    let candidate_id = rebuilt["data"]["items"][0]["candidate_id"]
         .as_str()
         .unwrap();
     let analyzed = harness.success(&[
@@ -1785,7 +2485,10 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
     let business_repository = fs::canonicalize(business_repository).unwrap();
     UserConfigStore::initialize(harness.root())
         .unwrap()
-        .add_repository(None, std::slice::from_ref(&business_repository))
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&business_repository),
+        )
         .unwrap();
     let focus_path = harness.home.join("task-artifact-focus.json");
     fs::write(
@@ -1815,9 +2518,15 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
         focused["data"]["resolved_focus"]["locator"],
         serde_json::json!({"locator_kind": "file", "path": "src/future.rs"})
     );
+    // A Focus on a file nobody has written about returns an empty Pack that says so. It no longer
+    // says it as a Graph diagnostic, because the Pack does not read the Graph.
     assert_eq!(
-        focused["data"]["context"]["graph_diagnostics"][0]["kind"],
-        "artifact_not_reachable_in_graph"
+        focused["data"]["context"]["graph_diagnostics"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        focused["data"]["context"]["omitted"][0]["reason"],
+        "no_lane_evidence"
     );
 
     let task_session_id = updated["data"]["task_session_id"]
@@ -1867,12 +2576,51 @@ fn task_intent_update_and_signal_supersede_cli_entries_use_strict_json_contracts
 }
 
 #[test]
-fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
+fn post_tool_hook_is_bounded_and_persists_no_raw_payload_or_capture_state() {
     let harness = Harness::new();
     let (space_id, _) = create_space(&harness, "Capture contract");
     assert!(!space_id.is_empty());
     let workspace = harness.home.join("business workspace");
     fs::create_dir_all(&workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let workspace = fs::canonicalize(workspace).unwrap();
+    harness.success(&[
+        "repository",
+        "add",
+        "--repository-id",
+        "FE",
+        "--path",
+        workspace.to_str().unwrap(),
+    ]);
+    let start = serde_json::json!({
+        "conversation_id": "conv_contract",
+        "generation_id": "gen_contract",
+        "model": "claude-opus-4-7",
+        "hook_event_name": "sessionStart",
+        "cursor_version": "3.13.10",
+        "workspace_roots": [workspace],
+        "user_email": null,
+        "transcript_path": null,
+        "session_id": "conv_contract",
+        "is_background_agent": false,
+        "composer_mode": "agent"
+    });
+    let start_output = harness.run_with_input(&["hook", "--agent", "cursor"], &start);
+    assert!(start_output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&start_output.stdout).unwrap(),
+        serde_json::json!({
+            "additional_context":
+                shared_context_activation_marker(AgentKind::Cursor, "conv_contract")
+        })
+    );
     let payload = serde_json::json!({
         "conversation_id": "conv_contract",
         "generation_id": "gen_contract",
@@ -1885,11 +2633,11 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
         "tool_name": "Shell",
         "tool_input": {
             "command": "echo RAW_COMMAND_MUST_NOT_BE_CAPTURED",
-            "working_directory": harness.home.join("business workspace")
+            "working_directory": workspace
         },
         "tool_output": "RAW_OUTPUT_MUST_NOT_BE_CAPTURED",
         "tool_use_id": "tool_contract",
-        "cwd": harness.home.join("business workspace"),
+        "cwd": workspace,
         "duration": 10
     });
     let output = harness.run_with_input(&["hook", "--agent", "cursor"], &payload);
@@ -1900,18 +2648,122 @@ fn post_tool_hook_captures_a_bounded_breadcrumb_not_raw_payload() {
     );
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        serde_json::json!({})
+        serde_json::json!({
+            "additional_context": "Shared Context: no ActiveTask exists. Call task_intent_update for this substantive task before continuing."
+        })
     );
 
-    let captures = fs::read_dir(harness.root().join("state/capture"))
-        .unwrap()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(captures.len(), 1);
-    let stored = fs::read_to_string(captures[0].path()).unwrap();
-    assert!(stored.contains("tool Shell succeeded"));
-    assert!(!stored.contains("RAW_COMMAND_MUST_NOT_BE_CAPTURED"));
-    assert!(!stored.contains("RAW_OUTPUT_MUST_NOT_BE_CAPTURED"));
+    for removed in ["capture", "capture.lock", "capture-metadata.json"] {
+        assert!(!harness.root().join("state").join(removed).exists());
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn context_json_input_preserves_typed_relations() {
+    let harness = Harness::new();
+    let (space_id, _) = create_space(&harness, "CLI typed relations");
+    let (target_context_id, _) = seed_context(&harness, &space_id, "relation target");
+    let (source_context_id, source_revision_id) =
+        seed_context(&harness, &space_id, "relation source");
+    let input = harness.home.join("context-relations.json");
+    fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "decision",
+            "topic_key": "cli/typed-relation",
+            "statement": "The CLI JSON input preserves typed relations",
+            "rationale": "Manual revision input uses the same domain enum",
+            "applicability": {"domains": ["cli"], "platforms": [], "conditions": []},
+            "assumptions": [],
+            "recheck_when": ["the CLI input contract changes"],
+            "relations": [{
+                "target_context_id": target_context_id,
+                "kind": "implements",
+                "rationale": "The source implements the target decision",
+                "supports": ["Direct CLI fixture validation"]
+            }],
+            "evidence": [{
+                "kind": "experiment_record",
+                "supports": "The CLI accepted the typed relation",
+                "content": {"actual": "passed"},
+                "interpretation": "The relation reached the immutable revision",
+                "limitations": []
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let revised = harness.success(&[
+        "context",
+        "revise",
+        "--space-id",
+        &space_id,
+        "--context-id",
+        &source_context_id,
+        "--parent-revision-id",
+        &source_revision_id,
+        "--input",
+        input.to_str().unwrap(),
+    ]);
+    let revision_id = text(&revised, "revision_id");
+    let stored = harness.success(&[
+        "context",
+        "get",
+        "--space-id",
+        &space_id,
+        "--context-id",
+        &source_context_id,
+        "--revision-id",
+        revision_id,
+    ]);
+    assert_eq!(
+        stored["data"]["revision"]["relations"],
+        serde_json::json!([{
+            "target_context_id": target_context_id,
+            "kind": "implements",
+            "rationale": "The source implements the target decision",
+            "supports": ["Direct CLI fixture validation"]
+        }])
+    );
+    let before_self_edge = harness.event_count();
+    fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "kind": "decision",
+            "statement": "Self edges must not enter the journal",
+            "rationale": "The source and target Context are identical",
+            "relations": [{
+                "target_context_id": source_context_id,
+                "kind": "related_to",
+                "rationale": "This edge is intentionally invalid",
+                "supports": ["Negative CLI fixture"]
+            }],
+            "evidence": [{
+                "kind": "experiment_record",
+                "supports": "The negative fixture is explicit",
+                "content": {"actual": "rejected"},
+                "interpretation": "No invalid relation should be appended",
+                "limitations": []
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let rejected = harness.failure(&[
+        "context",
+        "revise",
+        "--space-id",
+        &space_id,
+        "--context-id",
+        &source_context_id,
+        "--parent-revision-id",
+        revision_id,
+        "--input",
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(rejected["error"]["code"], "invalid_input");
+    assert_eq!(harness.event_count(), before_self_edge);
 }
 
 #[test]
@@ -1920,6 +2772,7 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         let harness = Harness::new();
         let mut child = Command::new(env!("CARGO_BIN_EXE_sctx"))
             .args(["mcp", "serve", "--client", client])
+            .env("SCTX_SKIP_LAUNCHCTL", "1")
             .env("HOME", &harness.home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1958,7 +2811,8 @@ fn mcp_stdio_entry_serves_cursor_and_codex_without_extra_stdout() {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["result"]["protocolVersion"], "2024-11-05");
         let tools = responses[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
+        assert!(tools.iter().all(|tool| tool["name"] != "task_capture_list"));
         assert!(tools.iter().any(|tool| tool["name"] == "task_checkpoint"));
         for name in [
             "candidate_list",
@@ -2028,6 +2882,11 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
         EVIDENCE,
     ]);
     let revision_id = text(&revised, "revision_id").to_owned();
+    // A Reference belongs to the revision it was recorded on, and only the *accepted* revision
+    // anchors -- which is the rule that keeps a file from pulling a retired reading back out of the
+    // corpus. The seeded Reference is on the parent, so the revision that will be published needs
+    // its own.
+    anchor_context(&harness, &context_id, &revision_id, CLI_FILE);
     let review = harness.success(&[
         "context",
         "review",
@@ -2071,8 +2930,8 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     establish_cli_task(
         &harness,
         "accepted-context-retrieval",
-        "stable",
-        "retrieve stable accepted Context",
+        "stable output",
+        "stable output",
     );
     let pack = harness.success(&[
         "task",
@@ -2115,6 +2974,7 @@ fn lifecycle_commands_share_stable_json_tree_and_generation_envelopes() {
     harness.success(&["validate", "--staged"]);
     let human = Command::new(env!("CARGO_BIN_EXE_sctx"))
         .args(["space", "list"])
+        .env("SCTX_SKIP_LAUNCHCTL", "1")
         .env("HOME", &harness.home)
         .output()
         .unwrap();
@@ -2183,7 +3043,7 @@ fn unrelated_unknown_schema_isolated_while_target_and_head_checks_stay_closed() 
     assert_eq!(harness.head(), head_before);
     assert_eq!(harness.event_count(), events_before);
 
-    let store = GitStore::initialize(harness.root()).unwrap();
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
     let concurrent = Event::publication_changed(
         SpaceId::from_str(&space_id).unwrap(),
         published.context_id.parse().unwrap(),
@@ -2360,7 +3220,7 @@ fn pending_commit_and_move_aside_are_explicit_and_validate_staged_rejects_modifi
     let harness = Harness::new();
     create_space(&harness, "Pending baseline");
     let pending_store =
-        GitStore::initialize(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
+        GitStore::bootstrap_local(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
     let pending_event = Event::space_created(intent("Pending commit"), None)?;
     assert!(
         pending_store
@@ -2381,7 +3241,7 @@ fn pending_commit_and_move_aside_are_explicit_and_validate_staged_rejects_modifi
     );
 
     let pending_store =
-        GitStore::initialize(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
+        GitStore::bootstrap_local(harness.root())?.with_crash_injector(Arc::new(StopAfterJournal));
     let pending_event = Event::space_created(intent("Pending aside"), None)?;
     assert!(
         pending_store
@@ -2423,4 +3283,615 @@ fn intent(title: &str) -> IntentSnapshot {
         acceptance_conditions: vec!["recoverable".to_owned()],
         domain_terms: Vec::new(),
     }
+}
+
+/// WP-C2: `candidate confirm --input` accepts either a strict single `candidate_id` shape or a
+/// `candidate_ids` batch shape, and `candidate discard` repeats `--candidate-id` to route to the
+/// same batch entry point; both keep the single-Candidate CLI output shape unchanged.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn candidate_confirm_and_discard_batches_are_atomic_and_single_id_keeps_prior_shape() {
+    let harness = Harness::new();
+    let (primary_space_id, _) = create_space(&harness, "CLI Batch Candidates");
+    let session = "cli-batch-candidates";
+    let task = task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot {
+                goal: "confirm and discard several CLI Candidates".to_owned(),
+                current_direction: Some("write batch operations".to_owned()),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let expected_task_id = task.context.task_id.to_string();
+    let expected_intent_revision_id = task.context.intent_revision_id.to_string();
+    let closed = task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            claims: vec![
+                TaskCheckpointClaimInput {
+                    context_kind: ContextKind::Decision,
+                    statement: "Batch confirm keeps one atomic operation for candidate alpha"
+                        .to_owned(),
+                    rationale: "The alpha Candidate is provable independently".to_owned(),
+                    conditions: Vec::new(),
+                    evidence: vec![TaskCheckpointEvidenceInput {
+                        evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                        summary: "The alpha CLI batch fixture passed".to_owned(),
+                        limitations: Vec::new(),
+                    }],
+                },
+                TaskCheckpointClaimInput {
+                    context_kind: ContextKind::Decision,
+                    statement: "Batch confirm keeps one atomic operation for candidate beta"
+                        .to_owned(),
+                    rationale: "The beta Candidate is provable independently".to_owned(),
+                    conditions: Vec::new(),
+                    evidence: vec![TaskCheckpointEvidenceInput {
+                        evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+                        summary: "The beta CLI batch fixture passed".to_owned(),
+                        limitations: Vec::new(),
+                    }],
+                },
+            ],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    assert_eq!(
+        closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let candidate_ids = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews
+    .into_iter()
+    .map(|review| review.0.candidate_id.to_string())
+    .collect::<Vec<_>>();
+    assert_eq!(candidate_ids.len(), 2);
+
+    // Both `candidate_id` and `candidate_ids` present is a typed CLI-layer error.
+    let both_path = harness.home.join("candidate-confirm-both.json");
+    fs::write(
+        &both_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": expected_task_id,
+            "expected_intent_revision_id": expected_intent_revision_id,
+            "candidate_id": candidate_ids[0],
+            "candidate_ids": candidate_ids,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let both_failure = harness.failure(&[
+        "candidate",
+        "confirm",
+        "--input",
+        both_path.to_str().unwrap(),
+    ]);
+    assert_eq!(both_failure["error"]["code"], "invalid_input");
+
+    // Neither `candidate_id` nor `candidate_ids` present is also a typed CLI-layer error.
+    let neither_path = harness.home.join("candidate-confirm-neither.json");
+    fs::write(
+        &neither_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": expected_task_id,
+            "expected_intent_revision_id": expected_intent_revision_id,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let neither_failure = harness.failure(&[
+        "candidate",
+        "confirm",
+        "--input",
+        neither_path.to_str().unwrap(),
+    ]);
+    assert_eq!(neither_failure["error"]["code"], "invalid_input");
+
+    // A `candidate_ids` batch confirms every Candidate in one atomic operation.
+    let before = harness.event_count();
+    let confirm_path = harness.home.join("candidate-confirm-batch.json");
+    fs::write(
+        &confirm_path,
+        serde_json::to_vec(&serde_json::json!({
+            "agent_kind": "codex",
+            "external_session_id": session,
+            "expected_task_id": expected_task_id,
+            "expected_intent_revision_id": expected_intent_revision_id,
+            "candidate_ids": candidate_ids,
+            "expected_review_version": 1,
+            "primary": {"existing_space_id": primary_space_id},
+            "related_space_ids": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let confirmed = harness.success(&[
+        "candidate",
+        "confirm",
+        "--input",
+        confirm_path.to_str().unwrap(),
+    ]);
+    assert_eq!(confirmed["command"], "candidate.confirm");
+    assert_eq!(confirmed["data"]["batch"], true);
+    assert_eq!(confirmed["data"]["status"], "confirmed");
+    let confirmations = confirmed["data"]["confirmations"].as_array().unwrap();
+    assert_eq!(confirmations.len(), 2);
+    assert!(
+        confirmations
+            .iter()
+            .all(|confirmation| confirmation["created"] == true)
+    );
+    assert_eq!(
+        confirmations
+            .iter()
+            .map(|confirmation| confirmation["context_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+    // Each Candidate confirmation appends 4 events (matching the single-Candidate path
+    // exercised by `twenty_cli_processes_confirm_one_review_in_one_atomic_commit`); a batch of
+    // two therefore appends 8.
+    assert_eq!(harness.event_count(), before + 8);
+
+    // A fresh Task/session with three Checkpoint-derived Candidates feeds both a single-id
+    // discard (keeping the original non-batch CLI response shape) and a `--candidate-id`-repeated
+    // batch discard.
+    let discard_session = "cli-discard-candidates";
+    let discard_task = task_intent_update_at_root(
+        harness.root(),
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: discard_session.to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot {
+                goal: "create several CLI Candidates to discard".to_owned(),
+                current_direction: Some("record discardable Candidates".to_owned()),
+                in_scope: Vec::new(),
+                out_of_scope: Vec::new(),
+                domains: Vec::new(),
+                platforms: Vec::new(),
+                constraints: Vec::new(),
+                acceptance_conditions: Vec::new(),
+                artifact_hints: Vec::new(),
+                interface_hints: Vec::new(),
+                open_questions: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    let discard_expected_task_id = discard_task.context.task_id.to_string();
+    let discard_expected_intent_revision_id = discard_task.context.intent_revision_id.to_string();
+    let claim = |statement: &str| TaskCheckpointClaimInput {
+        context_kind: ContextKind::Decision,
+        statement: statement.to_owned(),
+        rationale: "The Candidate is provable independently".to_owned(),
+        conditions: Vec::new(),
+        evidence: vec![TaskCheckpointEvidenceInput {
+            evidence_type: sctx_domain::EvidenceType::ExperimentRecord,
+            summary: "The discard CLI fixture passed".to_owned(),
+            limitations: Vec::new(),
+        }],
+    };
+    let discard_closed = task_checkpoint_at_root(
+        harness.root(),
+        &TaskCheckpointInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: discard_session.to_owned(),
+            claims: vec![
+                claim("single discard keeps the prior CLI response shape"),
+                claim("batch discard candidate alpha statement"),
+                claim("batch discard candidate beta statement"),
+            ],
+            unknowns: Vec::new(),
+        },
+    )
+    .unwrap()
+    .into_accepted()
+    .expect("nonempty Checkpoint must be accepted");
+    assert_eq!(
+        discard_closed.candidate_build.status,
+        sctx_mcp::CandidateBuildResponseStatus::Pending
+    );
+    let discard_candidate_ids = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: discard_session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 32_768,
+        },
+    )
+    .unwrap()
+    .reviews
+    .into_iter()
+    .map(|review| review.0.candidate_id.to_string())
+    .collect::<Vec<_>>();
+    assert_eq!(discard_candidate_ids.len(), 3);
+    let single_candidate_id = &discard_candidate_ids[0];
+    let discard_alpha = &discard_candidate_ids[1];
+    let discard_beta = &discard_candidate_ids[2];
+
+    // A single owned Candidate still keeps the original non-batch CLI response shape.
+    let single_discarded = harness.success(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        discard_session,
+        "--expected-task-id",
+        &discard_expected_task_id,
+        "--expected-intent-revision-id",
+        &discard_expected_intent_revision_id,
+        "--candidate-id",
+        single_candidate_id,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "single CLI discard keeps its prior shape",
+    ]);
+    assert_eq!(single_discarded["command"], "candidate.discard");
+    assert_eq!(single_discarded["data"]["status"], "discarded");
+    assert!(single_discarded["data"].get("batch").is_none());
+    assert!(single_discarded["data"]["review"].is_object());
+
+    // A batch of `--candidate-id` flags discards the remaining owned Candidates atomically.
+    let batch_discarded = harness.success(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        discard_session,
+        "--expected-task-id",
+        &discard_expected_task_id,
+        "--expected-intent-revision-id",
+        &discard_expected_intent_revision_id,
+        "--candidate-id",
+        discard_alpha,
+        "--candidate-id",
+        discard_beta,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "batch CLI discard covers several Candidates",
+    ]);
+    assert_eq!(batch_discarded["command"], "candidate.discard");
+    assert_eq!(batch_discarded["data"]["batch"], true);
+    assert_eq!(batch_discarded["data"]["status"], "discarded");
+    let reviews = batch_discarded["data"]["reviews"].as_array().unwrap();
+    assert_eq!(reviews.len(), 2);
+    assert!(
+        reviews
+            .iter()
+            .all(|review| review["review_status"] == "discarded")
+    );
+    assert_eq!(
+        reviews
+            .iter()
+            .map(|review| review["candidate_id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([discard_alpha.as_str(), discard_beta.as_str()])
+    );
+
+    // `--candidate-id` without a value is still a typed parse-layer error.
+    let missing_candidate = harness.failure(&[
+        "candidate",
+        "discard",
+        "--agent-kind",
+        "codex",
+        "--external-session-id",
+        discard_session,
+        "--expected-task-id",
+        &discard_expected_task_id,
+        "--expected-intent-revision-id",
+        &discard_expected_intent_revision_id,
+        "--expected-review-version",
+        "1",
+        "--reason",
+        "missing candidate id",
+    ]);
+    assert_eq!(missing_candidate["error"]["code"], "invalid_input");
+}
+
+fn with_provisional_intent(event: Event) -> Event {
+    let mut value = serde_json::to_value(event).unwrap();
+    value["intent_revision"]["provisional"] = Value::Bool(true);
+    sctx_event_schema::parse_event(&serde_json::to_vec(&value).unwrap())
+        .unwrap()
+        .known()
+        .expect("provisional fixture is a valid event")
+        .clone()
+}
+
+fn listed_provisional_flags(spaces: &Value) -> std::collections::BTreeMap<String, bool> {
+    spaces
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|space| {
+            (
+                space["space_id"].as_str().unwrap().to_owned(),
+                space["provisional"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn provisional_space_state_agrees_across_domain_index_mcp_and_cli() {
+    let harness = Harness::new();
+    let store = GitStore::bootstrap_local(harness.root()).unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for (title, proposed, conflicted) in [
+        ("Proposed boundary", true, false),
+        ("Named boundary", false, false),
+        ("Conflicting proposals", true, true),
+    ] {
+        let event = Event::space_created(intent(title), None).unwrap();
+        let event = if proposed {
+            with_provisional_intent(event)
+        } else {
+            event
+        };
+        let (space_id, parent) = match event.payload() {
+            EventPayload::SpaceCreated {
+                space_id,
+                intent_revision,
+            } => (*space_id, intent_revision.revision_id),
+            _ => unreachable!("space.created fixture"),
+        };
+        store.append_event(AppendRequest::event(event)).unwrap();
+        if conflicted {
+            for branch in ["First proposal", "Second proposal"] {
+                let revision =
+                    Event::intent_revision_added(space_id, vec![parent], intent(branch), None)
+                        .unwrap();
+                store
+                    .append_event(AppendRequest::event(with_provisional_intent(revision)))
+                    .unwrap();
+            }
+        }
+        expected.insert(space_id.to_string(), proposed && !conflicted);
+    }
+    let index = ProjectionIndex::for_store(&store);
+    let snapshot = index.domain_snapshot().unwrap();
+    let domain_flags = snapshot
+        .projection
+        .spaces
+        .values()
+        .map(|space| {
+            (
+                space.space_id.to_string(),
+                sctx_domain::space_is_provisional(space),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(domain_flags, expected);
+    let connection = rusqlite::Connection::open_with_flags(
+        index.database_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let indexed_flags = connection
+        .prepare("SELECT space_id, provisional FROM space_projection")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()
+        .unwrap();
+    assert_eq!(indexed_flags, expected);
+    let cli = harness.success(&["space", "list"]);
+    assert_eq!(listed_provisional_flags(&cli["data"]["spaces"]), expected);
+    assert_eq!(cli["tree"], snapshot.metadata.indexed_tree_oid);
+
+    let config = UserConfigStore::open_existing(harness.root()).unwrap();
+    let checkout = fs::canonicalize(store.repository()).unwrap();
+    config
+        .add_repository(
+            sctx_domain::RepositoryId::new(),
+            std::slice::from_ref(&checkout),
+        )
+        .unwrap();
+    let session = "provisional-consistency";
+    sctx_local_state::AuthorizedSessionScopeStore::initialize(harness.root())
+        .unwrap()
+        .try_authorize_missing(
+            &ExternalSessionLocator::new("codex", session).unwrap(),
+            &config.repository_catalog().unwrap(),
+            &checkout,
+        )
+        .unwrap();
+    establish_cli_task(
+        &harness,
+        session,
+        "Read provisional boundaries",
+        "Compare current flags",
+    );
+    let candidates = candidate_list_at_root(
+        harness.root(),
+        &CandidateListInput {
+            scope: sctx_domain::CandidateReviewScope::Task,
+            agent_kind: "codex".to_owned(),
+            external_session_id: session.to_owned(),
+            status: CandidateReviewStatus::Pending,
+            limit: 10,
+            cursor: None,
+            token_budget: 4096,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        candidates
+            .provisional_space_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>(),
+        expected
+            .iter()
+            .filter(|(_, value)| **value)
+            .map(|(id, _)| id.clone())
+            .collect()
+    );
+
+    let input = format!(
+        "{}\n{}\n",
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"protocolVersion":"2024-11-05"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"space_list","arguments":{
+                "agent_kind":"codex","external_session_id":session}}}),
+    );
+    let mut output = Vec::new();
+    sctx_mcp::McpServer::new(harness.root(), sctx_mcp::ClientKind::Codex)
+        .unwrap()
+        .serve(&mut std::io::Cursor::new(input.into_bytes()), &mut output)
+        .unwrap();
+    let responses = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses[1]["result"]["isError"], false);
+    let mcp = &responses[1]["result"]["structuredContent"];
+    assert_eq!(listed_provisional_flags(&mcp["spaces"]), expected);
+    assert_eq!(mcp["conflicts"], 1);
+    assert_eq!(mcp["indexed_tree_oid"], snapshot.metadata.indexed_tree_oid);
+}
+
+#[test]
+fn recall_stats_has_a_runtime_only_envelope_and_never_initializes_missing_state() {
+    let harness = Harness::new();
+    let root = harness.home.join(".shared-context");
+    let output = harness.run(&["recall", "stats"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response.as_object().unwrap().len(), 2);
+    assert_eq!(response["command"], "recall.stats");
+    assert_eq!(response["data"]["runtime_available"], false);
+    assert_eq!(response["data"]["totals"]["injections"], 0);
+    assert!(response["data"]["totals"]["coverage_percent"].is_null());
+    assert!(!root.exists());
+    assert!(
+        !harness
+            .run(&["recall", "stats", "--write"])
+            .status
+            .success()
+    );
+    assert!(!root.exists());
+}
+
+#[test]
+fn recall_stats_reads_existing_runtime_without_index_or_sidecar_writes() {
+    let harness = Harness::new();
+    let root = harness.home.join(".shared-context");
+    let runtime = TaskRuntime::initialize(&root).unwrap();
+    let locator = ExternalSessionLocator::new("codex", "readonly-recall").unwrap();
+    let task = runtime
+        .open_or_create(
+            locator.clone(),
+            sctx_domain::TaskId::new(),
+            serde_json::from_value(serde_json::json!({"goal": "recall metric fixture"})).unwrap(),
+            Vec::new(),
+        )
+        .unwrap()
+        .snapshot;
+    runtime
+        .record_task_injections_at(
+            task.task_id,
+            task.current_intent_revision().unwrap().revision_id,
+            sctx_task_runtime::ContextInjectionSource::TaskContext,
+            &[sctx_task_runtime::InjectedContext {
+                context_id: sctx_domain::ContextId::new(),
+                revision_id: sctx_domain::RevisionId::new(),
+            }],
+            10,
+        )
+        .unwrap();
+    runtime.record_session_close_usage_at(&locator, 20).unwrap();
+    let before = fs::read(runtime.database_path()).unwrap();
+    let output = harness.run(&["recall", "stats"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["data"]["totals"]["injections"], 1);
+    assert_eq!(response["data"]["totals"]["coverage_percent"], 100.0);
+    assert_eq!(
+        response["data"]["totals"]["outcomes"]["session_close"]["ignored"],
+        1
+    );
+    assert_eq!(response["data"]["totals"]["strong_samples"], 0);
+    assert!(response["data"]["totals"]["strong_reuse_rate_percent"].is_null());
+    assert_eq!(fs::read(runtime.database_path()).unwrap(), before);
+    assert_eq!(fs::read_dir(root.join("state")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+}
+
+/// The activation marker exactly as this installation renders it.
+///
+/// Protocol text plus the built-in team `## session` policy, which is what an installation with
+/// no `policy.md` -- every temporary root in this file -- actually delivers.
+fn shared_context_activation_marker(agent: AgentKind, external_session_id: &str) -> String {
+    shared_context_activation_marker_with_policy(
+        agent,
+        external_session_id,
+        Policy::compiled_default().session(),
+    )
 }

@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     path::{Path, PathBuf},
@@ -6,14 +7,58 @@ use std::{
     sync::Arc,
 };
 
-use sctx_engineering_graph::RepositoryRegistry;
-use sctx_installer::{
-    Agent, Architecture, CheckStatus, Host, InstallContext, Installer, SetupOptions, SetupStage,
-    SkillStatus,
+use rusqlite::Connection;
+use sctx_domain::{
+    Applicability, ArtifactKind, ArtifactLocator, ContextId, ContextKind, ContextRevisionDraft,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, PublicationAction,
+    PublicationDraft, ReferenceRelation, RepoRelativePath, ReviewDraft, ReviewVerdict, RevisionId,
+    TaskId, WorkingIntentSnapshot,
 };
-use sctx_local_state::UserConfigStore;
+use sctx_engineering_graph::{EngineeringProjectionStore, RepositoryRegistry};
+use sctx_event_schema::{Event, IntentSnapshot, V1_JSON_SCHEMA};
+use sctx_git_store::{AppendRequest, GitStore, TextObject};
+use sctx_index::{IncrementalFallback, ProjectionIndex};
+use sctx_installer::{
+    Agent, Architecture, CheckStatus, DataResetOptions, Host, InstallContext, Installer,
+    KnowledgeRemoteType, KnowledgeStoreUrl, ResetStage, SetupOptions, SetupStage, SkillStatus,
+    launchd::launch_agent_path,
+    maintain::{MaintainDigest, MaintainMode, MaintainOptions, MaintainOutcome, MaintainStep},
+};
+use sctx_local_state::{MaintenanceLock, PrivacyScanner, UserConfigStore};
+use sctx_mcp::{
+    ArtifactFocusQuery, ArtifactFocusQueryCoordinates, AssociationExplainInput,
+    AssociationRebuildInput, EngineeringReferenceRecordInput, ExpectedRevisionId,
+    RepositoryScanInput, TaskBoundary, TaskIntentUpdateInput, association_explain_at_root,
+    association_rebuild_at_root, engineering_reference_record_at_root, repository_scan_at_root,
+    task_artifact_focus_at_root, task_intent_update_at_root,
+};
+use sctx_search::TaskRetrievalPath;
+use sctx_task_runtime::TaskRuntime;
 use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
+
+const KNOWLEDGE_SYNC_PUSH_ATTEMPTS_FOR_TEST: usize = 3;
+
+#[derive(serde::Deserialize)]
+struct TeamSharingOracle {
+    schema: String,
+    version: u32,
+    repository_id: String,
+    relative_path: String,
+    source: String,
+    context_statement: String,
+    context_topic: String,
+    base_branch: String,
+    work_branch_prefix: String,
+}
+
+fn team_sharing_oracle() -> TeamSharingOracle {
+    let raw = include_str!("../../../fixtures/team-sharing/team-sharing-v1.json");
+    assert!(PrivacyScanner::default().scan(raw).unwrap().is_clean());
+    assert!(!raw.to_ascii_lowercase().contains("/users/"));
+    assert!(!raw.contains(".codex/") && !raw.contains(".cursor/"));
+    serde_json::from_str(raw).unwrap()
+}
 
 #[derive(Clone)]
 struct FakeHost {
@@ -22,6 +67,8 @@ struct FakeHost {
     git_ok: bool,
     signature_ok: bool,
     space: u64,
+    cursor_version: Option<&'static str>,
+    codex_version: Option<&'static str>,
 }
 
 impl Default for FakeHost {
@@ -32,6 +79,8 @@ impl Default for FakeHost {
             git_ok: true,
             signature_ok: true,
             space: u64::MAX,
+            cursor_version: Some("3.13.10"),
+            codex_version: Some("0.147.0"),
         }
     }
 }
@@ -72,13 +121,11 @@ impl Host for FakeHost {
     }
 
     fn agent_version(&self, agent: Agent) -> Option<String> {
-        Some(
-            match agent {
-                Agent::Cursor => "3.13.10",
-                Agent::Codex => "0.147.0",
-            }
-            .to_owned(),
-        )
+        match agent {
+            Agent::Cursor => self.cursor_version,
+            Agent::Codex => self.codex_version,
+        }
+        .map(str::to_owned)
     }
 }
 
@@ -117,6 +164,10 @@ impl Harness {
 
     fn skill_root(&self) -> PathBuf {
         self.home.join(".agents/skills/shared-context")
+    }
+
+    fn review_skill_root(&self) -> PathBuf {
+        self.home.join(".agents/skills/sctx-review")
     }
 
     fn seed_configs(&self) -> Vec<(PathBuf, Vec<u8>, u32)> {
@@ -172,6 +223,174 @@ impl Harness {
     }
 }
 
+fn runtime_database(root: &Path) -> PathBuf {
+    root.join("state/runtime.sqlite")
+}
+
+fn runtime_files(root: &Path) -> [PathBuf; 3] {
+    let database = runtime_database(root);
+    [
+        database.clone(),
+        database.with_extension("sqlite-wal"),
+        database.with_extension("sqlite-shm"),
+    ]
+}
+
+fn mark_runtime_as_legacy_schema(root: &Path, version: u32, with_operation: bool) {
+    assert!(matches!(version, 11 | 12));
+    let connection = Connection::open(runtime_database(root)).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+            CREATE TABLE IF NOT EXISTS capture_ingestion (
+                capture_id TEXT PRIMARY KEY,
+                episode_id TEXT NOT NULL,
+                observation_id TEXT NOT NULL UNIQUE,
+                task_session_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                FOREIGN KEY (observation_id, episode_id)
+                    REFERENCES work_observation (observation_id, episode_id),
+                FOREIGN KEY (episode_id, task_session_id, task_id)
+                    REFERENCES work_episode (episode_id, task_session_id, task_id)
+            ) STRICT;
+            CREATE TABLE IF NOT EXISTS work_episode_diagnostic (
+                episode_id TEXT NOT NULL,
+                diagnostic_ordinal INTEGER NOT NULL CHECK (diagnostic_ordinal >= 0),
+                capture_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN (
+                    'capture_repository_not_configured',
+                    'capture_unsafe_artifact_path'
+                )),
+                PRIMARY KEY (episode_id, diagnostic_ordinal),
+                UNIQUE (episode_id, capture_id, kind),
+                FOREIGN KEY (episode_id) REFERENCES work_episode (episode_id)
+            ) STRICT;",
+        )
+        .unwrap();
+    if with_operation {
+        connection
+            .execute_batch(
+                "INSERT INTO checkpoint_operation (
+                    operation_key, operation_id, semantic_json, task_session_id, task_id,
+                    intent_revision_id, checkpoint_id, episode_id, build_id
+                ) VALUES (
+                    'legacy-operation-key', 'cop_00000000-0000-4000-8000-000000000001', '{}',
+                    'tss_00000000-0000-4000-8000-000000000002',
+                    'tsk_00000000-0000-4000-8000-000000000003',
+                    'tir_00000000-0000-4000-8000-000000000004',
+                    'ckp_00000000-0000-4000-8000-000000000005',
+                    'wep_00000000-0000-4000-8000-000000000006',
+                    'bld_00000000-0000-4000-8000-000000000007'
+                );",
+            )
+            .unwrap();
+    } else {
+        connection
+            .execute_batch("DROP TABLE checkpoint_operation;")
+            .unwrap();
+    }
+    connection
+        .pragma_update(None, "user_version", version)
+        .unwrap();
+    let stored_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    assert_eq!(stored_version, i64::from(version));
+    assert_eq!(
+        sqlite_table_exists(&connection, "checkpoint_operation"),
+        with_operation
+    );
+    assert!(sqlite_table_exists(&connection, "capture_ingestion"));
+    assert!(sqlite_table_exists(&connection, "work_episode_diagnostic"));
+    if with_operation {
+        assert_eq!(runtime_operation_count(&connection), 1);
+    }
+}
+
+fn mark_runtime_as_schema_12(root: &Path) {
+    mark_runtime_as_legacy_schema(root, 12, true);
+}
+
+fn set_runtime_schema_version(root: &Path, version: u32) {
+    let connection = Connection::open(runtime_database(root)).unwrap();
+    connection
+        .pragma_update(None, "user_version", version)
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        i64::from(version)
+    );
+}
+
+fn sqlite_table_exists(connection: &Connection, name: &str) -> bool {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+}
+
+fn runtime_operation_count(connection: &Connection) -> i64 {
+    connection
+        .query_row("SELECT COUNT(*) FROM checkpoint_operation", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn assert_runtime_schema_current(root: &Path) {
+    let connection = Connection::open(runtime_database(root)).unwrap();
+    let version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .unwrap();
+    // 22 is the current schema version: 13 through 21 all gained in-place migrations (additive
+    // `hook_event`, the `context_usage` reset, the omission-only reset, additive disposition
+    // provenance, checkpoint-reminder counters, audit columns, the derivation record, the pending
+    // Prompt table and the latest-exposure column) rather than becoming discardable/unsupported
+    // versions, so a fresh or rebuilt Runtime always lands on 22.
+    assert_eq!(version, 22);
+    assert!(sqlite_table_exists(&connection, "auto_confirm_rejection"));
+    assert!(sqlite_table_exists(&connection, "task_signal"));
+    assert!(sqlite_table_exists(&connection, "hook_event"));
+    assert!(!sqlite_table_exists(&connection, "capture_ingestion"));
+    assert!(!sqlite_table_exists(&connection, "work_episode_diagnostic"));
+    assert_eq!(runtime_operation_count(&connection), 0);
+}
+
+fn seed_runtime_task(root: &Path, session_id: &str) -> ExternalSessionLocator {
+    let locator = ExternalSessionLocator::new("codex", session_id).unwrap();
+    TaskRuntime::initialize(root)
+        .unwrap()
+        .open_or_create(
+            locator.clone(),
+            TaskId::new(),
+            WorkingIntentSnapshot::new("Retain the compatible Runtime task").unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+    locator
+}
+
+fn legacy_capture_paths(root: &Path) -> [PathBuf; 3] {
+    [
+        root.join("state/capture"),
+        root.join("state/capture.lock"),
+        root.join("state/capture-metadata.json"),
+    ]
+}
+
+fn seed_legacy_capture_state(root: &Path) {
+    let [directory, lock, metadata] = legacy_capture_paths(root);
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("cap-legacy.json"), b"legacy capture").unwrap();
+    fs::write(lock, b"legacy lock").unwrap();
+    fs::write(metadata, b"legacy metadata").unwrap();
+}
+
 fn hook_count(path: &Path, events: &[&str]) -> usize {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     events
@@ -194,6 +413,27 @@ fn replace_owned_skill_bytes(path: &Path, bytes: &[u8], manifest_path: &Path) {
     fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
 }
 
+fn remove_owned_skill(path: &Path, manifest_path: &Path) {
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    manifest["skills"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|owned| owned["path"] != path.to_string_lossy().as_ref());
+    fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+fn manifest_skill_paths(manifest_path: &Path) -> Vec<PathBuf> {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).unwrap()).unwrap();
+    manifest["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|owned| PathBuf::from(owned["path"].as_str().unwrap()))
+        .collect()
+}
+
 fn init_catalog_repo(path: &Path) -> PathBuf {
     fs::create_dir_all(path).unwrap();
     assert!(
@@ -207,7 +447,375 @@ fn init_catalog_repo(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap()
 }
 
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+struct RemoteFixture {
+    repository: PathBuf,
+    remote: PathBuf,
+}
+
+fn remote_fixture(harness: &Harness, name: &str) -> RemoteFixture {
+    let seed_root = harness.home.join(format!("{name}-seed-installation"));
+    let store = GitStore::bootstrap_local(&seed_root).unwrap();
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "Remote setup fixture".to_owned(),
+            problem: "A second installation needs governed team knowledge".to_owned(),
+            desired_outcome: "The remote Event and object validate before activation".to_owned(),
+            in_scope: vec!["remote bootstrap".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["projection rebuild succeeds".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    store
+        .append_event(
+            AppendRequest::event(event).with_object(TextObject::new("remote evidence object")),
+        )
+        .unwrap();
+    let repository = store.repository().to_path_buf();
+    let remote = harness.home.join(format!("{name}-knowledge.git"));
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(
+        &repository,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repository, &["push", "origin", "main"]);
+    git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    RemoteFixture { repository, remote }
+}
+
+fn remote_setup_options(remote: &Path) -> SetupOptions {
+    SetupOptions {
+        knowledge_store_url: Some(
+            remote
+                .to_str()
+                .unwrap()
+                .parse::<KnowledgeStoreUrl>()
+                .unwrap(),
+        ),
+        ..SetupOptions::default()
+    }
+}
+
+fn append_space(store: &GitStore, title: &str) -> String {
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: title.to_owned(),
+            problem: format!("{title} needs shared knowledge"),
+            desired_outcome: format!("{title} is synchronized"),
+            in_scope: vec!["knowledge sync".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["the Event is present".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    store
+        .append_event(AppendRequest::event(event))
+        .unwrap()
+        .commit_oid
+}
+
+fn clone_work_store(root: &Path, remote: &Path, branch: &str) -> GitStore {
+    let config = UserConfigStore::initialize(root).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["clone", "--quiet", "--branch", branch, "--"])
+            .arg(remote)
+            .arg(config.repository())
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::create_dir_all(root.join("state/pending")).unwrap();
+    git(
+        config.repository(),
+        &["config", "user.name", "Sync Race Writer"],
+    );
+    git(
+        config.repository(),
+        &["config", "user.email", "sync-race@localhost"],
+    );
+    GitStore::open_existing(root).unwrap()
+}
+
+fn install_remote_hook(remote: &Path, script: &str) -> PathBuf {
+    let hook = remote.join("hooks/pre-receive");
+    fs::write(&hook, script).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    hook
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn commit_event_variant(repository: &Path, event: &Event, pretty: bool) -> String {
+    let event_id = event.event_id().to_string();
+    let uuid = event_id.strip_prefix("evt_").unwrap();
+    let relative = format!("events/{}/{event_id}.json", &uuid[..2]);
+    let path = repository.join(&relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let bytes = if pretty {
+        serde_json::to_vec_pretty(event).unwrap()
+    } else {
+        serde_json::to_vec(event).unwrap()
+    };
+    fs::write(path, bytes).unwrap();
+    git(repository, &["add", "--", &relative]);
+    git(repository, &["commit", "-m", "add sync conflict fixture"]);
+    git(repository, &["rev-parse", "HEAD"])
+}
+
+fn init_team_checkout(path: &Path, oracle: &TeamSharingOracle) -> PathBuf {
+    fs::create_dir_all(path).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .arg(path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(path, &["config", "user.name", "Team Sharing Fixture"]);
+    git(path, &["config", "user.email", "team-sharing@localhost"]);
+    let file = path.join(&oracle.relative_path);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(&file, &oracle.source).unwrap();
+    git(path, &["add", "--", &oracle.relative_path]);
+    git(path, &["commit", "--quiet", "-m", "team sharing fixture"]);
+    fs::canonicalize(path).unwrap()
+}
+
+fn append_accepted_team_context(
+    root: &Path,
+    oracle: &TeamSharingOracle,
+) -> (ContextId, RevisionId) {
+    let store = GitStore::open_existing(root).unwrap();
+    let space = Event::space_created(
+        IntentSnapshot {
+            title: "Team Shared FE Contract".to_owned(),
+            problem: "Independent FE installations need the same governed fact".to_owned(),
+            desired_outcome: "Both installations retrieve one accepted Context".to_owned(),
+            in_scope: vec![oracle.relative_path.clone()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["B resolves the A-authored reference".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned(), "RepositoryId".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let space_id = match space.payload() {
+        sctx_event_schema::EventPayload::SpaceCreated { space_id, .. } => *space_id,
+        _ => unreachable!(),
+    };
+    store.append_event(AppendRequest::event(space)).unwrap();
+    let revision = Event::context_revision_added(
+        space_id,
+        ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
+            kind: ContextKind::Contract,
+            topic_key: Some(oracle.context_topic.clone()),
+            statement: oracle.context_statement.clone(),
+            rationale: "A fixed tracked FE artifact proves the cross-install contract".to_owned(),
+            applicability: Applicability {
+                domains: vec!["team-sharing".to_owned()],
+                platforms: vec!["FE".to_owned()],
+                conditions: vec!["shared KnowledgeStore".to_owned()],
+            },
+            assumptions: Vec::new(),
+            recheck_when: vec!["sharedSearch implementation changes".to_owned()],
+            relations: Vec::new(),
+            evidence: vec![EvidenceSnapshotDraft {
+                kind: EvidenceType::ExperimentRecord,
+                supports: "Both checkouts contain the fixed tracked artifact".to_owned(),
+                content: serde_json::json!({
+                    "oracle": "shared-context.team-sharing-oracle",
+                    "relative_path": oracle.relative_path,
+                    "result": "tracked"
+                }),
+                interpretation: "RepositoryId plus locator is portable across checkout paths"
+                    .to_owned(),
+                limitations: vec!["Synthetic two-installation fixture".to_owned()],
+            }],
+        },
+        None,
+    )
+    .unwrap();
+    let (context_id, revision_id) = match revision.payload() {
+        sctx_event_schema::EventPayload::ContextRevisionAdded {
+            context_id,
+            revision,
+            ..
+        } => (*context_id, revision.revision_id),
+        _ => unreachable!(),
+    };
+    store.append_event(AppendRequest::event(revision)).unwrap();
+    let review = Event::context_reviewed(
+        space_id,
+        context_id,
+        ReviewDraft {
+            revision_id,
+            verdict: ReviewVerdict::Approve,
+            reason: "Fixed cross-install evidence is complete".to_owned(),
+        },
+        None,
+    )
+    .unwrap();
+    let review_event_id = review.event_id();
+    store.append_event(AppendRequest::event(review)).unwrap();
+    store
+        .append_event(AppendRequest::event(
+            Event::publication_changed(
+                space_id,
+                context_id,
+                PublicationDraft {
+                    previous_publication_ids: Vec::new(),
+                    action: PublicationAction::Publish,
+                    revision_id,
+                    review_event_ids: vec![review_event_id],
+                },
+                None,
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    (context_id, revision_id)
+}
+
+struct SeededResetState {
+    preserved: Vec<(PathBuf, Vec<u8>)>,
+    remote: PathBuf,
+    remote_head: String,
+}
+
+fn seed_reset_state(harness: &Harness) -> SeededResetState {
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let catalog_root = harness.home.join("team repositories");
+    let fe = init_catalog_repo(&catalog_root.join("fe"));
+    let android = init_catalog_repo(&catalog_root.join("android"));
+    let config = UserConfigStore::open_existing(&harness.root).unwrap();
+    let fe_id: sctx_domain::RepositoryId = "FE".parse().unwrap();
+    let android_id: sctx_domain::RepositoryId = "Android".parse().unwrap();
+    config
+        .add_repository(fe_id.clone(), std::slice::from_ref(&fe))
+        .unwrap();
+    config
+        .add_repository(android_id.clone(), std::slice::from_ref(&android))
+        .unwrap();
+
+    let repository = harness.root.join("repository");
+    git(
+        &repository,
+        &["commit", "--allow-empty", "-m", "seed reset knowledge"],
+    );
+    let remote = harness.home.join("knowledge-remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    git(
+        &repository,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repository, &["push", "-u", "origin", "main"]);
+    let remote_head = git(&remote, &["rev-parse", "refs/heads/main"]);
+
+    for database in [
+        "index.sqlite",
+        "engineering.sqlite",
+        "repository-registry.sqlite",
+    ] {
+        fs::write(
+            harness.root.join("state").join(database),
+            format!("seeded-{database}"),
+        )
+        .unwrap();
+    }
+    for sidecar in runtime_files(&harness.root).into_iter().skip(1) {
+        fs::write(&sidecar, format!("seeded-{}", sidecar.display())).unwrap();
+    }
+    seed_legacy_capture_state(&harness.root);
+    for (directory, file) in [
+        ("pending", "batch.json"),
+        ("pending-aside", "aside.json"),
+        ("authorized-session-scopes", "scope.json"),
+    ] {
+        let directory = harness.root.join("state").join(directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join(file),
+            format!("seeded-{}", directory.display()),
+        )
+        .unwrap();
+    }
+    fs::write(
+        harness.root.join("logs/reset-sentinel.log"),
+        "preserve logs",
+    )
+    .unwrap();
+
+    let preserved_paths = [
+        harness.root.join("bin/current/sctx"),
+        harness.root.join("state/install-manifest.json"),
+        harness.root.join("logs/reset-sentinel.log"),
+        harness.home.join(".cursor/mcp.json"),
+        harness.home.join(".cursor/hooks.json"),
+        harness.home.join(".codex/config.toml"),
+        harness.home.join(".codex/hooks.json"),
+        harness.skill_root().join("SKILL.md"),
+        harness.skill_root().join("references/workflow.md"),
+        harness.skill_root().join("agents/openai.yaml"),
+        harness.review_skill_root().join("SKILL.md"),
+        harness.review_skill_root().join("references/review.md"),
+        harness.review_skill_root().join("agents/openai.yaml"),
+    ];
+    let preserved = preserved_paths
+        .into_iter()
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    SeededResetState {
+        preserved,
+        remote,
+        remote_head,
+    }
+}
+
 #[test]
+#[allow(clippy::too_many_lines)]
 fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
     let harness = Harness::new();
     harness.seed_configs();
@@ -230,6 +838,47 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         fs::read(harness.skill_root().join("agents/openai.yaml")).unwrap(),
         include_bytes!("../../../skills/shared-context/agents/openai.yaml")
     );
+    assert_eq!(
+        fs::read(harness.skill_root().join("references/workflow.md")).unwrap(),
+        include_bytes!("../../../skills/shared-context/references/workflow.md")
+    );
+    assert_eq!(
+        fs::read(harness.review_skill_root().join("SKILL.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/SKILL.md")
+    );
+    assert_eq!(
+        fs::read(harness.review_skill_root().join("agents/openai.yaml")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/agents/openai.yaml")
+    );
+    assert_eq!(
+        fs::read(harness.review_skill_root().join("references/review.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/references/review.md")
+    );
+    for asset in [
+        harness.skill_root().join("SKILL.md"),
+        harness.skill_root().join("references/workflow.md"),
+        harness.skill_root().join("agents/openai.yaml"),
+        harness.review_skill_root().join("SKILL.md"),
+        harness.review_skill_root().join("references/review.md"),
+        harness.review_skill_root().join("agents/openai.yaml"),
+    ] {
+        assert_eq!(
+            fs::metadata(asset).unwrap().permissions().mode() & 0o7777,
+            0o644
+        );
+    }
+    // Ownership covers both bundles, sorted by path exactly as the manifest stores them.
+    assert_eq!(
+        manifest_skill_paths(&harness.root.join("state/install-manifest.json")),
+        vec![
+            harness.review_skill_root().join("SKILL.md"),
+            harness.review_skill_root().join("agents/openai.yaml"),
+            harness.review_skill_root().join("references/review.md"),
+            harness.skill_root().join("SKILL.md"),
+            harness.skill_root().join("agents/openai.yaml"),
+            harness.skill_root().join("references/workflow.md"),
+        ]
+    );
 
     let cursor_mcp: serde_json::Value =
         serde_json::from_slice(&fs::read(harness.home.join(".cursor/mcp.json")).unwrap()).unwrap();
@@ -249,6 +898,26 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         ),
         7
     );
+    let cursor_hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.home.join(".cursor/hooks.json")).unwrap())
+            .unwrap();
+    for event in [
+        "sessionStart",
+        "beforeSubmitPrompt",
+        "postToolUse",
+        "preCompact",
+        "stop",
+        "sessionEnd",
+    ] {
+        let command = cursor_hooks["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .find(|command| command.contains(" hook --agent cursor "))
+            .unwrap();
+        assert!(command.ends_with("--agent-version '3.13.10'"));
+    }
     assert_eq!(
         hook_count(
             &harness.home.join(".codex/hooks.json"),
@@ -263,6 +932,25 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
         ),
         7
     );
+    let codex_hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(harness.home.join(".codex/hooks.json")).unwrap()).unwrap();
+    for event in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "PreCompact",
+        "Stop",
+        "SessionEnd",
+    ] {
+        let command = codex_hooks["hooks"][event]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|hook| hook["hooks"][0]["command"].as_str())
+            .find(|command| command.contains(" hook --agent codex "))
+            .unwrap();
+        assert!(command.ends_with("--agent-version '0.147.0'"));
+    }
     let toml = fs::read_to_string(harness.home.join(".codex/config.toml")).unwrap();
     assert!(toml.contains("# keep this leading comment"));
     assert!(toml.contains("# keep inline"));
@@ -276,13 +964,610 @@ fn setup_three_times_is_idempotent_and_preserves_existing_configuration() {
 }
 
 #[test]
+fn setup_rebuilds_schema_12_runtime_and_discards_cached_task_and_operation() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let locator = seed_runtime_task(&harness.root, "schema-12-rebuild");
+    mark_runtime_as_schema_12(&harness.root);
+    seed_legacy_capture_state(&harness.root);
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+
+    assert!(report.changed);
+    assert_runtime_schema_current(&harness.root);
+    for path in legacy_capture_paths(&harness.root) {
+        assert!(
+            !path.exists(),
+            "legacy Capture state survived setup: {}",
+            path.display()
+        );
+    }
+    assert!(
+        TaskRuntime::initialize(&harness.root)
+            .unwrap()
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn setup_rebuilds_schema_11_runtime_and_discards_cached_task_and_capture_state() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let locator = seed_runtime_task(&harness.root, "schema-11-rebuild");
+    mark_runtime_as_legacy_schema(&harness.root, 11, false);
+    seed_legacy_capture_state(&harness.root);
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+
+    assert!(report.changed);
+    assert_runtime_schema_current(&harness.root);
+    for path in legacy_capture_paths(&harness.root) {
+        assert!(
+            !path.exists(),
+            "legacy Capture state survived setup: {}",
+            path.display()
+        );
+    }
+    assert!(
+        TaskRuntime::initialize(&harness.root)
+            .unwrap()
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn setup_rejects_unknown_or_future_runtime_schemas_without_mutating_state() {
+    for version in [10_u32, 23, 999] {
+        let harness = Harness::new();
+        let installer = harness.installer("1.2.3");
+        installer.setup(&SetupOptions::default()).unwrap();
+        seed_runtime_task(&harness.root, &format!("schema-{version}-rejected"));
+        set_runtime_schema_version(&harness.root, version);
+        seed_legacy_capture_state(&harness.root);
+        let paths = runtime_files(&harness.root);
+        fs::write(&paths[1], []).unwrap();
+        fs::write(&paths[2], []).unwrap();
+        fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o620)).unwrap();
+        fs::set_permissions(&paths[2], fs::Permissions::from_mode(0o600)).unwrap();
+        let prior = paths
+            .iter()
+            .map(|path| {
+                (
+                    path.clone(),
+                    fs::read(path).unwrap(),
+                    fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+                )
+            })
+            .collect::<Vec<_>>();
+        let [capture_directory, capture_lock, capture_metadata] =
+            legacy_capture_paths(&harness.root);
+        let legacy_prior = [
+            capture_directory.join("cap-legacy.json"),
+            capture_lock,
+            capture_metadata,
+        ]
+        .map(|path| {
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        });
+
+        let error = installer.setup(&SetupOptions::default()).unwrap_err();
+
+        assert_eq!(
+            error.message(),
+            format!("unsupported task runtime schema version {version}; expected 22")
+        );
+        for (path, bytes, mode) in prior {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "{}",
+                path.display()
+            );
+        }
+        assert!(capture_directory.is_dir());
+        for (path, bytes) in legacy_prior {
+            assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
+        let connection = Connection::open(runtime_database(&harness.root)).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            i64::from(version)
+        );
+    }
+}
+
+#[test]
+fn later_setup_failure_restores_schema_12_runtime_and_sidecars_exactly() {
+    let harness = Harness::new();
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    seed_runtime_task(&harness.root, "schema-12-rollback");
+    mark_runtime_as_schema_12(&harness.root);
+    seed_legacy_capture_state(&harness.root);
+    let paths = runtime_files(&harness.root);
+    fs::write(&paths[1], []).unwrap();
+    fs::write(&paths[2], []).unwrap();
+    fs::set_permissions(&paths[0], fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(&paths[1], fs::Permissions::from_mode(0o620)).unwrap();
+    fs::set_permissions(&paths[2], fs::Permissions::from_mode(0o600)).unwrap();
+    let prior = paths
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                fs::read(path).unwrap(),
+                fs::metadata(path).unwrap().permissions().mode() & 0o7777,
+            )
+        })
+        .collect::<Vec<_>>();
+    let [capture_directory, capture_lock, capture_metadata] = legacy_capture_paths(&harness.root);
+    let capture_record = capture_directory.join("cap-legacy.json");
+    let legacy_prior = [capture_record, capture_lock, capture_metadata].map(|path| {
+        let bytes = fs::read(&path).unwrap();
+        (path, bytes)
+    });
+
+    let error = harness
+        .installer("1.2.3")
+        .with_failure_after(SetupStage::GlobalSkillWritten)
+        .setup(&SetupOptions::default())
+        .unwrap_err();
+
+    assert!(error.message().contains("injected setup failure"));
+    for (path, bytes, mode) in prior {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode,
+            "{}",
+            path.display()
+        );
+    }
+    assert!(capture_directory.is_dir());
+    for (path, bytes) in legacy_prior {
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{}", path.display());
+    }
+    let connection = Connection::open(runtime_database(&harness.root)).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        12
+    );
+    assert_eq!(runtime_operation_count(&connection), 1);
+}
+
+#[test]
+fn idempotent_setup_retains_compatible_schema_13_runtime_data() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let locator = seed_runtime_task(&harness.root, "schema-13-retained");
+
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+
+    assert!(!report.changed);
+    assert_runtime_schema_current(&harness.root);
+    assert!(
+        TaskRuntime::initialize(&harness.root)
+            .unwrap()
+            .read_external_session_by_locator(&locator)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn setup_rejects_symlinked_legacy_capture_directory_without_following_it() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let capture = harness.root.join("state/capture");
+    let outside = harness.home.join("outside-legacy-capture");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("preserve.txt"), b"preserve").unwrap();
+    symlink(&outside, &capture).unwrap();
+
+    let error = installer.setup(&SetupOptions::default()).unwrap_err();
+
+    assert!(error.message().contains("non-symlink directory"));
+    assert!(capture.is_symlink());
+    assert_eq!(fs::read(outside.join("preserve.txt")).unwrap(), b"preserve");
+}
+
+#[test]
+fn setup_refreshes_unchanged_managed_hooks_when_verified_agent_versions_change() {
+    let harness = Harness::new();
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let refreshed = Installer::new(
+        harness.context("1.2.3"),
+        Arc::new(FakeHost {
+            cursor_version: Some("4.0.0"),
+            codex_version: Some("0.149.1"),
+            ..FakeHost::default()
+        }),
+    )
+    .setup(&SetupOptions::default())
+    .unwrap();
+    assert!(refreshed.changed);
+
+    let cursor = fs::read_to_string(harness.home.join(".cursor/hooks.json")).unwrap();
+    assert_eq!(cursor.matches("--agent-version '4.0.0'").count(), 6);
+    assert!(!cursor.contains("--agent-version '3.13.10'"));
+    let codex = fs::read_to_string(harness.home.join(".codex/hooks.json")).unwrap();
+    assert_eq!(codex.matches("--agent-version '0.149.1'").count(), 6);
+    assert!(!codex.contains("--agent-version '0.147.0'"));
+
+    let unavailable = Installer::new(
+        harness.context("1.2.3"),
+        Arc::new(FakeHost {
+            cursor_version: None,
+            codex_version: None,
+            ..FakeHost::default()
+        }),
+    )
+    .setup(&SetupOptions::default())
+    .unwrap();
+    assert!(!unavailable.changed);
+    assert_eq!(
+        fs::read_to_string(harness.home.join(".cursor/hooks.json")).unwrap(),
+        cursor
+    );
+    assert_eq!(
+        fs::read_to_string(harness.home.join(".codex/hooks.json")).unwrap(),
+        codex
+    );
+}
+
+#[test]
+fn installer_mutations_are_exclusive_and_doctor_reports_active_maintenance() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.2.3");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let maintenance = MaintenanceLock::open_or_create(&harness.root).unwrap();
+
+    let shared = maintenance.try_shared().unwrap();
+    assert_eq!(
+        installer
+            .setup(&SetupOptions::default())
+            .unwrap_err()
+            .kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    assert_eq!(
+        installer.uninstall().unwrap_err().kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    assert_eq!(
+        installer
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .unwrap_err()
+            .kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    assert_eq!(
+        installer.sync_knowledge().unwrap_err().kind(),
+        sctx_installer::ErrorKind::MaintenanceBusy
+    );
+    drop(shared);
+
+    let exclusive = maintenance.try_exclusive().unwrap();
+    let doctor = installer.doctor();
+    assert!(!doctor.healthy);
+    assert_eq!(doctor.checks.len(), 1);
+    assert_eq!(doctor.checks[0].name, "maintenance");
+    drop(exclusive);
+
+    assert!(!installer.setup(&SetupOptions::default()).unwrap().changed);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn data_reset_dry_run_is_read_only_and_confirmed_reset_preserves_installation() {
+    let harness = Harness::new();
+    let seeded = seed_reset_state(&harness);
+    let installer = harness.installer("1.2.3");
+    let repository = harness.root.join("repository");
+    let head_before = git(&repository, &["rev-parse", "HEAD"]);
+    let config_before = fs::read(harness.root.join("config.toml")).unwrap();
+    let reset_backups_before = fs::read_dir(harness.root.join("backups"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("reset-"))
+        .count();
+
+    assert!(
+        installer
+            .reset_data(DataResetOptions::default())
+            .unwrap_err()
+            .message()
+            .contains("--yes")
+    );
+    let dry_run = installer
+        .reset_data(DataResetOptions {
+            confirmed: false,
+            dry_run: true,
+        })
+        .unwrap();
+    assert!(dry_run.dry_run);
+    assert_eq!(dry_run.repository_count_cleared, 2);
+    assert!(dry_run.backup.is_none());
+    assert!(!dry_run.remote_detached);
+    assert!(!dry_run.remote_mutated);
+    assert_eq!(git(&repository, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(
+        fs::read(harness.root.join("config.toml")).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        fs::read_dir(harness.root.join("backups"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("reset-"))
+            .count(),
+        reset_backups_before
+    );
+
+    let report = installer
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(!report.dry_run);
+    assert_eq!(report.repository_count_cleared, 2);
+    assert!(report.remote_detached);
+    assert!(!report.remote_mutated);
+    let backup = report.backup.as_ref().unwrap();
+    assert!(backup.join("journal.json").is_file());
+    assert!(backup.join("old/repository/.git").is_dir());
+    assert!(
+        fs::read_to_string(backup.join("old/config.toml"))
+            .unwrap()
+            .contains("FE")
+    );
+    assert_eq!(
+        git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
+        seeded.remote_head
+    );
+    assert_eq!(git(&repository, &["rev-list", "--count", "HEAD"]), "1");
+    assert!(git(&repository, &["remote"]).is_empty());
+    assert!(
+        UserConfigStore::open_existing(&harness.root)
+            .unwrap()
+            .repository_catalog()
+            .unwrap()
+            .repositories
+            .is_empty()
+    );
+    assert!(
+        ProjectionIndex::new(&repository, harness.root.join("state"))
+            .quick_check()
+            .unwrap()
+            .healthy
+    );
+    TaskRuntime::initialize(harness.root.clone()).unwrap();
+    assert_runtime_schema_current(&harness.root);
+    for path in legacy_capture_paths(&harness.root) {
+        assert!(
+            !path.exists(),
+            "legacy Capture state survived reset: {}",
+            path.display()
+        );
+    }
+    assert!(
+        RepositoryRegistry::initialize(harness.root.clone())
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        EngineeringProjectionStore::initialize(harness.root.clone())
+            .unwrap()
+            .read_projection()
+            .unwrap()
+            .is_none()
+    );
+    for directory in ["pending", "pending-aside", "authorized-session-scopes"] {
+        assert!(
+            fs::read_dir(harness.root.join("state").join(directory))
+                .unwrap()
+                .next()
+                .is_none(),
+            "{directory} is not empty"
+        );
+    }
+    for (path, expected) in &seeded.preserved {
+        assert_eq!(&fs::read(path).unwrap(), expected, "{}", path.display());
+    }
+    assert!(installer.doctor().healthy);
+
+    let repeated = installer
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap();
+    assert_eq!(repeated.repository_count_cleared, 0);
+    assert_ne!(repeated.backup, report.backup);
+    assert!(installer.doctor().healthy);
+}
+
+#[test]
+fn every_reset_crash_seam_blocks_business_and_recovers_on_retry() {
+    for stage in [
+        ResetStage::Staged,
+        ResetStage::FirstOriginalMoved,
+        ResetStage::FirstReplacementInstalled,
+        ResetStage::Swapped,
+        ResetStage::SmokeTested,
+    ] {
+        let harness = Harness::new();
+        let seeded = seed_reset_state(&harness);
+        let crashing = harness.installer("1.2.3").with_reset_crash_after(stage);
+        let error = crashing
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .unwrap_err();
+        assert!(
+            error.message().contains("injected reset crash"),
+            "{stage:?}"
+        );
+        assert!(harness.root.join("state/reset-journal.json").is_file());
+        assert_eq!(
+            MaintenanceLock::open_or_create(&harness.root)
+                .unwrap()
+                .try_shared()
+                .unwrap_err()
+                .kind(),
+            sctx_installer::ErrorKind::MaintenanceBusy
+        );
+
+        let recovered = harness
+            .installer("1.2.3")
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .unwrap();
+        assert!(!harness.root.join("state/reset-journal.json").exists());
+        assert!(
+            recovered
+                .backup
+                .as_ref()
+                .unwrap()
+                .join("journal.json")
+                .is_file()
+        );
+        assert_eq!(
+            git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
+            seeded.remote_head
+        );
+        assert!(harness.installer("1.2.3").doctor().healthy, "{stage:?}");
+    }
+}
+
+#[test]
+fn setup_recovers_an_incomplete_reset_before_reapplying_installation() {
+    let harness = Harness::new();
+    let seeded = seed_reset_state(&harness);
+    for database in [
+        "index.sqlite",
+        "runtime.sqlite",
+        "engineering.sqlite",
+        "repository-registry.sqlite",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            let path = harness
+                .root
+                .join("state")
+                .join(format!("{database}{suffix}"));
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove seeded database: {error}"),
+            }
+        }
+    }
+    ProjectionIndex::new(harness.root.join("repository"), harness.root.join("state"))
+        .synchronize()
+        .unwrap();
+    TaskRuntime::initialize(harness.root.clone()).unwrap();
+    sctx_mcp::sync_repository_catalog_at_root(&harness.root).unwrap();
+    EngineeringProjectionStore::initialize(harness.root.clone()).unwrap();
+    let crashing = harness
+        .installer("1.2.3")
+        .with_reset_crash_after(ResetStage::Swapped);
+    assert!(
+        crashing
+            .reset_data(DataResetOptions {
+                confirmed: true,
+                dry_run: false,
+            })
+            .is_err()
+    );
+    assert!(harness.root.join("state/reset-journal.json").is_file());
+
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(!harness.root.join("state/reset-journal.json").exists());
+    let catalog = UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert_eq!(catalog.repositories.len(), 2);
+    assert_eq!(git(&harness.root.join("repository"), &["remote"]), "origin");
+    assert_eq!(
+        git(&seeded.remote, &["rev-parse", "refs/heads/main"]),
+        seeded.remote_head
+    );
+}
+
+#[test]
+fn reset_rejects_symlinked_targets_without_touching_the_target() {
+    let harness = Harness::new();
+    harness
+        .installer("1.2.3")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let capture = harness.root.join("state/capture");
+    if capture.exists() {
+        fs::remove_dir_all(&capture).unwrap();
+    }
+    let outside = harness.home.join("outside-capture");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("preserve.txt"), "preserve").unwrap();
+    symlink(&outside, &capture).unwrap();
+
+    let error = harness
+        .installer("1.2.3")
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap_err();
+    assert!(error.message().contains("must not be a symlink"));
+    assert_eq!(
+        fs::read_to_string(outside.join("preserve.txt")).unwrap(),
+        "preserve"
+    );
+    assert!(!harness.root.join("state/reset-journal.json").exists());
+}
+
+#[test]
 fn cursor_and_codex_share_one_global_skill_installation() {
     let harness = Harness::new();
     let cursor = SetupOptions {
         agents: [Agent::Cursor].into_iter().collect(),
+        ..SetupOptions::default()
     };
     let codex = SetupOptions {
         agents: [Agent::Codex].into_iter().collect(),
+        ..SetupOptions::default()
     };
     let first = harness.installer("1.0.0").setup(&cursor).unwrap();
     let second = harness.installer("1.0.0").setup(&codex).unwrap();
@@ -292,6 +1577,25 @@ fn cursor_and_codex_share_one_global_skill_installation() {
     assert_eq!(first.skill.path, second.skill.path);
     assert!(harness.skill_root().join("SKILL.md").is_file());
     assert!(harness.skill_root().join("agents/openai.yaml").is_file());
+    assert!(
+        harness
+            .skill_root()
+            .join("references/workflow.md")
+            .is_file()
+    );
+    assert!(harness.review_skill_root().join("SKILL.md").is_file());
+    assert!(
+        harness
+            .review_skill_root()
+            .join("agents/openai.yaml")
+            .is_file()
+    );
+    assert!(
+        harness
+            .review_skill_root()
+            .join("references/review.md")
+            .is_file()
+    );
 }
 
 #[test]
@@ -319,10 +1623,48 @@ fn setup_preserves_and_does_not_claim_an_external_same_name_skill() {
     .unwrap();
     assert_eq!(manifest["skills"].as_array().unwrap().len(), 0);
 
+    // The conflicting bundle stops the whole set: the second managed Skill is not installed
+    // either, so an installation never carries half of them.
+    assert!(!harness.review_skill_root().exists());
+
     let uninstall = installer.uninstall().unwrap();
     assert!(skill.join("SKILL.md").is_file());
     assert!(skill.join("agents/openai.yaml").is_file());
+    assert!(!skill.join("references/workflow.md").exists());
     assert!(!uninstall.removed.contains(&skill));
+}
+
+#[test]
+fn setup_preserves_and_does_not_claim_an_external_review_skill_of_the_same_name() {
+    let harness = Harness::new();
+    let review = harness.review_skill_root();
+    fs::create_dir_all(review.join("references")).unwrap();
+    fs::write(review.join("SKILL.md"), b"user review skill\n").unwrap();
+
+    let installer = harness.installer("1.0.0");
+    let report = installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(report.skill.status, SkillStatus::Conflict);
+    assert!(
+        report.notices.iter().any(|notice| {
+            notice.contains("sctx-review") && notice.contains("did not overwrite")
+        })
+    );
+    assert_eq!(
+        fs::read(review.join("SKILL.md")).unwrap(),
+        b"user review skill\n"
+    );
+    assert!(!review.join("references/review.md").exists());
+    // The other bundle is preserved too, and nothing is claimed in the manifest.
+    assert!(!harness.skill_root().exists());
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["skills"].as_array().unwrap().len(), 0);
+
+    let uninstall = installer.uninstall().unwrap();
+    assert!(review.join("SKILL.md").is_file());
+    assert!(!uninstall.removed.contains(&review));
 }
 
 #[test]
@@ -336,7 +1678,14 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         SetupStage::CursorHooksWritten,
         SetupStage::CodexMcpWritten,
         SetupStage::CodexHooksWritten,
+        SetupStage::GlobalSkillGateWritten,
+        SetupStage::GlobalSkillWorkflowWritten,
+        SetupStage::GlobalSkillMetadataWritten,
+        SetupStage::GlobalSkillReviewGateWritten,
+        SetupStage::GlobalSkillReviewReferenceWritten,
+        SetupStage::GlobalSkillReviewMetadataWritten,
         SetupStage::GlobalSkillWritten,
+        SetupStage::LaunchAgentWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
     ];
@@ -379,6 +1728,14 @@ fn every_setup_write_seam_restores_exact_agent_bytes_and_permissions() {
         assert!(
             !harness.home.join(".agents").exists(),
             "new global Skill parents at {stage:?}"
+        );
+        assert!(
+            !launch_agent_path(&harness.home).exists(),
+            "maintenance LaunchAgent at {stage:?}"
+        );
+        assert!(
+            !harness.home.join("Library").exists(),
+            "new LaunchAgents parents at {stage:?}"
         );
         if stage >= SetupStage::RepositoryInitialized {
             assert!(harness.root.join("repository/.git").is_dir());
@@ -496,6 +1853,211 @@ fn upgrade_switches_atomically_and_failed_upgrade_restores_previous_runtime() {
     assert!(!harness.root.join("bin/3.0.0/arm64/sctx").exists());
 }
 
+/// An editor's `sctx mcp serve` process (or a Hook process) resolved `bin/current` once, at its
+/// own startup, and keeps that binary mapped for its whole lifetime; switching the symlink an
+/// upgrade later does not reach it. Nothing this process runs can restart another process's MCP
+/// server, so the report has to say so explicitly -- in the structured `notices` field that both
+/// `--json` and the pretty-printed default carry, not a side channel a scripted caller would miss.
+#[test]
+fn upgrade_notices_that_a_running_editor_must_restart_to_see_the_new_binary() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let upgraded = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        upgraded.notices.iter().any(|notice| {
+            notice.contains("restart") && notice.contains("1.0.0") && notice.contains("2.0.0")
+        }),
+        "an upgrade that switched bin/current must notice that a running editor or MCP server \
+         needs a restart: {:#?}",
+        upgraded.notices
+    );
+
+    // Re-running the upgrade at the same version is a no-op for `bin/current`: nothing switched,
+    // so nothing already running fell behind, and repeating the notice would just be noise.
+    let repeated = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !repeated.changed,
+        "an upgrade to the version already current changes nothing"
+    );
+    assert!(
+        !repeated
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart")),
+        "an upgrade that switched nothing must not claim a restart is needed: {:#?}",
+        repeated.notices
+    );
+}
+
+/// `sctx setup` re-run over an installation that already exists takes the same `bin/current`
+/// switch an `upgrade` does, and a running editor is exactly as stale either way -- the notice
+/// has to follow "did `bin/current` just move for a pre-existing installation", not the verb the
+/// operator typed.
+#[test]
+fn setup_rerun_over_an_existing_installation_notices_the_restart_the_same_way_upgrade_does() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let resetup = harness
+        .installer("2.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        resetup
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart") && notice.contains("2.0.0")),
+        "a `setup` rerun that moves bin/current for an existing installation must notice the \
+         restart exactly as an `upgrade` would: {:#?}",
+        resetup.notices
+    );
+}
+
+/// The very first `setup` on a machine has no prior installation and nothing else could already
+/// be running the old binary, so there is nothing to restart and the notice must stay silent.
+#[test]
+fn a_first_setup_never_claims_a_restart_is_needed() {
+    let harness = Harness::new();
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("restart")),
+        "a first-ever setup has no prior process to restart: {:#?}",
+        report.notices
+    );
+}
+
+/// An installation that configured explicit `RepositoryGroups` keeps working after the
+/// upgrade that removed them: the section is dropped in the same transaction that would
+/// roll it back, and one notice explains what replaced it (WP-N2).
+#[test]
+fn upgrade_migrates_a_configuration_that_still_declares_repository_groups() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let member = init_catalog_repo(&harness.home.join("team repositories/fe"));
+    let config_path = harness.root.join("config.toml");
+    UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .add_repository("FE".parse().unwrap(), std::slice::from_ref(&member))
+        .unwrap();
+    let before = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{before}\n[[repository_groups]]\n\
+             id = \"rpg_00000000-0000-4000-8000-000000000001\"\n\
+             root = \"{}\"\nmembers = [\"FE\"]\n",
+            member.parent().unwrap().display()
+        ),
+    )
+    .unwrap();
+    assert!(
+        UserConfigStore::open_existing(&harness.root)
+            .unwrap()
+            .repository_catalog()
+            .is_err(),
+        "the removed section makes the document unreadable until it is migrated"
+    );
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(report.changed);
+    assert!(
+        report.notices.iter().any(|notice| {
+            notice.contains("repository groups are deprecated")
+                && notice.contains("derived from registered checkouts")
+        }),
+        "the upgrade explains what replaced Groups: {:#?}",
+        report.notices
+    );
+    let migrated = fs::read_to_string(&config_path).unwrap();
+    assert!(!migrated.contains("repository_groups"));
+    let catalog = UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert_eq!(catalog.repositories.len(), 1);
+    assert_eq!(
+        catalog.repositories[0].checkout_paths,
+        vec![member.clone()],
+        "the Repository registration itself is untouched"
+    );
+
+    // The pre-migration document is recoverable from the upgrade's own backup.
+    let backups = fs::read_dir(harness.root.join("backups"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    let mut recovered = Vec::new();
+    for backup in &backups {
+        let mut files = Vec::new();
+        collect_files_recursive(backup, &mut files);
+        recovered.extend(
+            files
+                .into_iter()
+                .filter_map(|path| fs::read_to_string(path).ok())
+                .filter(|text| text.contains("[[repository_groups]]")),
+        );
+    }
+    assert!(
+        !recovered.is_empty(),
+        "the original document is retained as a backup"
+    );
+
+    // Repeating the upgrade finds nothing left to migrate and says nothing about it.
+    let repeated = harness
+        .installer("3.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        !repeated
+            .notices
+            .iter()
+            .any(|notice| notice.contains("repository groups are deprecated")),
+        "migration is announced once: {:#?}",
+        repeated.notices
+    );
+}
+
+fn collect_files_recursive(directory: &std::path::Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_files_recursive(&path, files);
+        } else {
+            files.push(path);
+        }
+    }
+}
+
 #[test]
 fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
     let harness = Harness::new();
@@ -505,6 +2067,7 @@ fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
         .unwrap();
     let skill_md = harness.skill_root().join("SKILL.md");
     let openai_yaml = harness.skill_root().join("agents/openai.yaml");
+    let workflow = harness.skill_root().join("references/workflow.md");
     fs::write(&skill_md, b"user modified skill\n").unwrap();
     fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
 
@@ -513,6 +2076,7 @@ fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
     assert_eq!(upgrade.skill.status, SkillStatus::Modified);
     assert_eq!(fs::read(&skill_md).unwrap(), b"user modified skill\n");
     assert!(openai_yaml.is_file());
+    assert!(workflow.is_file());
     assert!(
         upgrade
             .notices
@@ -523,6 +2087,7 @@ fn upgrade_and_uninstall_preserve_only_the_user_modified_skill_file() {
     let uninstall = installer.uninstall().unwrap();
     assert!(skill_md.is_file());
     assert!(!openai_yaml.exists());
+    assert!(!workflow.exists());
     assert!(harness.skill_root().is_dir());
     assert!(uninstall.preserved.contains(&skill_md));
     assert!(uninstall.removed.contains(&openai_yaml));
@@ -554,12 +2119,14 @@ fn uninstall_never_follows_a_replaced_skill_parent_symlink() {
         include_bytes!("../../../skills/shared-context/agents/openai.yaml"),
     )
     .unwrap();
+    fs::create_dir_all(outside.join("references")).unwrap();
     symlink(&outside, &skill).unwrap();
 
     let report = installer.uninstall().unwrap();
     assert!(skill.is_symlink());
     assert!(outside.join("SKILL.md").is_file());
     assert!(outside.join("agents/openai.yaml").is_file());
+    assert!(outside.join("references").is_dir());
     assert!(
         report
             .warnings
@@ -576,9 +2143,16 @@ fn upgrade_replaces_an_unchanged_managed_skill_from_an_older_build() {
         .setup(&SetupOptions::default())
         .unwrap();
     let skill_md = harness.skill_root().join("SKILL.md");
+    let workflow = harness.skill_root().join("references/workflow.md");
+    let openai_yaml = harness.skill_root().join("agents/openai.yaml");
     let manifest = harness.root.join("state/install-manifest.json");
     replace_owned_skill_bytes(&skill_md, b"older managed skill\n", &manifest);
+    replace_owned_skill_bytes(&openai_yaml, b"older: metadata\n", &manifest);
+    remove_owned_skill(&workflow, &manifest);
+    fs::remove_file(&workflow).unwrap();
+    fs::remove_dir(workflow.parent().unwrap()).unwrap();
     fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o640)).unwrap();
+    fs::set_permissions(&openai_yaml, fs::Permissions::from_mode(0o604)).unwrap();
     fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
 
     let report = harness
@@ -594,6 +2168,139 @@ fn upgrade_replaces_an_unchanged_managed_skill_from_an_older_build() {
         fs::metadata(&skill_md).unwrap().permissions().mode() & 0o7777,
         0o640
     );
+    assert_eq!(
+        fs::read(&workflow).unwrap(),
+        include_bytes!("../../../skills/shared-context/references/workflow.md")
+    );
+    assert_eq!(
+        fs::metadata(&workflow).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    assert_eq!(
+        fs::read(&openai_yaml).unwrap(),
+        include_bytes!("../../../skills/shared-context/agents/openai.yaml")
+    );
+    assert_eq!(
+        fs::metadata(&openai_yaml).unwrap().permissions().mode() & 0o7777,
+        0o604
+    );
+    assert_eq!(manifest_skill_paths(&manifest).len(), 6);
+}
+
+#[test]
+fn upgrade_from_a_single_skill_installation_adds_the_review_bundle() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    // Rewind to what a pre-split installation looked like: one bundle on disk, one in the manifest.
+    let manifest = harness.root.join("state/install-manifest.json");
+    let review = harness.review_skill_root();
+    for relative in ["SKILL.md", "references/review.md", "agents/openai.yaml"] {
+        remove_owned_skill(&review.join(relative), &manifest);
+    }
+    fs::remove_dir_all(&review).unwrap();
+    assert_eq!(manifest_skill_paths(&manifest).len(), 3);
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+
+    assert_eq!(report.skill.status, SkillStatus::Installed);
+    assert_eq!(
+        fs::read(review.join("SKILL.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/SKILL.md")
+    );
+    assert_eq!(
+        fs::read(review.join("references/review.md")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/references/review.md")
+    );
+    assert_eq!(
+        fs::read(review.join("agents/openai.yaml")).unwrap(),
+        include_bytes!("../../../skills/sctx-review/agents/openai.yaml")
+    );
+    assert_eq!(manifest_skill_paths(&manifest).len(), 6);
+
+    // And uninstall now reclaims both bundles down to the empty directories they created.
+    let uninstall = harness.installer("2.0.0").uninstall().unwrap();
+    assert!(!review.exists());
+    assert!(!harness.skill_root().exists());
+    assert!(uninstall.removed.contains(&review));
+    assert!(uninstall.removed.contains(&harness.skill_root()));
+}
+
+#[test]
+fn hostile_unowned_reference_blocks_the_complete_managed_bundle_upgrade() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let skill_md = harness.skill_root().join("SKILL.md");
+    let workflow = harness.skill_root().join("references/workflow.md");
+    let openai_yaml = harness.skill_root().join("agents/openai.yaml");
+    let manifest = harness.root.join("state/install-manifest.json");
+    replace_owned_skill_bytes(&skill_md, b"older managed gate\n", &manifest);
+    replace_owned_skill_bytes(&openai_yaml, b"older: managed metadata\n", &manifest);
+    remove_owned_skill(&workflow, &manifest);
+    fs::write(&workflow, b"hostile user-owned workflow\n").unwrap();
+    let before_paths = manifest_skill_paths(&manifest);
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+
+    let report = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+
+    assert_eq!(report.skill.status, SkillStatus::Conflict);
+    assert_eq!(fs::read(&skill_md).unwrap(), b"older managed gate\n");
+    assert_eq!(
+        fs::read(&openai_yaml).unwrap(),
+        b"older: managed metadata\n"
+    );
+    assert_eq!(
+        fs::read(&workflow).unwrap(),
+        b"hostile user-owned workflow\n"
+    );
+    assert_eq!(manifest_skill_paths(&manifest), before_paths);
+    assert!(report.notices.iter().any(|notice| {
+        notice.contains("user-owned global Agent Skill file")
+            && notice.contains("references/workflow.md")
+    }));
+}
+
+#[test]
+fn modified_owned_reference_is_preserved_by_setup_upgrade_and_uninstall() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let skill_md = harness.skill_root().join("SKILL.md");
+    let workflow = harness.skill_root().join("references/workflow.md");
+    let gate_before = fs::read(&skill_md).unwrap();
+    fs::write(&workflow, b"user-modified workflow\n").unwrap();
+
+    let repeat = installer.setup(&SetupOptions::default()).unwrap();
+    assert_eq!(repeat.skill.status, SkillStatus::Modified);
+    assert_eq!(fs::read(&workflow).unwrap(), b"user-modified workflow\n");
+    assert_eq!(fs::read(&skill_md).unwrap(), gate_before);
+
+    fs::write(&harness.runtime, b"signed-runtime-v2").unwrap();
+    let upgrade = harness
+        .installer("2.0.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(upgrade.skill.status, SkillStatus::Modified);
+    assert_eq!(fs::read(&workflow).unwrap(), b"user-modified workflow\n");
+    assert_eq!(fs::read(&skill_md).unwrap(), gate_before);
+
+    let uninstall = harness.installer("2.0.0").uninstall().unwrap();
+    assert!(workflow.is_file());
+    assert_eq!(fs::read(&workflow).unwrap(), b"user-modified workflow\n");
+    assert!(uninstall.preserved.contains(&workflow));
+    assert!(!skill_md.exists());
 }
 
 #[test]
@@ -607,7 +2314,14 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
         SetupStage::CursorHooksWritten,
         SetupStage::CodexMcpWritten,
         SetupStage::CodexHooksWritten,
+        SetupStage::GlobalSkillGateWritten,
+        SetupStage::GlobalSkillWorkflowWritten,
+        SetupStage::GlobalSkillMetadataWritten,
+        SetupStage::GlobalSkillReviewGateWritten,
+        SetupStage::GlobalSkillReviewReferenceWritten,
+        SetupStage::GlobalSkillReviewMetadataWritten,
         SetupStage::GlobalSkillWritten,
+        SetupStage::LaunchAgentWritten,
         SetupStage::ManifestWritten,
         SetupStage::SmokeTested,
     ] {
@@ -633,6 +2347,11 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
                 harness.skill_root().join("SKILL.md"),
                 b"old skill\n".as_slice(),
                 0o640,
+            ),
+            (
+                harness.skill_root().join("references/workflow.md"),
+                b"old workflow\n".as_slice(),
+                0o644,
             ),
             (
                 harness.skill_root().join("agents/openai.yaml"),
@@ -682,6 +2401,378 @@ fn failed_upgrade_restores_managed_skill_bytes_and_permissions() {
     }
 }
 
+/// Reads the `key -> trusted_hash` pairs the installer left in a Codex `config.toml`.
+fn stored_codex_trust(path: &Path) -> std::collections::BTreeMap<String, String> {
+    let document = fs::read_to_string(path)
+        .unwrap()
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+    sctx_installer::codex_trust::stored_trust_hashes(&document)
+}
+
+/// The hashes Codex itself would demand for every hook in a `hooks.json`.
+fn required_codex_trust(hooks: &Path) -> std::collections::BTreeMap<String, String> {
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(hooks).unwrap()).expect("hooks.json is JSON");
+    sctx_installer::codex_trust::hook_state_entries(
+        document.as_object().unwrap(),
+        hooks.to_str().unwrap(),
+    )
+    .expect("hashable hooks.json")
+}
+
+fn codex_paths(home: &Path) -> (PathBuf, PathBuf) {
+    (
+        home.join(".codex/hooks.json"),
+        home.join(".codex/config.toml"),
+    )
+}
+
+/// Writing `hooks.json` is only half of installing a Codex hook: Codex recomputes each hook's
+/// identity hash at discovery time and silently skips any hook whose hash is not the one
+/// `config.toml` records as trusted. Measured on the dev.10 install -- `hooks.json` had been
+/// rewritten to `--agent-version 0.154.0`, all six stored hashes still described `0.153.4`, and a
+/// full replay produced zero `<shared-context-active>` markers and zero external-session rows.
+#[test]
+fn setup_trusts_every_codex_hook_it_writes_and_nobody_elses() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+
+    let required = required_codex_trust(&hooks);
+    let stored = stored_codex_trust(&config);
+    let source = hooks.to_str().unwrap();
+    let runtime = harness.root.join("bin/current/sctx");
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&hooks).unwrap()).unwrap();
+    for (event, label) in [
+        ("SessionStart", "session_start"),
+        ("UserPromptSubmit", "user_prompt_submit"),
+        ("PostToolUse", "post_tool_use"),
+        ("PreCompact", "pre_compact"),
+        ("Stop", "stop"),
+        ("SessionEnd", "session_end"),
+    ] {
+        // The seeded fixture already owns `Stop` group 0, so our own `Stop` hook lands at group 1:
+        // the address has to be found, not assumed.
+        let index = document["hooks"][event]
+            .as_array()
+            .unwrap_or_else(|| panic!("{event} is not in hooks.json"))
+            .iter()
+            .position(|group| {
+                group["hooks"][0]["command"]
+                    .as_str()
+                    .is_some_and(|command| command.contains(runtime.to_str().unwrap()))
+            })
+            .unwrap_or_else(|| panic!("no {event} hook targets the current runtime"));
+        let key = format!("{source}:{label}:{index}:0");
+        assert_eq!(
+            stored.get(&key),
+            required.get(&key),
+            "{event} is registered but not trusted, so Codex would skip it"
+        );
+    }
+    // The operator's own `Stop` hook at group 0 is in the same file. Its trust is theirs to grant:
+    // setup must not have stamped it.
+    assert!(
+        !stored.contains_key(&format!("{source}:stop:0:0")),
+        "setup granted Codex execution trust to a hook it did not write"
+    );
+    assert_eq!(stored.len(), 6, "exactly our six hooks were trusted");
+}
+
+/// The hash covers the hook *command*, and the command carries `--agent-version`. So every Codex
+/// upgrade invalidates all six stored hashes at once; re-stamping cannot be a first-install-only
+/// step.
+#[test]
+fn an_upgrade_that_rewrites_the_hook_command_re_stamps_its_trust() {
+    let harness = Harness::new();
+    let before = Installer::new(
+        harness.context("1.0.0"),
+        Arc::new(FakeHost {
+            codex_version: Some("0.153.4"),
+            ..FakeHost::default()
+        }),
+    );
+    before.setup(&SetupOptions::default()).unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let first = stored_codex_trust(&config);
+    assert_eq!(first, required_codex_trust(&hooks));
+
+    let after = Installer::new(
+        harness.context("1.1.0"),
+        Arc::new(FakeHost {
+            codex_version: Some("0.154.0"),
+            ..FakeHost::default()
+        }),
+    );
+    let report = after.upgrade(&SetupOptions::default()).unwrap();
+    assert!(
+        report
+            .notices
+            .iter()
+            .all(|notice| !notice.contains("could not re-stamp"))
+    );
+    let second = stored_codex_trust(&config);
+    assert_eq!(
+        second,
+        required_codex_trust(&hooks),
+        "the upgrade left Codex refusing every hook it had just rewritten"
+    );
+    assert_ne!(
+        first, second,
+        "the fixture must actually change the command, or this proves nothing"
+    );
+    assert!(
+        fs::read_to_string(&hooks).unwrap().contains("0.154.0"),
+        "the hook command should name the newly detected Codex version"
+    );
+}
+
+/// Two disciplines in one test, because they are the same discipline: the installer owns its own
+/// state keys and nothing else. A key addressing a position our `hooks.json` no longer has is dead
+/// -- it can run nothing -- so reclaiming it takes no capability from anyone. A key addressing
+/// another source is not ours to read, rewrite, or remove, however dead it looks.
+#[test]
+fn setup_prunes_its_own_dead_trust_keys_and_leaves_foreign_sources_alone() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let source = hooks.to_str().unwrap().to_owned();
+
+    // What the real install looked like: keys from a Shared Context version that registered more
+    // events than this one does, next to a project hooks file and a plugin-provided source.
+    let foreign = [
+        "/some/project/.codex/hooks.json:stop:0:0",
+        "auto-tracking@ai-metrics:hooks/hooks.json:session_start:0:0",
+    ];
+    let mut body = fs::read_to_string(&config).unwrap();
+    for stale in [
+        "pre_tool_use:0:0",
+        "subagent_start:0:0",
+        "subagent_stop:0:0",
+    ] {
+        write!(
+            body,
+            "\n[hooks.state.\"{source}:{stale}\"]\ntrusted_hash = \"sha256:stale\"\n"
+        )
+        .unwrap();
+    }
+    for key in foreign {
+        write!(
+            body,
+            "\n[hooks.state.\"{key}\"]\ntrusted_hash = \"sha256:theirs\"\nenabled = true\n"
+        )
+        .unwrap();
+    }
+    fs::write(&config, &body).unwrap();
+
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let stored = stored_codex_trust(&config);
+    for stale in [
+        "pre_tool_use:0:0",
+        "subagent_start:0:0",
+        "subagent_stop:0:0",
+    ] {
+        assert!(
+            !stored.contains_key(&format!("{source}:{stale}")),
+            "{stale} addresses a hook that no longer exists and should have been pruned"
+        );
+    }
+    for key in foreign {
+        assert_eq!(
+            stored.get(key).map(String::as_str),
+            Some("sha256:theirs"),
+            "{key} belongs to another source and must be untouched"
+        );
+    }
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("enabled = true"),
+        "a foreign entry's other fields must survive too"
+    );
+    assert_eq!(stored_codex_trust(&config).len(), 6 + foreign.len());
+}
+
+/// `config.toml` is the operator's hand-written file. When re-stamping cannot proceed, an install
+/// that is otherwise complete must still complete: the cost of the failure is hooks that do not
+/// fire, which is worth a sentence and a doctor check, never worth discarding a finished setup.
+#[test]
+fn an_unusable_codex_config_degrades_the_trust_stamp_to_a_notice() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    let (_, config) = codex_paths(&harness.home);
+    // Valid TOML, so the MCP merge still succeeds, but `hooks` is not a table -- the one shape
+    // the re-stamp refuses rather than overwriting.
+    fs::write(&config, "model = \"fixture\"\nhooks = 1\n").unwrap();
+
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(
+        report.notices.iter().any(|notice| notice
+            .contains("could not re-stamp the Codex hook trust hashes")
+            && notice.contains("codex_trusted_hash")),
+        "a degraded trust stamp must be reported: {:?}",
+        report.notices
+    );
+    assert_eq!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .matches("hooks = 1")
+            .count(),
+        1,
+        "the shape we refused to interpret must be left exactly as it was"
+    );
+    // And the consequence is visible rather than inferred: with no `[hooks.state]` to read, every
+    // installed hook is untrusted, which is exactly what Codex will do with them.
+    let report = harness.installer("1.0.0").doctor();
+    let check = report
+        .checks
+        .iter()
+        .find(|check| check.name == "codex_trusted_hash")
+        .expect("the check is registered");
+    assert_eq!(check.status, CheckStatus::ActionRequired);
+    assert!(check.message.contains("6 of 6"), "{}", check.message);
+}
+
+#[test]
+fn doctor_reports_whether_codex_actually_trusts_the_installed_hooks() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let trusted = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "codex_trusted_hash")
+            .cloned()
+            .expect("the check is registered")
+    };
+
+    let healthy = trusted(&harness.installer("1.0.0").doctor());
+    assert_eq!(healthy.status, CheckStatus::Ok);
+    assert!(healthy.message.contains("all 6"), "{}", healthy.message);
+
+    // Exactly the dev.10 state: the hooks file is current, the stored hashes describe an older
+    // command. Nothing else on the installation is wrong, so this is the operator's action, not an
+    // error.
+    let stale = fs::read_to_string(&config)
+        .unwrap()
+        .replace("trusted_hash = \"sha256:", "trusted_hash = \"sha256:00");
+    fs::write(&config, stale).unwrap();
+    let broken = trusted(&harness.installer("1.0.0").doctor());
+    assert_eq!(broken.status, CheckStatus::ActionRequired);
+    assert!(
+        broken.message.contains("6 of 6")
+            && broken.message.contains("silently skips them")
+            && broken.message.contains("sctx setup"),
+        "the check has to name the repair: {}",
+        broken.message
+    );
+    let report = harness.installer("1.0.0").doctor();
+    assert!(
+        report.healthy,
+        "an untrusted hook is an action, not a broken installation"
+    );
+
+    // A dead key of our own is worth saying, but it costs no hook: a warning, not an action.
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let mut body = fs::read_to_string(&config).unwrap();
+    write!(
+        body,
+        "\n[hooks.state.\"{}:subagent_stop:0:0\"]\ntrusted_hash = \"sha256:dead\"\n",
+        hooks.to_str().unwrap()
+    )
+    .unwrap();
+    fs::write(&config, body).unwrap();
+    let stale_only = trusted(&harness.installer("1.0.0").doctor());
+    assert_eq!(stale_only.status, CheckStatus::Warning);
+    assert!(
+        stale_only.message.contains("1 stale trust keys"),
+        "{}",
+        stale_only.message
+    );
+}
+
+/// Uninstall takes our hooks out of `hooks.json`, which is what makes its own trust keys dead.
+#[test]
+fn uninstall_takes_its_dead_trust_keys_with_it_and_leaves_the_operators() {
+    let harness = Harness::new();
+    harness.seed_configs();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let (hooks, config) = codex_paths(&harness.home);
+    let source = hooks.to_str().unwrap().to_owned();
+    // The operator trusts their own `Stop` hook, which lives at group 0 of the same file.
+    let mut body = fs::read_to_string(&config).unwrap();
+    write!(
+        body,
+        "\n[hooks.state.\"{source}:stop:0:0\"]\ntrusted_hash = \"sha256:theirs\"\n"
+    )
+    .unwrap();
+    fs::write(&config, body).unwrap();
+    assert_eq!(stored_codex_trust(&config).len(), 7);
+
+    let report = harness.installer("1.0.0").uninstall().unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("preserved the Codex hook trust keys"))
+    );
+    let stored = stored_codex_trust(&config);
+    assert_eq!(
+        stored.keys().cloned().collect::<Vec<_>>(),
+        vec![format!("{source}:stop:0:0")],
+        "uninstall must reclaim only the keys it made dead"
+    );
+}
+
+/// A rolled-back setup must leave `config.toml` byte-for-byte as it found it, trust keys included.
+#[test]
+fn a_failed_setup_restores_the_codex_trust_state_it_had_rewritten() {
+    let harness = Harness::new();
+    let seeded = harness.seed_configs();
+    let (_, config) = codex_paths(&harness.home);
+    let original = seeded
+        .iter()
+        .find(|(path, _, _)| path == &config)
+        .map(|(_, bytes, _)| bytes.clone())
+        .unwrap();
+
+    let failing = harness
+        .installer("1.0.0")
+        .with_failure_after(SetupStage::CodexHookTrustStamped);
+    assert!(failing.setup(&SetupOptions::default()).is_err());
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        original,
+        "rollback left the operator's Codex config rewritten"
+    );
+}
+
 #[test]
 fn doctor_reports_codex_trust_as_action_required() {
     let harness = Harness::new();
@@ -708,6 +2799,22 @@ fn doctor_reports_codex_trust_as_action_required() {
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Ok
     }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.workflow_reference" && check.status == CheckStatus::Ok
+    }));
+    for name in [
+        "global_skill.review_skill_md",
+        "global_skill.review_reference",
+        "global_skill.review_openai_yaml",
+    ] {
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == name && check.status == CheckStatus::Ok),
+            "{name} is missing from a healthy doctor report"
+        );
+    }
 }
 
 #[test]
@@ -716,15 +2823,36 @@ fn doctor_distinguishes_modified_and_missing_managed_skill_files() {
     let installer = harness.installer("1.0.0");
     installer.setup(&SetupOptions::default()).unwrap();
     fs::write(harness.skill_root().join("SKILL.md"), b"modified\n").unwrap();
+    fs::write(
+        harness.skill_root().join("references/workflow.md"),
+        b"modified workflow\n",
+    )
+    .unwrap();
     fs::remove_file(harness.skill_root().join("agents/openai.yaml")).unwrap();
+    fs::write(
+        harness.review_skill_root().join("references/review.md"),
+        b"modified review\n",
+    )
+    .unwrap();
+    fs::remove_file(harness.review_skill_root().join("SKILL.md")).unwrap();
 
     let report = installer.doctor();
     assert!(!report.healthy);
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.review_reference" && check.status == CheckStatus::ActionRequired
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.review_skill_md" && check.status == CheckStatus::Error
+    }));
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.skill_md" && check.status == CheckStatus::ActionRequired
     }));
     assert!(report.checks.iter().any(|check| {
         check.name == "global_skill.openai_yaml" && check.status == CheckStatus::Error
+    }));
+    assert!(report.checks.iter().any(|check| {
+        check.name == "global_skill.workflow_reference"
+            && check.status == CheckStatus::ActionRequired
     }));
 }
 
@@ -734,7 +2862,7 @@ fn setup_and_doctor_restore_registry_from_catalog_and_report_invalid_config() {
     let checkout = init_catalog_repo(&harness.home.join("configured checkout"));
     let configured = UserConfigStore::initialize(&harness.root)
         .unwrap()
-        .add_repository(None, &[checkout])
+        .add_repository(sctx_domain::RepositoryId::new(), &[checkout])
         .unwrap();
     let installer = harness.installer("1.0.0");
     installer.setup(&SetupOptions::default()).unwrap();
@@ -776,7 +2904,7 @@ fn setup_and_doctor_restore_registry_from_catalog_and_report_invalid_config() {
 
     let config_path = harness.root.join("config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
-    config.push_str("\n[[repositories]]\nid = \"rpo_short\"\npaths = []\n");
+    config.push_str("\n[[repositories]]\nid = \"FE/mobile\"\npaths = []\n");
     fs::write(config_path, config).unwrap();
     let invalid = installer.doctor();
     assert!(!invalid.healthy);
@@ -793,6 +2921,10 @@ fn uninstall_removes_only_exact_owned_entries_and_retains_repository() {
     let originals = harness.seed_configs();
     let installer = harness.installer("1.0.0");
     installer.setup(&SetupOptions::default()).unwrap();
+    seed_legacy_capture_state(&harness.root);
+    let runtime_paths = runtime_files(&harness.root);
+    fs::write(&runtime_paths[1], b"legacy wal").unwrap();
+    fs::write(&runtime_paths[2], b"legacy shm").unwrap();
 
     let cursor_hooks_path = harness.home.join(".cursor/hooks.json");
     let mut cursor_hooks: serde_json::Value =
@@ -810,6 +2942,13 @@ fn uninstall_removes_only_exact_owned_entries_and_retains_repository() {
     assert!(harness.root.join("repository/.git").is_dir());
     assert!(!harness.root.join("bin").exists());
     assert!(!harness.skill_root().exists());
+    for path in runtime_paths
+        .into_iter()
+        .chain(legacy_capture_paths(&harness.root))
+    {
+        assert!(!path.exists(), "uninstall retained {}", path.display());
+        assert!(report.removed.contains(&path));
+    }
     assert!(
         report
             .warnings
@@ -883,6 +3022,827 @@ fn knowledge_deletion_requires_path_and_phrase_as_two_confirmations() {
 }
 
 #[test]
+fn repeated_setup_repairs_a_missing_bundled_schema_and_reports_the_change() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+    let repository = harness.root.join("repository");
+    git(&repository, &["rm", "--", "schemas/event-v1.schema.json"]);
+    git(
+        &repository,
+        &["commit", "-m", "legacy repository without bundled schema"],
+    );
+
+    let repaired = installer.setup(&SetupOptions::default()).unwrap();
+    assert!(repaired.changed);
+    assert_eq!(
+        fs::read_to_string(repository.join("schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    assert_eq!(git(&repository, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn remote_setup_clones_once_to_stable_work_branch_without_mutating_default() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "team");
+    let remote_main = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let options = remote_setup_options(&fixture.remote);
+
+    let first = harness.installer("1.0.0").setup(&options).unwrap();
+    assert!(first.changed);
+    assert_eq!(first.knowledge_store.source, "remote");
+    assert_eq!(
+        first.knowledge_store.remote_type,
+        Some(KnowledgeRemoteType::Local)
+    );
+    assert_eq!(first.knowledge_store.default_branch, "main");
+    assert_eq!(
+        fs::read_to_string(harness.root.join("repository/schemas/event-v1.schema.json")).unwrap(),
+        V1_JSON_SCHEMA
+    );
+    let work_branch = first.knowledge_store.work_branch.as_deref().unwrap();
+    assert_eq!(
+        work_branch,
+        format!("shared-context/{}", first.knowledge_store.installation_id)
+    );
+    assert_eq!(
+        git(
+            &harness.root.join("repository"),
+            &["symbolic-ref", "--short", "HEAD"]
+        ),
+        work_branch
+    );
+    assert_eq!(
+        git(
+            &harness.root.join("repository"),
+            &["rev-parse", "refs/heads/main"]
+        ),
+        remote_main
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_main
+    );
+    let projection = ProjectionIndex::for_store(&GitStore::open_existing(&harness.root).unwrap())
+        .domain_snapshot()
+        .unwrap();
+    assert_eq!(projection.projection.spaces.len(), 1);
+    let installed_store = GitStore::open_existing(&harness.root).unwrap();
+    let first_write = Event::space_created(
+        IntentSnapshot {
+            title: "First post-Setup write".to_owned(),
+            problem: "Remote bootstrap must leave the Writer usable".to_owned(),
+            desired_outcome: "The first Event commits without layout repair".to_owned(),
+            in_scope: vec!["active pending state".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["append succeeds".to_owned()],
+            domain_terms: vec!["KnowledgeStore".to_owned()],
+        },
+        None,
+    )
+    .unwrap();
+    let appended_head = installed_store
+        .append_event(AppendRequest::event(first_write))
+        .unwrap()
+        .commit_oid;
+    assert_eq!(
+        git(installed_store.repository(), &["rev-parse", "HEAD"]),
+        appended_head
+    );
+    assert!(harness.root.join("state/pending").is_dir());
+    assert!(
+        !Command::new("git")
+            .arg("-C")
+            .arg(&fixture.remote)
+            .args(["show-ref", "--verify", &format!("refs/heads/{work_branch}")])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+
+    let unavailable_remote = harness.home.join("team-knowledge-unavailable.git");
+    fs::rename(&fixture.remote, &unavailable_remote).unwrap();
+    let second = harness.installer("1.0.0").setup(&options).unwrap();
+    assert!(!second.changed);
+    assert_eq!(second.knowledge_store, first.knowledge_store);
+    fs::rename(&unavailable_remote, &fixture.remote).unwrap();
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_main
+    );
+    let manifest = fs::read_to_string(harness.root.join("state/install-manifest.json")).unwrap();
+    assert!(!manifest.contains(fixture.remote.to_str().unwrap()));
+    assert!(manifest.contains("url_digest"));
+    assert!(manifest.contains("installation_id"));
+}
+
+#[test]
+fn remote_setup_rejects_a_different_url_and_an_existing_local_store() {
+    let harness = Harness::new();
+    let first = remote_fixture(&harness, "first");
+    let second = remote_fixture(&harness, "second");
+    harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&first.remote))
+        .unwrap();
+    let work_head = git(&harness.root.join("repository"), &["rev-parse", "HEAD"]);
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&second.remote))
+        .unwrap_err();
+    assert!(error.message().contains("does not match"));
+    assert!(!error.message().contains(second.remote.to_str().unwrap()));
+    assert_eq!(
+        git(&harness.root.join("repository"), &["rev-parse", "HEAD"]),
+        work_head
+    );
+
+    let local = Harness::new();
+    local
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let error = local
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&second.remote))
+        .unwrap_err();
+    assert!(error.message().contains("cannot replace"));
+    assert!(local.root.join("repository/.git").is_dir());
+}
+
+#[test]
+fn remote_setup_rolls_back_the_active_clone_after_a_later_failure() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "rollback");
+    let remote_main = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let options = remote_setup_options(&fixture.remote);
+    let error = harness
+        .installer("1.0.0")
+        .with_failure_after(SetupStage::RepositoryInitialized)
+        .setup(&options)
+        .unwrap_err();
+    assert!(error.message().contains("injected setup failure"));
+    assert!(!harness.root.join("repository").exists());
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        remote_main
+    );
+
+    let recovered = harness.installer("1.0.0").setup(&options).unwrap();
+    assert_eq!(recovered.knowledge_store.source, "remote");
+    assert!(harness.root.join("repository/.git").is_dir());
+}
+
+#[test]
+fn remote_setup_rejects_corrupt_committed_objects_before_activation() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "corrupt-object");
+    let digest = "0".repeat(64);
+    let object = fixture.repository.join("objects/sha256/00").join(&digest);
+    fs::create_dir_all(object.parent().unwrap()).unwrap();
+    fs::write(&object, b"content whose digest is not zero").unwrap();
+    git(
+        &fixture.repository,
+        &["add", "--", object.to_str().unwrap()],
+    );
+    git(&fixture.repository, &["commit", "-m", "add corrupt object"]);
+    git(&fixture.repository, &["push", "origin", "main"]);
+
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap_err();
+    assert!(error.message().contains("object path or digest"));
+    assert!(!harness.root.join("repository").exists());
+}
+
+#[test]
+fn remote_setup_rejects_invalid_events_before_activation() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "corrupt-event");
+    let event = fixture.repository.join("events/invalid.json");
+    fs::create_dir_all(event.parent().unwrap()).unwrap();
+    fs::write(&event, b"{not valid JSON").unwrap();
+    git(&fixture.repository, &["add", "--", "events/invalid.json"]);
+    git(&fixture.repository, &["commit", "-m", "add invalid event"]);
+    git(&fixture.repository, &["push", "origin", "main"]);
+
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap_err();
+    assert!(
+        error.message().contains("parse")
+            || error.message().contains("JSON")
+            || error.message().contains("event")
+    );
+    assert!(!harness.root.join("repository").exists());
+}
+
+#[test]
+fn remote_url_validation_rejects_secrets_and_clone_errors_are_redacted() {
+    let secret = "https://token-value@example.invalid/team/context.git";
+    let error = secret.parse::<KnowledgeStoreUrl>().unwrap_err();
+    assert!(error.message().contains("embedded credentials"));
+    assert!(!error.message().contains("token-value"));
+
+    let harness = Harness::new();
+    let missing = harness.home.join("sensitive-project-name.git");
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&missing))
+        .unwrap_err();
+    assert!(error.message().contains("git clone failed"));
+    assert!(!error.message().contains("sensitive-project-name"));
+    assert!(!harness.root.join("repository").exists());
+}
+
+#[test]
+fn remote_setup_rejects_an_empty_remote_without_creating_a_default_branch() {
+    let harness = Harness::new();
+    let remote = harness.home.join("empty-knowledge.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let error = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&remote))
+        .unwrap_err();
+    assert!(
+        error.message().contains("HEAD")
+            || error.message().contains("default branch")
+            || error.message().contains("git exited")
+    );
+    assert!(!harness.root.join("repository").exists());
+    let refs = Command::new("git")
+        .arg("-C")
+        .arg(&remote)
+        .arg("show-ref")
+        .output()
+        .unwrap();
+    assert!(refs.stdout.is_empty());
+}
+
+#[test]
+fn knowledge_sync_uses_only_the_protected_installation_branch_and_recreates_it() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "protected-sync");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+
+    let source_root = fixture.repository.parent().unwrap();
+    let source = GitStore::open_existing(source_root).unwrap();
+    append_space(&source, "remote default advance");
+    git(&fixture.repository, &["push", "origin", "main"]);
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    let seen_refs = fixture.remote.join("hooks/seen-refs");
+    let protected_hook = format!(
+        "#!/bin/sh\nwhile read old new ref; do\n  printf '%s\\n' \"$ref\" >> {}\n  if [ \"$ref\" = refs/heads/main ]; then exit 1; fi\ndone\nexit 0\n",
+        shell_quote(&seen_refs)
+    );
+    install_remote_hook(&fixture.remote, &protected_hook);
+
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    append_space(&local, "local work advance");
+    let first = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert_eq!(first.base_branch, "main");
+    assert_eq!(first.work_branch, work_branch);
+    assert_eq!(first.behind, 0);
+    assert!(first.ahead > 0);
+    assert!(first.pushed);
+    assert!(first.needs_merge);
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+    let work_ref = format!("refs/heads/{work_branch}");
+    let published = git(&fixture.remote, &["rev-parse", &work_ref]);
+    assert_eq!(published, git(local.repository(), &["rev-parse", "HEAD"]));
+
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/main", &published],
+    );
+    git(&fixture.remote, &["update-ref", "-d", &work_ref]);
+    let merged_default = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let recreated = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(recreated.pushed);
+    assert_eq!(recreated.ahead, 0);
+    assert_eq!(recreated.behind, 0);
+    assert!(!recreated.needs_merge);
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        merged_default
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", &work_ref]),
+        merged_default
+    );
+    let unchanged = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(!unchanged.pushed);
+    assert_eq!(unchanged.ahead, 0);
+    assert_eq!(unchanged.behind, 0);
+    assert!(!unchanged.needs_merge);
+    assert!(
+        fs::read_to_string(seen_refs)
+            .unwrap()
+            .lines()
+            .all(|reference| reference == work_ref)
+    );
+}
+
+#[test]
+fn knowledge_sync_aborts_conflicts_and_restores_the_original_local_head() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "sync-conflict");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+    harness.installer("1.0.0").sync_knowledge().unwrap();
+    let alternate_root = harness.home.join("conflicting work clone");
+    let alternate = clone_work_store(&alternate_root, &fixture.remote, &work_branch);
+
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "same Event different encoding".to_owned(),
+            problem: "two writers add the same path".to_owned(),
+            desired_outcome: "sync aborts instead of choosing bytes".to_owned(),
+            in_scope: vec!["merge conflict".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["original local HEAD is restored".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    let original_local = commit_event_variant(local.repository(), &event, true);
+    commit_event_variant(alternate.repository(), &event, false);
+    let destination = format!("HEAD:refs/heads/{work_branch}");
+    git(alternate.repository(), &["push", "origin", &destination]);
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    let error = harness.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::Conflict);
+    assert_eq!(
+        git(local.repository(), &["rev-parse", "HEAD"]),
+        original_local
+    );
+    assert!(git(local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+}
+
+#[test]
+fn knowledge_sync_retries_a_non_fast_forward_push_race_and_merges_both_heads() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "sync-race");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+    harness.installer("1.0.0").sync_knowledge().unwrap();
+
+    let race_root = harness.home.join("race work clone");
+    let race = clone_work_store(&race_root, &fixture.remote, &work_branch);
+    let race_head = append_space(&race, "remote race Event");
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    let local_head = append_space(&local, "local race Event");
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+
+    let hook = local.repository().join(".git/hooks/pre-push");
+    let destination = format!("HEAD:refs/heads/{work_branch}");
+    let script = format!(
+        "#!/bin/sh\nrm -- \"$0\"\n/usr/bin/git -C {} push origin {} >/dev/null 2>&1\n",
+        shell_quote(race.repository()),
+        shell_quote(Path::new(&destination))
+    );
+    fs::write(&hook, script).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = harness.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(report.pushed);
+    assert_eq!(report.behind, 0);
+    assert!(report.needs_merge);
+    let final_head = git(local.repository(), &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git(
+            &fixture.remote,
+            &["rev-parse", &format!("refs/heads/{work_branch}")]
+        ),
+        final_head
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(local.repository())
+            .args(["merge-base", "--is-ancestor", &local_head, &final_head])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(local.repository())
+            .args(["merge-base", "--is-ancestor", &race_head, &final_head])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+}
+
+#[test]
+fn knowledge_sync_reports_read_only_push_failure_without_targeting_default() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "read-only-sync");
+    let setup = harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    let work_branch = setup.knowledge_store.work_branch.unwrap();
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    let local_head = append_space(&local, "read-only local Event");
+    let default_before = git(&fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let seen_refs = fixture.remote.join("hooks/rejected-refs");
+    let reject = format!(
+        "#!/bin/sh\nwhile read old new ref; do printf '%s\\n' \"$ref\" >> {}; done\nexit 1\n",
+        shell_quote(&seen_refs)
+    );
+    install_remote_hook(&fixture.remote, &reject);
+
+    let error = harness.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::External);
+    assert!(error.message().contains("write access"));
+    assert_eq!(git(local.repository(), &["rev-parse", "HEAD"]), local_head);
+    assert!(git(local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&fixture.remote, &["rev-parse", "refs/heads/main"]),
+        default_before
+    );
+    let expected = format!("refs/heads/{work_branch}");
+    let refs = fs::read_to_string(seen_refs).unwrap();
+    assert_eq!(refs.lines().count(), KNOWLEDGE_SYNC_PUSH_ATTEMPTS_FOR_TEST);
+    assert!(refs.lines().all(|reference| reference == expected));
+}
+
+#[test]
+fn knowledge_sync_rejects_local_store_and_rolls_back_invalid_remote_facts() {
+    let local = Harness::new();
+    local
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let error = local.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::Unsupported);
+
+    let malformed = Harness::new();
+    let malformed_fixture = remote_fixture(&malformed, "malformed-sync");
+    malformed
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&malformed_fixture.remote))
+        .unwrap();
+    let malformed_local = GitStore::open_existing(&malformed.root).unwrap();
+    let malformed_original = git(malformed_local.repository(), &["rev-parse", "HEAD"]);
+    let invalid_path = malformed_fixture.repository.join("events/invalid.json");
+    fs::write(&invalid_path, b"{invalid Event").unwrap();
+    git(
+        &malformed_fixture.repository,
+        &["add", "--", "events/invalid.json"],
+    );
+    git(
+        &malformed_fixture.repository,
+        &["commit", "-m", "add malformed sync Event"],
+    );
+    git(&malformed_fixture.repository, &["push", "origin", "main"]);
+    let malformed_default = git(&malformed_fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let error = malformed.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::InvariantViolation);
+    assert_eq!(
+        git(malformed_local.repository(), &["rev-parse", "HEAD"]),
+        malformed_original
+    );
+    assert!(git(malformed_local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&malformed_fixture.remote, &["rev-parse", "refs/heads/main"]),
+        malformed_default
+    );
+
+    let modified = Harness::new();
+    let modified_fixture = remote_fixture(&modified, "modified-sync");
+    modified
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&modified_fixture.remote))
+        .unwrap();
+    let modified_local = GitStore::open_existing(&modified.root).unwrap();
+    let modified_original = git(modified_local.repository(), &["rev-parse", "HEAD"]);
+    let event_path = git(&modified_fixture.repository, &["ls-files", "events"])
+        .lines()
+        .next()
+        .unwrap()
+        .to_owned();
+    let event_file = modified_fixture.repository.join(&event_path);
+    let mut bytes = fs::read(&event_file).unwrap();
+    bytes.push(b'\n');
+    fs::write(&event_file, bytes).unwrap();
+    git(&modified_fixture.repository, &["add", "--", &event_path]);
+    git(
+        &modified_fixture.repository,
+        &["commit", "-m", "modify existing sync Event"],
+    );
+    git(&modified_fixture.repository, &["push", "origin", "main"]);
+    let modified_default = git(&modified_fixture.remote, &["rev-parse", "refs/heads/main"]);
+    let error = modified.installer("1.0.0").sync_knowledge().unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::InvariantViolation);
+    assert!(error.message().contains("not append-only"));
+    assert_eq!(
+        git(modified_local.repository(), &["rev-parse", "HEAD"]),
+        modified_original
+    );
+    assert!(git(modified_local.repository(), &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git(&modified_fixture.remote, &["rev-parse", "refs/heads/main"]),
+        modified_default
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn fixed_two_installation_team_sharing_and_local_reset_oracle() {
+    let oracle = team_sharing_oracle();
+    assert_eq!(oracle.schema, "shared-context.team-sharing-oracle");
+    assert_eq!(oracle.version, 1);
+    assert_eq!(oracle.repository_id, "FE");
+    assert!(!oracle.source.contains("/Users/"));
+
+    let machine_a = Harness::new();
+    let machine_b = Harness::new();
+    let shared = remote_fixture(&machine_a, "team-sharing-final");
+    let options = remote_setup_options(&shared.remote);
+    let setup_a = machine_a.installer("1.0.0").setup(&options).unwrap();
+    let setup_b = machine_b.installer("1.0.0").setup(&options).unwrap();
+    assert_ne!(
+        setup_a.knowledge_store.installation_id,
+        setup_b.knowledge_store.installation_id
+    );
+    let branch_a = setup_a.knowledge_store.work_branch.unwrap();
+    let branch_b = setup_b.knowledge_store.work_branch.unwrap();
+    assert!(branch_a.starts_with(&oracle.work_branch_prefix));
+    assert!(branch_b.starts_with(&oracle.work_branch_prefix));
+    assert_ne!(branch_a, branch_b);
+
+    let checkout_a = init_team_checkout(&machine_a.home.join("A FE checkout"), &oracle);
+    let checkout_b = init_team_checkout(&machine_b.home.join("B FE checkout"), &oracle);
+    assert_ne!(checkout_a, checkout_b);
+    let repository_id: sctx_domain::RepositoryId = oracle.repository_id.parse().unwrap();
+    for (root, checkout) in [
+        (&machine_a.root, &checkout_a),
+        (&machine_b.root, &checkout_b),
+    ] {
+        UserConfigStore::open_existing(root)
+            .unwrap()
+            .add_repository(repository_id.clone(), std::slice::from_ref(checkout))
+            .unwrap();
+    }
+
+    let scan_a = repository_scan_at_root(
+        &machine_a.root,
+        &RepositoryScanInput {
+            checkout_path: checkout_a.to_string_lossy().into_owned(),
+            paths: vec![oracle.relative_path.clone()],
+            max_artifacts: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(scan_a.repository_id, repository_id);
+    let (context_id, revision_id) = append_accepted_team_context(&machine_a.root, &oracle);
+    let recorded = engineering_reference_record_at_root(
+        &machine_a.root,
+        &EngineeringReferenceRecordInput {
+            context_id: context_id.to_string(),
+            revision_id: revision_id.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "Machine A inspected the fixed tracked FE artifact".to_owned(),
+            limitations: vec!["Resolution must be rebuilt on each installation".to_owned()],
+        },
+    )
+    .unwrap();
+    let default_ref = format!("refs/heads/{}", oracle.base_branch);
+    let default_before_a = git(&shared.remote, &["rev-parse", &default_ref]);
+    let sync_a = machine_a.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(sync_a.pushed);
+    assert!(sync_a.needs_merge);
+    assert_eq!(sync_a.base_branch, oracle.base_branch);
+    assert_eq!(
+        git(&shared.remote, &["rev-parse", &default_ref]),
+        default_before_a
+    );
+
+    let branch_a_ref = format!("refs/heads/{branch_a}");
+    let integrated_head = git(&shared.remote, &["rev-parse", &branch_a_ref]);
+    git(
+        &shared.remote,
+        &["update-ref", &default_ref, &integrated_head],
+    );
+    git(&shared.remote, &["update-ref", "-d", &branch_a_ref]);
+    let default_before_b = git(&shared.remote, &["rev-parse", &default_ref]);
+    let sync_b = machine_b.installer("1.0.0").sync_knowledge().unwrap();
+    assert!(sync_b.pushed);
+    assert!(!sync_b.needs_merge);
+    assert_eq!(sync_b.ahead, 0);
+    assert_eq!(sync_b.behind, 0);
+    assert_eq!(
+        git(&shared.remote, &["rev-parse", &default_ref]),
+        default_before_b
+    );
+
+    let scan_b = repository_scan_at_root(
+        &machine_b.root,
+        &RepositoryScanInput {
+            checkout_path: checkout_b.to_string_lossy().into_owned(),
+            paths: vec![oracle.relative_path.clone()],
+            max_artifacts: 20,
+        },
+    )
+    .unwrap();
+    assert_eq!(scan_b.repository_id, repository_id);
+    let rebuilt = association_rebuild_at_root(
+        &machine_b.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(rebuilt.reference_count, 1);
+    assert_eq!(rebuilt.status_counts.resolved, 1);
+    assert_eq!(rebuilt.repositories.len(), 1);
+    assert_eq!(rebuilt.repositories[0].repository_id, repository_id);
+    assert_eq!(
+        rebuilt.repositories[0].checkout_path.as_ref(),
+        Some(&checkout_b)
+    );
+    let explained = association_explain_at_root(
+        &machine_b.root,
+        &AssociationExplainInput {
+            reference_id: recorded.reference_id.to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(explained.context_id, context_id);
+    assert_eq!(explained.repository_id, repository_id);
+    assert_eq!(explained.status, sctx_domain::ResolutionStatus::Resolved);
+    let artifact = explained.resolved_artifact.unwrap();
+    assert_eq!(artifact.repository_id(), repository_id);
+    assert_eq!(
+        artifact.locator(),
+        &ArtifactLocator::File {
+            path: RepoRelativePath::new(&oracle.relative_path).unwrap()
+        }
+    );
+
+    let task = task_intent_update_at_root(
+        &machine_b.root,
+        &TaskIntentUpdateInput {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "team-sharing-machine-b".to_owned(),
+            task_boundary: TaskBoundary::New,
+            expected_revision_id: ExpectedRevisionId::Null(()),
+            intent: WorkingIntentSnapshot::new("Use the shared FE contract").unwrap(),
+        },
+    )
+    .unwrap();
+    let focused = task_artifact_focus_at_root(
+        &machine_b.root,
+        &ArtifactFocusQuery {
+            agent_kind: "codex".to_owned(),
+            external_session_id: "team-sharing-machine-b".to_owned(),
+            expected_revision_id: task.context.intent_revision_id.to_string(),
+            absolute_file_path: checkout_b
+                .join(&oracle.relative_path)
+                .to_string_lossy()
+                .into_owned(),
+            locator: ArtifactFocusQueryCoordinates::File,
+            token_budget: 4_000,
+            max_spaces: 8,
+        },
+    )
+    .unwrap();
+    assert_eq!(focused.resolved_focus.repository_id, repository_id);
+    // Machine B reaches the Context Machine A wrote, by the file both installations record it
+    // against. It is a `file_anchor` rather than an `engineering_graph` path because ADR-0007's
+    // first lane joins the Focus coordinate against the Engineering Reference rows in the index --
+    // which is also why this works before Machine B has built a Graph of its own.
+    assert!(
+        focused.context.items.iter().any(|item| {
+            item.context.context_id == context_id
+                && item
+                    .retrieval_paths
+                    .iter()
+                    .all(|path| matches!(path, TaskRetrievalPath::FileAnchor { .. }))
+        }),
+        "{:#?}",
+        focused.context.items
+    );
+
+    let preserved_paths = [
+        machine_b.root.join("bin/current/sctx"),
+        machine_b.root.join("state/install-manifest.json"),
+        machine_b.home.join(".cursor/mcp.json"),
+        machine_b.home.join(".cursor/hooks.json"),
+        machine_b.home.join(".codex/config.toml"),
+        machine_b.home.join(".codex/hooks.json"),
+        machine_b.skill_root().join("SKILL.md"),
+    ];
+    let preserved = preserved_paths
+        .iter()
+        .map(|path| (path.clone(), fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    let remote_before_reset = git(&shared.remote, &["show-ref"]);
+    let reset = machine_b
+        .installer("1.0.0")
+        .reset_data(DataResetOptions {
+            confirmed: true,
+            dry_run: false,
+        })
+        .unwrap();
+    assert!(reset.remote_detached);
+    assert!(!reset.remote_mutated);
+    assert_eq!(reset.repository_count_cleared, 1);
+    for (path, bytes) in preserved {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    assert_eq!(git(&shared.remote, &["show-ref"]), remote_before_reset);
+    let reset_store = GitStore::open_existing(&machine_b.root).unwrap();
+    assert!(git(reset_store.repository(), &["remote"]).is_empty());
+    assert_eq!(
+        git(reset_store.repository(), &["rev-list", "--count", "HEAD"]),
+        "1"
+    );
+    let empty = ProjectionIndex::for_store(&reset_store)
+        .domain_snapshot()
+        .unwrap();
+    assert!(empty.projection.spaces.is_empty());
+    assert!(empty.projection.engineering_references.is_empty());
+    let empty_catalog = UserConfigStore::open_existing(&machine_b.root)
+        .unwrap()
+        .repository_catalog()
+        .unwrap();
+    assert!(empty_catalog.repositories.is_empty());
+    assert!(
+        RepositoryRegistry::initialize(&machine_b.root)
+            .unwrap()
+            .list()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        TaskRuntime::initialize(&machine_b.root)
+            .unwrap()
+            .read_external_session_by_locator(
+                &ExternalSessionLocator::new("codex", "team-sharing-machine-b").unwrap()
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(machine_b.installer("1.0.0").doctor().healthy);
+    let a_snapshot = ProjectionIndex::for_store(&GitStore::open_existing(&machine_a.root).unwrap())
+        .domain_snapshot()
+        .unwrap();
+    assert!(
+        a_snapshot
+            .projection
+            .spaces
+            .values()
+            .any(|space| space.contexts.contains_key(&context_id))
+    );
+}
+
+#[test]
 fn next_setup_recovers_an_incomplete_durable_journal_before_reapplying() {
     let harness = Harness::new();
     let installer = harness.installer("1.0.0");
@@ -905,4 +3865,1014 @@ fn next_setup_recovers_an_incomplete_durable_journal_before_reapplying() {
         serde_json::from_slice(&fs::read(&report.journal).unwrap()).unwrap();
     assert_eq!(recovered_journal["phase"], "recovered_rollback");
     assert_eq!(recovered_journal["complete"], true);
+}
+
+/// `APPEND_PROTOCOL_BYPASSED` (WP-V6 fix 4) used to reach only whichever process's own
+/// `sctx index sync` call happened to trigger the fallback rebuild that found it, gone the moment
+/// that process exited. It is now persisted in the index's own `meta` table, so a `sctx doctor`
+/// run long after the triggering synchronization still sees it.
+#[test]
+fn doctor_surfaces_a_persisted_append_protocol_bypass_after_the_synchronization_that_found_it() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let append_protocol_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "append_protocol")
+            .expect("doctor always reports append-protocol integrity")
+            .clone()
+    };
+    assert_eq!(
+        append_protocol_check(&installer.doctor()).status,
+        CheckStatus::Ok,
+        "a freshly set up installation has no history to warn about"
+    );
+
+    let store = GitStore::open_existing(&harness.root).unwrap();
+    let event = Event::space_created(
+        IntentSnapshot {
+            title: "doctor append-protocol fixture".to_owned(),
+            problem: "a persisted bypass warning must survive past the call that found it"
+                .to_owned(),
+            desired_outcome: "sctx doctor reports it".to_owned(),
+            in_scope: vec!["append-protocol integrity".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["doctor names the modified path".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    let outcome = store.append_event(AppendRequest::event(event)).unwrap();
+    let event_path = harness.root.join("repository").join(&outcome.event_path);
+    let index = ProjectionIndex::new(harness.root.join("repository"), harness.root.join("state"));
+    index.synchronize().unwrap();
+
+    // Committed history modified outside the append protocol: the same shape
+    // `crates/index/tests/sqlite_rebuild.rs`'s "modify" case constructs.
+    let replacement = Event::space_created(
+        IntentSnapshot {
+            title: "manual replacement".to_owned(),
+            problem: "committed history must not be a second source of truth".to_owned(),
+            desired_outcome: "doctor names the modified path".to_owned(),
+            in_scope: vec!["append-protocol integrity".to_owned()],
+            out_of_scope: Vec::new(),
+            acceptance_conditions: vec!["doctor reports the bypass".to_owned()],
+            domain_terms: Vec::new(),
+        },
+        None,
+    )
+    .unwrap();
+    fs::write(&event_path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+    git(
+        &harness.root.join("repository"),
+        &["add", "--", &outcome.event_path],
+    );
+    git(
+        &harness.root.join("repository"),
+        &["commit", "-m", "Bypass append protocol for doctor test"],
+    );
+
+    let synchronized = index.synchronize().unwrap();
+    assert_eq!(
+        synchronized.incremental_fallback,
+        Some(IncrementalFallback::AppendProtocolBypassed)
+    );
+
+    let bypassed = append_protocol_check(&installer.doctor());
+    assert_eq!(
+        bypassed.status,
+        CheckStatus::Warning,
+        "a persisted bypass must not read as healthy: {}",
+        bypassed.message
+    );
+    assert!(
+        bypassed.message.contains("知识仓库历史出现非追加变更"),
+        "{}",
+        bypassed.message
+    );
+    assert!(
+        bypassed.message.contains(&outcome.event_path),
+        "the message must name the modified path: {}",
+        bypassed.message
+    );
+}
+
+/// A dark Graph channel is silent by construction: every Task Context Pack degrades to text, and
+/// that degradation is the normal path for an installation with no Graph at all. So `doctor` is
+/// where it has to become visible, and the warning has to name the command that repairs it.
+#[test]
+fn doctor_warns_when_the_graph_lags_the_store_rather_than_calling_it_healthy() {
+    // A Confirmation whose rescan did not finish leaves the Graph one Context Tree behind the
+    // Store. It still has snapshots in it, so the old check called that healthy while
+    // Artifact-anchored retrieval quietly missed everything confirmed since.
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let graph_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "engineering_graph")
+            .expect("doctor always reports the Graph channel")
+            .clone()
+    };
+
+    let oracle = team_sharing_oracle();
+    let checkout = init_team_checkout(&harness.home.join("doctor stale checkout"), &oracle);
+    let repository_id: sctx_domain::RepositoryId = oracle.repository_id.parse().unwrap();
+    UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .add_repository(repository_id.clone(), std::slice::from_ref(&checkout))
+        .unwrap();
+    let config_path = harness.root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[engineering]\nauto_scan = false\n");
+    fs::write(&config_path, text).unwrap();
+
+    let (context_id, revision_id) = append_accepted_team_context(&harness.root, &oracle);
+    engineering_reference_record_at_root(
+        &harness.root,
+        &EngineeringReferenceRecordInput {
+            context_id: context_id.to_string(),
+            revision_id: revision_id.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "The doctor fixture inspected the fixed tracked artifact".to_owned(),
+            limitations: vec!["Synthetic doctor fixture".to_owned()],
+        },
+    )
+    .unwrap();
+    association_rebuild_at_root(
+        &harness.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(graph_check(&installer.doctor()).status, CheckStatus::Ok);
+
+    // One more accepted Context, and no rebuild after it.
+    let (later_context, later_revision) = append_accepted_team_context(&harness.root, &oracle);
+    engineering_reference_record_at_root(
+        &harness.root,
+        &EngineeringReferenceRecordInput {
+            context_id: later_context.to_string(),
+            revision_id: later_revision.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "A later Confirmation the Graph has not caught up with".to_owned(),
+            limitations: vec!["Synthetic doctor fixture".to_owned()],
+        },
+    )
+    .unwrap();
+
+    let stale = graph_check(&installer.doctor());
+    assert_eq!(
+        stale.status,
+        CheckStatus::Warning,
+        "a Graph behind the Store is not healthy: {}",
+        stale.message
+    );
+    assert!(stale.message.contains("Context Tree"), "{}", stale.message);
+    assert!(
+        stale.message.contains("sctx association rebuild"),
+        "{}",
+        stale.message
+    );
+
+    association_rebuild_at_root(
+        &harness.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(graph_check(&installer.doctor()).status, CheckStatus::Ok);
+}
+
+#[test]
+fn doctor_names_the_repair_when_engineering_references_resolve_against_no_graph() {
+    let harness = Harness::new();
+    let installer = harness.installer("1.0.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let graph_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "engineering_graph")
+            .expect("doctor always reports the Graph channel")
+            .clone()
+    };
+    let empty = installer.doctor();
+    assert_eq!(graph_check(&empty).status, CheckStatus::Ok);
+    assert!(
+        graph_check(&empty)
+            .message
+            .contains("no Engineering Reference")
+    );
+
+    let oracle = team_sharing_oracle();
+    let checkout = init_team_checkout(&harness.home.join("doctor graph checkout"), &oracle);
+    let repository_id: sctx_domain::RepositoryId = oracle.repository_id.parse().unwrap();
+    UserConfigStore::open_existing(&harness.root)
+        .unwrap()
+        .add_repository(repository_id.clone(), std::slice::from_ref(&checkout))
+        .unwrap();
+    // The opt-out reproduces the shape a real installation reached before the Confirmation-time
+    // rescan existed: References in the Store, nothing scanned, and no complaint anywhere.
+    let config_path = harness.root.join("config.toml");
+    let mut text = fs::read_to_string(&config_path).unwrap();
+    text.push_str("\n[engineering]\nauto_scan = false\n");
+    fs::write(&config_path, text).unwrap();
+
+    let (context_id, revision_id) = append_accepted_team_context(&harness.root, &oracle);
+    engineering_reference_record_at_root(
+        &harness.root,
+        &EngineeringReferenceRecordInput {
+            context_id: context_id.to_string(),
+            revision_id: revision_id.to_string(),
+            repository_id: repository_id.to_string(),
+            artifact_kind: ArtifactKind::File,
+            relation: ReferenceRelation::Implements,
+            locator: ArtifactLocator::File {
+                path: RepoRelativePath::new(&oracle.relative_path).unwrap(),
+            },
+            supports: "The doctor fixture inspected the fixed tracked artifact".to_owned(),
+            limitations: vec!["Synthetic doctor fixture".to_owned()],
+        },
+    )
+    .unwrap();
+
+    let dark = graph_check(&installer.doctor());
+    assert_eq!(dark.status, CheckStatus::Warning);
+    assert!(
+        dark.message.contains("sctx association rebuild"),
+        "{}",
+        dark.message
+    );
+    assert!(dark.message.contains("auto_scan"), "{}", dark.message);
+
+    association_rebuild_at_root(
+        &harness.root,
+        &AssociationRebuildInput {
+            diagnose_only: false,
+        },
+    )
+    .unwrap();
+    let repaired = graph_check(&installer.doctor());
+    assert_eq!(repaired.status, CheckStatus::Ok);
+    assert!(
+        repaired.message.contains("Graph Context snapshots"),
+        "{}",
+        repaired.message
+    );
+}
+
+#[test]
+fn doctor_reports_the_embedding_channel_as_off_configured_or_broken() {
+    let harness = Harness::new();
+    let installer = harness.installer("0.1.0");
+    installer.setup(&SetupOptions::default()).unwrap();
+
+    let retrieval_check = |report: &sctx_installer::DoctorReport| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.name == "retrieval_embedding")
+            .expect("doctor always reports the embedding channel")
+            .clone()
+    };
+
+    // 1. Unconfigured is the default and is healthy: lexical retrieval is the product's baseline,
+    //    not a degraded state. Doctor still says how to turn the channel on.
+    let off = retrieval_check(&installer.doctor());
+    assert_eq!(off.status, CheckStatus::Ok);
+    assert!(off.message.contains("Off."), "{}", off.message);
+    assert!(
+        off.message.contains("sctx embedding install"),
+        "an operator who wants the channel must learn how from doctor, and since T5c that is one \
+         command rather than a manual errand: {}",
+        off.message
+    );
+
+    let config_path = harness.root.join("config.toml");
+    let model = harness.root.join("模型目录");
+    let runtime = harness.root.join("libonnxruntime.dylib");
+    std::fs::create_dir_all(&model).unwrap();
+
+    // 2. Half a configuration is an operator mistake, not a silent no-op.
+    let mut text = std::fs::read_to_string(&config_path).unwrap();
+    let _ = write!(
+        text,
+        "\n[retrieval]\nembedding_model_path = \"{}\"\n",
+        model.display()
+    );
+    std::fs::write(&config_path, &text).unwrap();
+    let half = retrieval_check(&installer.doctor());
+    assert_eq!(half.status, CheckStatus::Warning);
+    assert!(half.message.contains("only one of"), "{}", half.message);
+
+    // 3. Configured but with the files absent: the operator believes they are paying for semantic
+    //    recall and is not getting it, which is the one state worth a warning.
+    let _ = writeln!(text, "embedding_runtime_path = \"{}\"", runtime.display());
+    std::fs::write(&config_path, &text).unwrap();
+    let broken = retrieval_check(&installer.doctor());
+    assert_eq!(broken.status, CheckStatus::Warning);
+    assert!(broken.message.contains("model.onnx"), "{}", broken.message);
+    assert!(
+        broken.message.contains("tokenizer.json"),
+        "{}",
+        broken.message
+    );
+    assert!(
+        installer.doctor().healthy,
+        "an unconfigured or misconfigured optional channel never makes an installation unhealthy"
+    );
+
+    // 4. Every file present: reported as configured, without paying the 9-12 second model load
+    //    that only `serve` should ever pay.
+    std::fs::write(model.join("model.onnx"), b"not a real model").unwrap();
+    std::fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+    std::fs::write(&runtime, b"not a real library").unwrap();
+    let configured = retrieval_check(&installer.doctor());
+    assert_eq!(configured.status, CheckStatus::Ok);
+    assert!(
+        configured.message.contains("Configured:"),
+        "{}",
+        configured.message
+    );
+    assert!(
+        configured
+            .message
+            .contains("0 Context revision(s) embedded"),
+        "a fresh installation has embedded nothing yet: {}",
+        configured.message
+    );
+}
+
+fn maintain_step<'a>(digest: &'a MaintainDigest, name: &str) -> &'a MaintainStep {
+    digest
+        .steps
+        .iter()
+        .find(|step| step.name == name)
+        .unwrap_or_else(|| panic!("digest has no {name} step: {digest:?}"))
+}
+
+fn maintain_check(report: &sctx_installer::DoctorReport) -> &sctx_installer::DoctorCheck {
+    report
+        .checks
+        .iter()
+        .find(|check| check.name == "maintain")
+        .expect("doctor reports a maintain check")
+}
+
+/// The digest is the whole point of `maintain run`: it is what `doctor` reads, what an operator
+/// reads, and what a later automatic triage pass will extend. So its shape is asserted on disk,
+/// field by field, rather than only through the returned value.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn maintain_run_records_a_digest_and_skips_the_sync_a_local_installation_cannot_do() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    let digest = harness
+        .installer("1.0.0")
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+
+    assert_eq!(digest.schema_version, 1);
+    assert_eq!(digest.mode, MaintainMode::Scheduled);
+    assert_eq!(
+        digest
+            .steps
+            .iter()
+            .map(|step| step.name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "association_rebuild",
+            "candidate_survey",
+            "provisional_space_survey",
+            "knowledge_sync",
+            "logs_sync",
+        ]
+    );
+    for name in [
+        "association_rebuild",
+        "candidate_survey",
+        "provisional_space_survey",
+    ] {
+        let step = maintain_step(&digest, name);
+        assert_eq!(step.outcome, MaintainOutcome::Ok, "{step:?}");
+        assert_eq!(step.attempts, 1);
+        assert!(step.reason.is_none());
+        assert!(!step.needs_human);
+    }
+    // A locally bootstrapped Knowledge Store has no remote. That is a property of the installation,
+    // not a fault, so it is skipped without spending an attempt -- and `doctor` stays quiet.
+    let sync = maintain_step(&digest, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Skipped);
+    assert_eq!(sync.attempts, 0);
+    assert!(
+        sync.reason.as_deref().unwrap().contains("local"),
+        "{sync:?}"
+    );
+    assert!(!sync.needs_human);
+    let logs_sync = maintain_step(&digest, "logs_sync");
+    assert_eq!(logs_sync.outcome, MaintainOutcome::Skipped);
+    assert_eq!(logs_sync.attempts, 0);
+    assert!(
+        logs_sync
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("not configured"),
+        "{logs_sync:?}"
+    );
+    assert!(digest.failed_steps().is_empty());
+
+    assert_eq!(
+        digest.counts.candidate_expiry_horizon_seconds,
+        7 * 24 * 60 * 60
+    );
+    assert_eq!(digest.counts.pending_candidate_reviews, 0);
+    assert_eq!(digest.counts.expiring_candidate_reviews, 0);
+    assert_eq!(digest.counts.provisional_spaces, 0);
+    assert_eq!(digest.counts.engineering_references, 0);
+    assert_eq!(digest.counts.unresolved_references, 0);
+    assert_eq!(digest.counts.relocation_candidates, 0);
+    assert!(digest.graph_generation.is_some());
+    assert!(digest.finished_at_unix_seconds >= digest.started_at_unix_seconds);
+
+    let digest_path = harness.root.join("state/maintain-digest.json");
+    assert_eq!(
+        fs::metadata(&digest_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let written: serde_json::Value =
+        serde_json::from_slice(&fs::read(&digest_path).unwrap()).unwrap();
+    assert_eq!(
+        written
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "counts",
+            "finished_at_unix_seconds",
+            "graph_generation",
+            "mode",
+            "projection_generation",
+            "schema_version",
+            "started_at_unix_seconds",
+            "steps",
+        ],
+        "the digest is a stable, readable shape, not an accident of serialization"
+    );
+    assert_eq!(
+        written["counts"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "candidate_expiry_horizon_seconds",
+            "engineering_references",
+            "expiring_candidate_reviews",
+            "pending_candidate_reviews",
+            "provisional_spaces",
+            "relocation_candidates",
+            "unresolved_references",
+        ]
+    );
+    assert_eq!(written["steps"][3]["outcome"], "skipped");
+    assert_eq!(written["mode"], "scheduled");
+    // Every field is optional on read, so a digest a newer version wrote still loads here.
+    let reloaded: MaintainDigest = serde_json::from_str("{}").unwrap();
+    assert_eq!(reloaded.schema_version, 0);
+
+    let marker = harness.root.join("state/maintain-last-run");
+    assert_eq!(
+        fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap(),
+        digest.finished_at_unix_seconds
+    );
+
+    let log = fs::read_dir(harness.root.join("logs"))
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().is_some_and(|extension| extension == "log")
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("maintain-"))
+        })
+        .expect("the run appends one summary line to a dated maintenance log");
+    let line = fs::read_to_string(&log).unwrap();
+    assert!(line.contains("mode=scheduled"), "{line}");
+    assert!(line.contains("knowledge_sync=skipped"), "{line}");
+    assert!(line.contains("pending_reviews=0"), "{line}");
+
+    let status = harness.installer("1.0.0").maintain_status().unwrap();
+    assert_eq!(status.digest.as_ref(), Some(&digest));
+    assert_eq!(
+        status.last_run_at_unix_seconds,
+        Some(digest.finished_at_unix_seconds)
+    );
+    assert_eq!(status.digest_path, digest_path);
+    assert_eq!(status.last_run_path, marker);
+}
+
+/// The two ways a run meets a busy installation, and the one thing that must be true of both: the
+/// read-only steps still run. They take the *shared* lease, so a concurrent shared holder -- an
+/// editor's in-flight MCP call, another `association rebuild` -- is not competition.
+#[test]
+fn maintain_backs_off_while_busy_and_an_opportunistic_run_yields_at_once() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "maintain-busy");
+    harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+
+    let maintenance = MaintenanceLock::open_or_create(&harness.root).unwrap();
+    let shared = maintenance.try_shared().unwrap();
+
+    let scheduled = harness
+        .installer("1.0.0")
+        .with_maintain_sync_backoff(vec![std::time::Duration::from_millis(5); 3])
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    for name in [
+        "association_rebuild",
+        "candidate_survey",
+        "provisional_space_survey",
+    ] {
+        assert_eq!(
+            maintain_step(&scheduled, name).outcome,
+            MaintainOutcome::Ok,
+            "the read-only steps coexist with a concurrent shared lease holder"
+        );
+    }
+    let sync = maintain_step(&scheduled, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Failed);
+    assert_eq!(
+        sync.attempts, 4,
+        "one attempt plus one per backoff entry, and no more"
+    );
+    assert!(!sync.needs_human, "a busy installation is not a decision");
+    assert_eq!(scheduled.failed_steps().len(), 1);
+
+    // The opportunistic run must not even look at the backoff schedule, so it is handed one it
+    // could never afford to wait on.
+    let opportunistic = harness
+        .installer("1.0.0")
+        .with_maintain_sync_backoff(vec![std::time::Duration::from_secs(600)])
+        .maintain(&MaintainOptions {
+            opportunistic: true,
+        })
+        .unwrap();
+    assert_eq!(opportunistic.mode, MaintainMode::Opportunistic);
+    let sync = maintain_step(&opportunistic, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Skipped);
+    assert_eq!(sync.attempts, 1);
+    assert!(
+        opportunistic.failed_steps().is_empty(),
+        "stepping aside is the mode's purpose, not a failure to report"
+    );
+
+    drop(shared);
+    let completed = harness
+        .installer("1.0.0")
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    let sync = maintain_step(&completed, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Ok, "{sync:?}");
+    assert_eq!(sync.attempts, 1);
+}
+
+/// A remote that accepts the connection and then stops answering is the failure the exclusive
+/// maintenance lease cannot survive without a budget: nothing else in the installation can run
+/// until the transfer returns.
+#[test]
+fn a_stalled_network_git_operation_is_terminated_and_frees_the_exclusive_lease() {
+    let harness = Harness::new();
+    let fixture = remote_fixture(&harness, "maintain-stall");
+    harness
+        .installer("1.0.0")
+        .setup(&remote_setup_options(&fixture.remote))
+        .unwrap();
+    // The closest local stand-in for that remote: a receive hook that never replies.
+    install_remote_hook(&fixture.remote, "#!/bin/sh\nsleep 45\nexit 0\n");
+    let local = GitStore::open_existing(&harness.root).unwrap();
+    append_space(&local, "work that must be pushed");
+
+    let started = std::time::Instant::now();
+    let error = harness
+        .installer("1.0.0")
+        .with_git_network_timeout(std::time::Duration::from_millis(500))
+        .sync_knowledge()
+        .unwrap_err();
+    assert_eq!(error.kind(), sctx_installer::ErrorKind::External);
+    assert!(error.message().contains("terminated"), "{error}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the stalled child was waited on rather than killed"
+    );
+    // The whole reason for the budget: the lease the failed sync held is available immediately.
+    assert!(
+        MaintenanceLock::open_or_create(&harness.root)
+            .unwrap()
+            .try_exclusive()
+            .is_ok()
+    );
+    assert!(
+        fs::read_to_string(harness.root.join("repository/.git/HEAD")).is_ok(),
+        "the Knowledge Store checkout survives a killed transfer"
+    );
+
+    // And a maintenance run records the same ending instead of raising it, leaving the read-only
+    // steps it already completed intact.
+    let digest = harness
+        .installer("1.0.0")
+        .with_git_network_timeout(std::time::Duration::from_millis(500))
+        .with_maintain_sync_backoff(Vec::new())
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    let sync = maintain_step(&digest, "knowledge_sync");
+    assert_eq!(sync.outcome, MaintainOutcome::Failed);
+    assert_eq!(
+        sync.attempts, 1,
+        "a stall is not a busy lease; it is not retried"
+    );
+    assert!(!sync.needs_human);
+    assert!(
+        sync.reason.as_deref().unwrap().contains("terminated"),
+        "{sync:?}"
+    );
+    assert_eq!(
+        maintain_step(&digest, "association_rebuild").outcome,
+        MaintainOutcome::Ok
+    );
+}
+
+/// Three states, and the reason the first is not a warning: a machine installed five minutes ago
+/// has nothing to maintain, and a doctor that complains about that teaches operators to skim.
+#[test]
+fn doctor_reports_never_run_clean_and_failed_maintenance_without_ever_erroring() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+
+    let never = harness.installer("1.0.0").doctor();
+    let check = maintain_check(&never);
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(check.message.contains("No maintenance run"), "{check:?}");
+
+    harness
+        .installer("1.0.0")
+        .maintain(&MaintainOptions::default())
+        .unwrap();
+    let clean = harness.installer("1.0.0").doctor();
+    let check = maintain_check(&clean);
+    assert_eq!(check.status, CheckStatus::Ok);
+    assert!(check.message.contains("completed every step"), "{check:?}");
+    assert!(
+        check.message.contains("0 Candidate Reviews pending"),
+        "{check:?}"
+    );
+
+    let mut digest = sctx_installer::maintain::read_digest(&harness.root)
+        .unwrap()
+        .unwrap();
+    digest.steps.push(MaintainStep {
+        name: "knowledge_sync".to_owned(),
+        outcome: MaintainOutcome::Failed,
+        reason: Some("Knowledge Store branch merge conflicted".to_owned()),
+        attempts: 1,
+        needs_human: true,
+        duration_ms: 0,
+    });
+    fs::write(
+        harness.root.join("state/maintain-digest.json"),
+        serde_json::to_vec(&digest).unwrap(),
+    )
+    .unwrap();
+    let degraded = harness.installer("1.0.0").doctor();
+    let check = maintain_check(&degraded);
+    assert_eq!(check.status, CheckStatus::Warning);
+    assert!(
+        check
+            .message
+            .contains("knowledge_sync: Knowledge Store branch merge conflicted"),
+        "{check:?}"
+    );
+    assert!(
+        check.message.contains("needs a human decision"),
+        "{check:?}"
+    );
+    assert_eq!(
+        degraded
+            .checks
+            .iter()
+            .filter(|other| other.name == "maintain" && other.status == CheckStatus::Error)
+            .count(),
+        0,
+        "an unsynchronized Knowledge Store never makes the installation itself unhealthy"
+    );
+}
+
+/// Reads the exact bytes `setup` installed for the daily maintenance job.
+fn installed_plist(home: &Path) -> String {
+    fs::read_to_string(launch_agent_path(home)).unwrap()
+}
+
+/// Appends one `[maintenance]` table to an installation's `config.toml`.
+fn write_maintenance_table(root: &Path, table: &str) {
+    let path = root.join("config.toml");
+    let mut document = fs::read_to_string(&path).unwrap();
+    document.push_str(table);
+    fs::write(&path, document).unwrap();
+}
+
+#[test]
+fn setup_installs_one_daily_maintenance_launch_agent_and_follows_the_configured_time() {
+    let harness = Harness::new();
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(report.changed);
+
+    let plist = launch_agent_path(&harness.home);
+    assert!(plist.is_file());
+    assert_eq!(
+        fs::metadata(&plist).unwrap().permissions().mode() & 0o7777,
+        0o644
+    );
+    // The complete installed document, so a change to the schedule launchd reads is a change to
+    // this test rather than a silent one.
+    let program = harness.root.join("bin/current/sctx");
+    let log = harness.root.join("logs/maintain-launchd.log");
+    let expected = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.shared-context.maintain</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>{}</string>
+		<string>maintain</string>
+		<string>run</string>
+		<string>--json</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>6</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>{}</string>
+	<key>StandardErrorPath</key>
+	<string>{}</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+</dict>
+</plist>
+"#,
+        program.display(),
+        log.display(),
+        log.display(),
+    );
+    assert_eq!(installed_plist(&harness.home), expected);
+    // The program is the version-stable symlink, so an upgrade never has to rewrite the plist.
+    assert!(!expected.contains("1.0.0"));
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["launch_agent"]["label"],
+        "com.shared-context.maintain"
+    );
+    assert_eq!(manifest["launch_agent"]["path"], plist.to_str().unwrap());
+    assert_eq!(
+        manifest["launch_agent"]["sha256"].as_str().unwrap(),
+        format!("{:x}", Sha256::digest(expected.as_bytes()))
+    );
+
+    // Re-running with the same schedule is a no-op down to the bytes.
+    let repeat = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(!repeat.changed);
+    assert_eq!(installed_plist(&harness.home), expected);
+
+    // An explicit time reaches launchd, and only the two integers move.
+    write_maintenance_table(
+        &harness.root,
+        "\n[maintenance]\nschedule_hour = 21\nschedule_minute = 30\n",
+    );
+    let rescheduled = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(rescheduled.changed);
+    let plist_text = installed_plist(&harness.home);
+    assert_eq!(
+        plist_text,
+        expected
+            .replace("<integer>6</integer>", "<integer>21</integer>")
+            .replace("<integer>0</integer>", "<integer>30</integer>")
+    );
+
+    // An impossible time is a typed refusal, not a job that never fires.
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    write_maintenance_table(&harness.root, "\n[maintenance]\nschedule_hour = 24\n");
+    let error = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("schedule_hour"), "{error}");
+}
+
+#[test]
+fn setup_never_claims_or_overwrites_a_launch_agent_it_did_not_write() {
+    let harness = Harness::new();
+    let plist = launch_agent_path(&harness.home);
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, b"<!-- someone else's job -->\n").unwrap();
+
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(fs::read(&plist).unwrap(), b"<!-- someone else's job -->\n");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("preserved user-owned launchd job")),
+        "{:?}",
+        report.notices
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.get("launch_agent").is_none());
+
+    // Uninstall owns nothing here, so it removes nothing.
+    let uninstall = harness.installer("1.0.0").uninstall().unwrap();
+    assert!(plist.is_file());
+    assert!(!uninstall.removed.contains(&plist));
+
+    // A job this installation *did* write, then the operator edited, is equally untouchable.
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let plist = launch_agent_path(&harness.home);
+    fs::write(&plist, b"<!-- hand-tuned -->\n").unwrap();
+    let report = harness
+        .installer("1.1.0")
+        .upgrade(&SetupOptions::default())
+        .unwrap();
+    assert_eq!(fs::read(&plist).unwrap(), b"<!-- hand-tuned -->\n");
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("preserved user-modified scheduled maintenance")),
+        "{:?}",
+        report.notices
+    );
+    let uninstall = harness.installer("1.1.0").uninstall().unwrap();
+    assert!(plist.is_file());
+    assert!(uninstall.preserved.contains(&plist));
+    assert!(
+        uninstall
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("preserved user-modified scheduled maintenance")),
+        "{:?}",
+        uninstall.warnings
+    );
+}
+
+#[test]
+fn a_disabled_schedule_removes_the_owned_launch_agent_and_uninstall_removes_it_otherwise() {
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let plist = launch_agent_path(&harness.home);
+    assert!(plist.is_file());
+
+    write_maintenance_table(&harness.root, "\n[maintenance]\nscheduled = false\n");
+    let report = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(report.changed);
+    assert!(!plist.exists());
+    assert!(
+        report
+            .notices
+            .iter()
+            .any(|notice| notice.contains("removed the scheduled maintenance")),
+        "{:?}",
+        report.notices
+    );
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(harness.root.join("state/install-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(manifest.get("launch_agent").is_none());
+
+    // Staying disabled is quiet: nothing to remove, nothing to say.
+    let repeat = harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    assert!(!repeat.changed);
+    assert!(
+        !repeat
+            .notices
+            .iter()
+            .any(|notice| notice.contains("scheduled maintenance")),
+        "{:?}",
+        repeat.notices
+    );
+
+    // And a normal installation gives its own plist back at uninstall.
+    let harness = Harness::new();
+    harness
+        .installer("1.0.0")
+        .setup(&SetupOptions::default())
+        .unwrap();
+    let plist = launch_agent_path(&harness.home);
+    let uninstall = harness.installer("1.0.0").uninstall().unwrap();
+    assert!(!plist.exists());
+    assert!(uninstall.removed.contains(&plist));
+    assert!(uninstall.warnings.is_empty(), "{:?}", uninstall.warnings);
+}
+
+/// launchd user agents are a macOS facility, and `preflight` already refuses every other platform
+/// before any write happens -- so "skipped on a foreign host" is the whole installation being
+/// refused, and the plist is one of the things that is never written. The planning function's own
+/// non-macOS branch is covered by the unit test beside it.
+#[test]
+fn a_non_macos_host_writes_no_launch_agent_because_setup_itself_is_refused() {
+    let harness = Harness::new();
+    let installer = Installer::new(
+        harness.context("1.0.0"),
+        Arc::new(FakeHost {
+            platform: "linux",
+            ..FakeHost::default()
+        }),
+    );
+    let error = installer.setup(&SetupOptions::default()).unwrap_err();
+    assert!(error.to_string().contains("supports macOS only"), "{error}");
+    assert!(!launch_agent_path(&harness.home).exists());
+    assert!(!harness.home.join("Library").exists());
 }

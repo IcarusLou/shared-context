@@ -10,7 +10,7 @@
 
 本项目尚未上线，本文直接定义目标模型、接口和存储结构。
 
-### 1.1 当前实现状态（Mew #170）
+### 1.1 当前实现状态（Mew #229）
 
 本文的大部分章节描述目标架构，不代表代码已经全部实现。当前里程碑边界如下：
 
@@ -19,9 +19,30 @@
 | **M1：Task-first 领域与入口基础** | **已实现** | `WorkingIntentSnapshot` 无 Space；`TaskSpaceAssociation` 支持 `0..N`；不存在 Workspace-to-Space 绑定；检索没有 preferred-Space 排序；无 Space Candidate 不可自动注入 |
 | **M2：Task Runtime 与多 Space Retrieval** | **已实现** | TaskSession/runtime.sqlite、`TaskIntentRevision`、Space Intent 召回、`0..N` 多 Space 关联、typed RetrievalPath、严格 `task_intent_update` 与只读 `task_context` 已通过跨 crate/E2E 验收 |
 | **M3：Engineering Graph** | **已实现** | 稳定本机 Repository Catalog、可重建 Registry、Reference-derived 有界扫描、build-time immutable Context/safety snapshot、历史 Graph Retrieval、ContextRelation 1–2 跳及 MCP/CLI 工作流已通过固定跨 crate/E2E oracle |
-| **M4：Low-tax Capture** | **已实现** | #117、#136、#156–#164 与 #169 已实现旁路 Working Intent、Hint Text retrieval、WorkEpisode、Hook lifecycle、Candidate Builder/analysis/Review/Confirm，并通过固定跨层 E2E、privacy、performance 与恢复验收 |
+| **M4：Direct Checkpoint / Candidate Review** | **已实现** | #226–#228 用 flat direct Claims/Unknowns、内容寻址 operation receipt、durable Build outbox 和人工 Candidate Confirmation 取代机械 Capture 选择链路 |
+| **Repository 范围推理前准入与 Session 授权** | **实现完成，待最终人工验收** | #181–#191/#194 实现准入判定、Session lease、SessionStart marker、MCP Session guard、registered cross-Repo / safe non-locating / unsafe drop 与 SessionEnd 清理；#192 提供 marker-gated installer-owned workflow，#193 以手写 oracle 关闭 token bytes proxy、黑盒链、installer 与 NPM 回归证据。方案 B 后准入改为从已登记 checkout 与其父目录推导的二态 `Enabled`/`Disabled`，显式 `RepositoryGroup` 及其五个 CLI 子命令整体删除 |
+| **真实宿主契约与 Hook 热路径** | **已实现；模型循环实测另行验收** | Codex/Cursor Adapter 把结构化工具事件归一化为非事实 TaskSignals；Hook 不保存或筛选 Claim Evidence，MCP/host schema 共享一个严格输入契约 |
 
-当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask，不能提交 Intent、Signals 或身份。PromptSubmit 只返回使用 Skill/工具的能力提示。PostToolUse 的 File observation 只形成带 Session/optional Task owner 的 redacted Capture Breadcrumb，可识别测试工具只形成非事实、非定位的 TestOutcome TaskSignal；TaskSignal 可影响 Working Intent retrieval，但不是工程 Evidence。Hook 不运行 Git discovery、Scanner、Registry sync、Graph rebuild、Focus 提交、Episode open/ingest，也不伪造 Claim。PreCompact/TurnStop 只能关闭已有 current-Intent Checkpoint 的 Episode并调用共享 Builder。显式 Graph 工具完成 bounded scan、Reference record、rebuild/diagnose 和 explain；Graph 不可用时 Task Retrieval 降级为 Context-only。Candidate 只由 closed WorkEpisode 的 Builder 调用内部 submission service 创建，公开面仅提供 list/get/discard/confirm。
+当前 `task_intent_update` 通过外部 Session Locator 和 Revision CAS 创建或修订承载 `WorkingIntentSnapshot` 的 `TaskIntentRevision`，并返回可解释的多 Space TaskContextPack；`task_context` 只按 Locator 读取已有 ActiveTask。SessionStart 先在本地同步完成 Repository 范围准入，只有 Enabled lease 才向 Agent 返回固定短 marker；PromptSubmit 不重复 marker，也不读取 Runtime/Search。Enabled PostToolUse 只合并机械化、非事实的 TaskSignals，不能产生 Claim Evidence。`task_checkpoint` 只接收 locator + direct Claims/Unknowns，服务端解析 Task/Intent/lifecycle并 durable queue Candidate Build；Candidate 只在 bounded recovery 后成为不可信 Review，公开面仅提供 list/get/discard/confirm。
+
+### 1.2 Repository 范围推理前准入（Mew #180/#185）
+
+当前已把本地范围组件接入 Agent Hook；整个准入发生在模型推理前，不读取 Prompt，也不经过模型：
+
+- 产品私有 `config.toml` 只显式登记 Repository checkout（typed CLI `repository add|list|doctor|rename|scan`），不再有任何手工登记的激活边界；配置与修复不会在业务仓库中创建项目级 Agent 文件。
+- `ScopeResolver` 对 canonical Session 启动目录返回二态 `Enabled { repository_ids }` 或 `Disabled`，全部推导自已登记 checkout：①目录在某个已登记 checkout 内 → 该 checkout 的 Repository（longest-prefix，归属歧义是 typed 错误）；②否则收集所有位于该目录之下的已登记 checkout，非空即 Enabled（去重排序后的 Repository 身份集合），这就是"共同父目录下启动 Agent"；③其余 Disabled。规则②对文件系统根、用户 HOME 本身与 HOME 的直接父级永不启用——从这些位置推导会一次性拉进整机所有登记仓库；可选 `[activation] allow_home = true`（默认 false）解除两条 HOME 保护，文件系统根永不可推导。决定只含 Repository 身份，不含任何路径。
+- `AuthorizedSessionScope` 是按 `ExternalSessionLocator` 隔离、与 Agent Session 永久绑定、不过期的产品私有 lease。文件名只含 locator digest，记录只含 typed decision、允许的 RepositoryId、canonical `startup_cwd` 与 `issued_at`；不保存 Prompt、transcript、tool output、report 或业务正文。`startup_cwd` 是后端本机元数据，只用于对当前 Catalog 重解析决定，不进 prompt、MCP 响应或持久 Context。lease 的边界由 `SessionEnd` 删除、30 天孤儿回收（`ORPHAN_LEASE_MAX_AGE`）与 4096 条 / 8MB 上限下的 LRU 淘汰共同保证，不再由 TTL 保证。
+- SessionStart 同步读取 Catalog，并对 Catalog/lease 使用 non-blocking try-lock。只有 Missing locator 可以按本次 canonical cwd 解析并先持久化 lease；Current 复用记录的 `startup_cwd` 对当前 Catalog 纯函数重解析（不 stat、不跑 Git、不扫描），结果变化时才在 non-blocking 排他锁下回写；锁忙或解析异常立即返回 `Disabled`。同一 locator 的首次成功决定所绑定的 `startup_cwd` 是 sticky，后续 startup/resume/compact 即使 cwd 改变也不重新判归属，但登记变化会改变该 `startup_cwd` 的判定结果。
+- Enabled 会话（单仓库或共同父目录）使用同一个 bounded、无 Repository/路径/Prompt/身份的 activation marker；marker 只出现在显式 SessionStart（包括 Codex resume/compact）边界，PromptSubmit 返回 neutral wire output。
+- Enabled PostToolUse 在 Runtime 前验证结构化 path hints。Adapter 只输出 `FileOperation`、`TestRunner`、`Shell`、`SharedContext` 或 `Other`，并只允许安全的机械含义进入非事实 TaskSignals；Shared Context 自身工具不回流。启动时推导出的 Enabled 不限制 Session 后续显式调查目标。
+- Disabled 的 Prompt/Tool/PreCompact/Stop/End 全部保持 Agent-neutral 且不打开业务 Runtime；SessionEnd 只按 exact locator 尝试移除 lease，不跨 Session 清理。Catalog/lease 锁忙或异常均 fail-open 让 Agent 继续，同时 fail-closed 为 Disabled。
+- scope 解析与 lease 热路径不运行 Git 或 Repository scan；安装仍是用户级配置，不需要 launcher，不在业务仓库写项目级 MCP/Hook 文件。
+
+`task_checkpoint` 的 Rust request type 与 MCP `inputSchema` 共享同一严格契约：顶层恰为 `agent_kind/external_session_id/claims/unknowns`；Claim 恰为 `context_kind/statement/rationale/conditions/evidence`；Evidence 恰为 `evidence_type/summary/limitations`；Unknown 恰为 `statement/blocking`。所有层 `additionalProperties=false`，Codex host declaration 是派生视图。
+
+Hook Runtime 使用短 SQLite busy timeout且 fail-open；普通 CLI/MCP 保留交互超时。Installer 每次 setup 只探测一次 Agent 版本，将 bounded version token 固化进托管 Hook 命令；Hook 事件不启动版本子进程，也不维护 Evidence 缓存。
+
+当前 MCP Server 已按 current Enabled `AuthorizedSessionScope` 实施 Session-level authorization guard，每次公开调用只做一次 lease 读取并按 `startup_cwd` 对冻结的 Catalog 重解析；Disabled/Missing/busy/corrupt Session 调用被拒绝，Enabled Session 可调查任意已登记 Repository或提交不伪造 Artifact identity 的非定位 Evidence。全局 Skill 主入口是最小 activation gate：没有可信 SessionStart marker 时自动路径不读取完整 workflow reference、不产生 Shared Context MCP 调用提示；有 marker 时才完整读取一次 installer-owned reference。Server guard 只负责安全和不落越权数据，Skill gate 负责调用前的指令准入。#214 更新后的固定 oracle 证明 Disabled 的 activation/reference/MCP call/result/business residue proxy 全 0，Enabled 每条链 marker 为 126 bytes、完整 workflow 读取一次、实际 public MCP 调用 5 次且清洗后的 result bytes 落在手写上限内；当前 source gate/workflow/metadata 分别为 1543/9098/263 bytes。Bytes 不等于 token，MCP 进程和工具 Schema 仍由用户级配置全局提供，可能物理启动或可见。
 
 ## 2. 背景与目标
 
@@ -36,7 +57,7 @@
     ↓
 注入当前真正相关的 Context
     ↓
-持续观察开发过程
+Agent 提交聚焦的 direct Checkpoint
     ↓
 自动形成新的 Context Candidate
 ```
@@ -46,7 +67,7 @@
 1. 以当前 `TaskIntentRevision` 中的 `WorkingIntentSnapshot` 作为默认检索入口，不要求调用者提前选择 Space。
 2. 自动推断一个 Task 与多个 `ContextSpace` 的关联，并返回匹配原因。
 3. 建立 Context 与 Repository、Module、File、Symbol、API、Schema、Test 的可重建关联。
-4. 从 Prompt、代码访问、Diff、测试和 Agent 结论中自动生成 `ContextCandidate`。
+4. 从 Agent 直接提交的完整 Claims、Unknowns 和 self-contained Evidence 可靠生成 `ContextCandidate`。
 5. 使用 Git 保存稳定、可审计的 Context 事实，使用 SQLite 保存可删除、可重建的投影和工程关联。
 6. 保持自动注入安全：只有有效、已激活、证据充分且无阻断冲突的 Context 可以自动进入 Agent 上下文。
 
@@ -54,13 +75,13 @@
 
 ### 3.1 已确认约束
 
-- 一次安装维护一个本地 `ContextStore`，对应唯一 Git 仓库。
+- 一次安装维护一个本地 `KnowledgeStore`，对应唯一 Git 仓库。
 - `ContextSpace` 表示一项内部 Requirement 或长期工作目标，不依赖外部需求系统维持身份。
 - Workspace 只说明代码位置和当前工程现场，不能决定当前 Task 属于哪个 Space。
 - 一个 Task 可以同时关联零个、一个或多个 Space。
 - `ContextCandidate` 在形成时可以没有 Space；Space 归属是 Candidate 的后续确认结果。
 - 文件路径、Symbol 位置、Commit、Branch 等不能成为领域身份，但必须能参与检索和关联重建。
-- Git 中只保存稳定 Context 事实和自包含 Evidence；Task、Capture、置信度和当前代码解析结果保存在本地状态中。
+- Git 中只保存 Candidate proposal 或稳定 Context 事实及自包含 Evidence；Task、Checkpoint receipt/outbox、置信度和当前代码解析结果保存在本地状态中。
 - SQLite 不是事实源；删除后必须能够从 Context Git Tree 和当前可访问的业务代码仓库重建相应投影。
 - 产品写接口只创建新事件和对象，不修改、删除或重命名已有知识文件。
 - 首版支持 Cursor 和 Codex，Adapter 边界支持后续新增其他 Agent。
@@ -81,7 +102,7 @@
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ Agent Integration                                           │
-│ Prompt / Tool / Diff / File / Symbol / API / Test Signals   │
+│ Working Intent / Direct Checkpoint / Non-factual Signals     │
 └──────────────────────────────┬──────────────────────────────┘
                                ↓
 ┌─────────────────────────────────────────────────────────────┐
@@ -122,7 +143,7 @@
 - WorkEpisode、ContextCandidate 和候选置信度。
 - FTS、排序分数、分页游标和 Token Budget 结果。
 
-稳定事实进入 Git；派生或短期状态进入 SQLite 或有 TTL 的本地 Capture 存储。
+稳定事实进入 Git；派生或短期状态进入 SQLite。
 
 ## 5. 领域模型
 
@@ -130,7 +151,8 @@
 
 | 术语 | 定义 |
 |---|---|
-| `ContextStore` | 一次安装唯一的本地 Git 知识仓库 |
+| `KnowledgeStore` | 一次安装唯一的 Git 知识事实仓；可以从团队远端初始化，但独立于业务源码 RepositoryIdentity |
+| `InstallationWorkBranch` | 每次安装稳定拥有的 `shared-context/<installation-id>` 知识写分支；远端默认分支只作为只读集成基线 |
 | `ContextSpace` | 一项内部 Requirement 或长期工作目标的 Intent 与 Context 组织容器 |
 | `IntentRevision` | ContextSpace 目标、范围和验收条件的一版完整快照 |
 | `TaskSession` | 一次 Agent 工程任务的本地运行实例，与 Agent Session 隔离 |
@@ -316,6 +338,7 @@ rsl_<random>   ConflictResolution
 tsk_<random>   TaskSession
 cnd_<random>   ContextCandidate
 wep_<random>   WorkEpisode
+psg_<stable>   一个 TaskIntentRevision 的 ProposedSpaceGroup
 ```
 
 禁止使用标题、路径、时间、用户名、外部单号或内容 Hash 作为领域 ID。
@@ -511,7 +534,7 @@ Evidence 必须在开发分支、Commit、业务代码仓库或 Agent Session �
 - `experiment_record`：实验前提、输入、步骤、期望和实际结果。
 - `artifact_snapshot`：接口响应、测试结果或其他结构化材料。
 
-Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference 等工程断言。WorkingIntentSnapshot、TaskSignal、Hint 和 ArtifactFocusQuery 只提供工作理解或检索线索，不是 Evidence；Claim 显式引用的 owned Diff/TestOutcome 也必须先由 Builder 转换为自包含 EvidenceSnapshot，不能把 TaskSignal 原样提升为知识证据。
+Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference 等工程断言。WorkingIntentSnapshot、TaskSignal、Hint 和 ArtifactFocusQuery 只提供工作理解或检索线索，不是 Evidence；服务端内部 typed provenance 可以支撑内部 WorkObservation，但公开 Checkpoint 只接受 `DirectEvidenceDraft`，不能引用或提升 TaskSignal。
 
 ### 7.2 EngineeringReference
 
@@ -675,11 +698,13 @@ Task Retrieval 默认只扩展一至两跳：
 │   ├── index.sqlite
 │   ├── runtime.sqlite
 │   ├── repository-registry.sqlite
+│   ├── maintenance.lock
+│   ├── reset-journal.json        # 仅 reset 进行中或待恢复时存在
 │   ├── writer.lock
 │   ├── index.lock
 │   ├── runtime.lock
 │   ├── pending/
-│   └── capture/
+│   └── authorized-session-scopes/
 ├── backups/
 └── logs/
 ```
@@ -688,23 +713,28 @@ Task Retrieval 默认只扩展一至两跳：
 
 - `index.sqlite`：可从 Git 和当前工程快照重建的知识及关联投影。
 - `runtime.sqlite`：Task、WorkEpisode 和 Candidate 短期状态，不是知识事实。
-- `capture/`：受 TTL 和容量限制的临时 Evidence/Observation 材料。
+- `authorized-session-scopes/`：按 external Session locator digest 隔离、Catalog-bound、TTL-bounded 的私有 activation lease；不是 Task/Context 事实。
+- `maintenance.lock`：安装级非阻塞读写门禁；业务 CLI、Hook 和单次 MCP tool call 持共享锁，Setup/Upgrade/Uninstall、知识删除与 data reset 持排他锁。
+- `reset-journal.json`：活动 reset 的固定恢复 marker；存在时全部共享业务入口返回 `maintenance_busy`，只有持排他锁的 reset/setup/uninstall/知识删除可以先回滚恢复。
 - `config.toml`：固定 Context Store 与本机显式 Repository Catalog，不包含 Workspace-to-Space 映射。
+
+所有组件统一使用 `maintenance → setup/config/writer/index/runtime` 锁顺序。排他维护期间 CLI/MCP 返回 bounded `maintenance_busy`，Hook 保持 neutral；不得在持有组件锁后反向申请 maintenance lock。
 
 Repository Catalog 的配置语义：
 
 ```toml
 [[repositories]]
-id = "rpo_<uuid-v4>"
+id = "FE"
 paths = ["/absolute/canonical/checkout", "/absolute/canonical/worktree"]
 ```
 
-- Catalog 是 RepositoryId 的唯一权威；新 ID 只能由 `repository add` 使用现有 typed `RepositoryId::new()` 格式生成。
+- RepositoryId 是团队显式约定的 exact-case 可读 ASCII 名称；`repository add --repository-id <ID>` 负责创建或幂等挂载本机 checkout，Catalog 不自动生成身份。
 - 一个 ID 可有 `0..N` paths；同一 path 只能属于一个 ID。多个 worktree/checkout 是否同一逻辑 Repository 由显式配置决定。
+- 同一本机 Catalog 拒绝只存在 ASCII 大小写差异的两个 ID，避免 `FE`/`fe` 误绑定；跨机器共享要求使用完全相同的 spelling。
 - basename、remote、Git common-dir、父 Workspace 和 sibling 目录都不是 identity 或合并依据。
 - `repository-registry.sqlite` 是可删除投影；setup、doctor、显式 Runtime open 从 Catalog 原子恢复相同 ID/locators。
 - 运行时文件解析只在允许 Workspace 与 configured checkout 的交集内执行 canonical longest-prefix；输出 RepositoryId + RepoRelativePath。未配置路径为 typed `repository_not_configured`，Workspace 外与 symlink traversal 拒绝。
-- Catalog 仅本机有效，不做团队同步，也不承载 Space/Requirement 关系。
+- Catalog path 绑定仅本机有效，不做团队路径同步，也不承载 Space/Requirement 关系；团队共享的是 RepositoryId spelling 与 Knowledge Store 中引用它的事实。
 
 ### 9.2 仓库结构
 
@@ -767,13 +797,14 @@ repository/
 | `work_episode` | Task-owned、version-CAS 的 Open/Closed Episode boundary |
 | `work_episode_intent_ref` / `work_episode_signal_ref` | ordered Intent Revision 与非定位 Signal provenance |
 | `work_observation` / `work_observation_source` | server-owned normalized meaning 与 typed sources |
-| `capture_ingestion` | `CaptureId → Episode/Observation` 唯一幂等记录 |
-| `agent_checkpoint` | Episode parent-version 语义幂等的完整 Claims/Unknowns、server IDs 与 continue/close boundary |
-| `candidate_build` / `candidate_build_item` | closed Episode/Claim-scoped Builder reservation、submission identity 与#117结果 |
+| `agent_checkpoint` | server-owned final Claims/Unknowns、Task/Intent/Episode ownership 与 content-addressed semantics |
+| `checkpoint_operation` | Task/Intent-scoped stable operation receipt；调用方不提供 transport key |
+| `candidate_build` / `candidate_build_item` | 与 Checkpoint 同事务预留的 durable outbox、Claim-scoped submission identity 与恢复状态 |
 | `candidate_analysis` | 可删除重算、按CandidateId替换的current derived review JSON与固定Context/Graph generations |
-| `work_episode_diagnostic` | unconfigured/unsafe Capture Artifact 映射诊断 |
+| `candidate_review` / `candidate_confirmation_operation` | Task-scoped Review lifecycle 与 Git 前完整 ConfirmationPlan reservation |
+| `proposed_space_group` | exact TaskIntentRevision 的 `psg_` → first new Space reservation/committed mapping；不合并 Candidate |
 
-Capture 文件设置 TTL；Runtime Episode 不进入 Git。删除 `runtime.sqlite` 只会丢失 Task/Episode，不改变 Context Git、Index 或 `state/capture`。
+Runtime schema 当前为 13。Setup/Upgrade 对已知 schema 11/12 备份并丢弃 `runtime.sqlite`、WAL、SHM 后全新初始化；unknown/future schema fail closed。安装事务后续失败时必须恢复原文件、sidecars 和权限。Runtime Episode、Checkpoint receipt 和 outbox 不进入 Git；删除 Runtime 不改变已经存在的 Candidate proposal或 accepted Context facts。
 
 ### 10.3 投影 Generation
 
@@ -797,6 +828,8 @@ task_signal_fingerprint
 2. 当前可访问业务代码仓库：重建 EngineeringArtifact、Resolution 和 Association。
 
 业务仓库不可访问时，知识 Projection 仍必须可用；Artifact Resolution 标记为 unavailable，检索退化到 Intent、Context、Scope 和稳定 ContextRelation。
+
+若整个 Engineering Graph snapshot 不可用且请求带有服务端已解析的 `ResolvedFocus`，Search 可使用 `ResolvedFocusTextFallback`：只查询安全 Accepted Context，并要求 RepositoryId 与完整 kind-specific `ArtifactLocator.canonical_key()` 的规范化 token 序列都精确出现。返回路径显式标记 `resolved_focus_text_fallback`，`matched_artifacts`/Graph generation 保持为空，不扩展 ContextRelation，也不持久化 Focus。只要 Graph snapshot 存在——即使该 locator 在 Graph 中 missing、ambiguous 或 unreachable——都禁止 fallback；basename、部分路径、缺少 API/Symbol 坐标和跨 Repository 文本碰撞同样不匹配。
 
 ## 11. Task-first Retrieval
 
@@ -825,7 +858,7 @@ mode:
 - Agent 后续调用 `task_intent_update`：旁路提交当前自然形成的 `WorkingIntentSnapshot`、Task boundary 与 Revision CAS；其余字段可省略。
 - 目标、方向、范围、约束、验收条件、Hint 或自然形成的问题变化时，Agent 可以提交新 Revision；Runtime 不从 Prompt、Diff 或相似度自动推断完整 Working Intent。
 - Agent 需要围绕某工程对象查询历史时调用只读 `task_artifact_focus`；Catalog 为本次请求解析 `ResolvedFocus`，不会创建 `TaskIntentRevision` 或任何 Focus Runtime 状态。
-- PreCompact、TurnStop 只在 Agent 已自然形成更新时旁路记录 Working Intent，并只基于已有 Checkpoint 推进 WorkEpisode lifecycle。
+- PreCompact、TurnStop 只提供 bounded Checkpoint guidance 与既有 outbox recovery；非空 direct `task_checkpoint` 自己解析并完成 WorkEpisode lifecycle。
 
 `task_boundary=new` 只能由 Agent 显式声明；Runtime 只执行 ActiveTask 切换，不根据 Prompt 相似度猜测任务边界。`continue` 使用调用方的 parent Revision CAS，由 Runtime 原子判断 `created`、`already_current` 或 stale。
 
@@ -840,6 +873,10 @@ mode:
 5. Platform、Domain、Condition、Kind 的结构化匹配。
 
 候选 Space 由上述 Context 和 Intent 信号共同推断，不能先选 Space 再搜索。
+
+自动模式先过滤英文 stopword、短 token、固定通用工程词，并在至少 20 个当前可检索文档时排除 document frequency 达 30% 的高频 token；最多保留 64 个更长、更具体的 token。显式 `context_search` 与 Explicit Task Pack 不应用这层过滤，仍可用于诊断。
+
+过滤后，文本候选满足以下任一替代条件才具有 `AutomaticTextEligibility`：完整 phrase match、query token coverage ≥60%、两个独立文本 channel、Context text + ExactScope，或 exact EngineeringGraph/ContextRelation path。条件不是累加要求。ContextRelation 扩展也只能从已经通过直接门槛的文本/Hint seed 或 exact Graph seed 出发；弱 Space Intent 不得让同 Space 的无关 Context 继承资格。
 
 ### 11.4 排序
 
@@ -901,61 +938,56 @@ SearchResult.tsx
 - 无未解决且阻断的语义冲突。
 - Evidence 满足最低完整度。
 - Retrieval Path 可解释且达到最小相关性阈值。
+- 文本路径满足 `AutomaticTextEligibility`；单个 stopword、短词、通用/高频 token 或弱 Space-only 命中不足以注入。
 
-Candidate、Deprecated Context、Annotation 和原始 Capture 内容只能作为不可信参考数据，不能提升为指令。
+Candidate、Deprecated Context、Annotation 和 TaskSignals 只能作为不可信参考数据，不能提升为指令。
 
-## 12. Low-tax Capture
+## 12. Direct Checkpoint 与 Candidate Outbox
 
 ### 12.1 WorkEpisode
 
 WorkEpisode 聚合一次 Task 中的：
 
 - TaskIntentRevisions 及其 WorkingIntentSnapshots。
-- 检索过的 Context 及采用/忽略原因。
-- 访问和修改的 Artifact。
-- Diff 摘要。
-- API、Schema 和调用关系观察。
-- 测试、实验和验证结果。
-- Agent Checkpoint。
-- 未解决问题。
+- Agent 直接提交的 final Checkpoint。
+- Checkpoint 中的 Claims、Unknowns 和 self-contained Evidence drafts。
 
-原始 Transcript 和完整 Tool Output 不进入 WorkEpisode。Runtime 只保存经过 Adapter 归一化、Secret/PII 扫描和容量限制的结构化观察。
+原始 Transcript、Hook text、TaskSignals 和完整 Tool Output 不进入 Claim Evidence。
 
-#156/#157 当前可执行基础：
+#226–#228 当前可执行基础：
 
-- `CaptureId` 是 typed `cap_<uuid-v4>`；Capture record 固化 ExternalSessionLocator、optional exact ActiveTask owner、redacted summary/file hints、TTL/privacy diagnostics 与 idempotent claim。
-- CaptureStore 提供 bounded read/list/claim/cleanup；无 Session/ActiveTask 的 Capture 保留 `no_active_task` 诊断并不可 claim，跨 Task/Episode claim 拒绝。
-- WorkEpisode 一 TaskSession 最多一个 Open 实例；open/read/list、显式 refs advance、normalized append、Capture ingestion、close preparation 和 source verification 使用 Episode version CAS。
-- `capture_ingestion.capture_id` 唯一；claim 与 Runtime commit 任一侧崩溃都可重试且不产生重复 Observation。
-- Catalog 只把 safe existing configured File hint 映射为 File ArtifactRef；unconfigured/unsafe path 保留 Capture source、summary 和 typed diagnostic，不猜 Repository。
-- Hook 只 Capture，不自动 open/ingest Episode，也不生成 Claim。#163 的 AutomatedEpisodeBoundary 只能在工作 Agent 已写入 current-Intent Checkpoint 后补齐 ordered refs、关闭 Episode 并调用共享 Builder。
-- `task_checkpoint` 由工作 Agent 显式提交 Task/TaskIntentRevision/Episode CAS、完整 Claims/Unknowns 和 typed refs；Runtime 在一个事务中 open/advance Episode、生成 inline Validation Observation、Claim/Checkpoint ID，并 continue 或 close。
-- `(episode_id, parent_episode_version)` 唯一约束配合完整语义 JSON 实现 timeout retry；相同内容返回原 Checkpoint，不同内容冲突，stale version 拒绝。Checkpoint 不生成 Candidate 或 Git Event。
+- 外部 Session locator 只由 `agent_kind + external_session_id` 组成；当前实现信任 Agent 提交的 locator，并由 Server 查找 exact ActiveTask。
+- WorkEpisode 一 TaskSession 最多一个 Open 实例。非空 Checkpoint submission 会复用或创建它，并在同一事务中关闭。
+- Server 以 TaskSession、Task、Intent Revision 与 canonical Claims/Unknowns 派生 SHA-256 operation key；调用方不传 request key、operation ID 或 lifecycle CAS。
+- `checkpoint_operation`、AgentCheckpoint、Closed Episode、Candidate Build 和每 Claim 的 SubmissionId 在一个 SQLite transaction 中提交。
+- 相同 scoped content 在 timeout/retry/concurrency 下返回相同 operation、Checkpoint、Episode、Build 和 Submission identities；不同 Task/Intent scope 不发生错误收敛。
+- 空 Claims+Unknowns 在确认 ActiveTask 后返回 mutation-free `no_op`。
+- Checkpoint ACK 与 same-content replay 都是 zero-Git-write；它们只证明 durable queued outbox，不宣称 Candidate 已完成。
 
 ### 12.2 AgentCheckpoint
 
-Agent 在 PreCompact、TurnStop 或形成重要结论时调用：
+Agent 在形成重要结论、PreCompact 或 TurnStop 前调用：
 
 ```yaml
 agent_kind:
 external_session_id:
-expected_task_id:
-expected_intent_revision_id:
-expected_episode_version:
-boundary: continue | close
 claims:
-  - statement:
+  - context_kind:
+    statement:
     rationale:
-    applicability:
-    assumptions:
-    recheck_when:
+    conditions:
     evidence:
-    artifact_refs:
-    related_contexts:
+      - evidence_type:
+        summary:
+        limitations:
 unknowns:
+  - statement:
+    blocking:
 ```
 
-Checkpoint 表达 Agent 已形成的工程认知，不是“工具执行成功”日志。Evidence 绑定 CheckpointClaim，并可复用 owned WorkObservation、同一 Index snapshot 的 ContextEvidence，或提交经 PrivacyScanner 检查的 self-contained inline Validation。TaskSignal 即使被 Claim 显式引用也仍是非事实来源线索：Prompt/Workspace 不可转成工程 Evidence，normalized Diff/TestOutcome 必须先由 Builder 组装为带 supports、content、interpretation 和 limitations 的 EvidenceSnapshot。ArtifactRef 只描述关联，不独立成为 Evidence。Unknown-only Checkpoint 可以 continue 或 close，但不产生知识主张。
+Checkpoint 表达 Agent 已形成的工程认知，不是工具日志。Claim 的字段严格等于 `context_kind/statement/rationale/conditions/evidence`；Evidence 严格等于 `evidence_type/summary/limitations`；Unknown 严格等于 `statement/blocking`。Evidence type 只允许 `source_snapshot`、`experiment_record`、`artifact_snapshot`，每个 Claim 至少一条 Evidence。
+
+Agent-attested Evidence 只支持 untrusted Candidate，不因 ACK 或 recovery 自动成为知识事实。Hook text、TaskSignal、Prompt、raw command/tool output、检索相似度和 Artifact hint 都不是 Claim Evidence。Unknown-only Checkpoint 合法，但不产生 Candidate Claim。
 
 ### 12.3 Candidate Builder
 
@@ -963,8 +995,8 @@ Pipeline：
 
 ```text
 WorkEpisode
-→ 聚合 Claim
-→ 组装最小充分 Evidence
+→ 读取 durable Build outbox
+→ 逐 Claim 组装 self-contained Evidence
 → 检索已有 Context
 → 判断重复、支持、修订、矛盾或新增
 → 推断 Applicability
@@ -979,20 +1011,25 @@ Candidate Builder 必须输出：
 - 推荐的 Primary/Related Spaces 及原因。
 - 置信度、未知项和需要重新检查的条件。
 
+Checkpoint 返回 queued ACK 后，`candidate_list` 对当前 Task 的 pending/incomplete outbox 做 bounded/fair recovery；`candidate_get` 做 target-aware recovery。恢复可追加 `context_candidate.created` 等 untrusted proposal facts，不能据此声称 zero Git through list/get。重复恢复必须幂等；在 `candidate_confirm` 前不得出现 accepted Context revision、Space association、publication 或 confirmation facts。
+
 ### 12.4 Candidate 确认
 
 确认接口只要求：
 
 ```yaml
 candidate_id:
-confirmed_primary_space:
-  existing_space_id:              # 与 new_space_intent 二选一
-  new_space_intent:
-confirmed_related_space_ids:
-optional_edits:
+expected_task_id:
+expected_intent_revision_id:
+expected_review_version:
+primary:
+  existing_space_id:              # 与 new_space_recommendation_id 二选一
+  new_space_recommendation_id:
+related_space_ids:
+edits:
 ```
 
-用户不需要重新填写 Statement、Rationale、Applicability 和 Evidence。确认新 Space 时，Writer 在同一 Batch 中原子生成 Space、Context、SpaceAssociation 和 Lifecycle Events；确认失败不得留下部分领域事实。
+用户不需要重新填写 Statement、Rationale、Applicability 或 Evidence。Writer 在同一 Batch/Commit 中原子生成已有 Primary 所需的 4 个基础事实或新 Space 所需的 5 个基础事实；显式用户 edits 可调整最终 Revision。EngineeringReference 在确认后通过独立验证入口记录。确认失败不得留下部分 accepted 领域事实。
 
 ## 13. CLI、MCP 与 Agent Adapter
 
@@ -1005,7 +1042,7 @@ sctx space create|revise|list|get
 sctx task context|artifact-focus|checkpoint|intent update|signal supersede
 sctx candidate list|get|confirm|discard
 sctx context get|search|revise|deprecate
-sctx repository add|list|doctor|scan
+sctx repository add|list|doctor|rename|scan
 sctx engineering-reference record
 sctx association explain|rebuild
 sctx index rebuild
@@ -1022,21 +1059,21 @@ sctx mcp serve --client cursor|codex
 | `task_intent_update` | 读/写本地状态 | CAS 写入 `WorkingIntentSnapshot` 的 `TaskIntentRevision` 并生成多 Space TaskContextPack |
 | `task_artifact_focus` | 只读 | 钉定 ActiveTask 与 Intent Revision；仅接收 Session、absolute path 与无 path coordinates，由 Catalog 补全本次 `ResolvedFocus` 并立即返回 TaskContextPack，不保存 ID 或生命周期 |
 | `task_signal_supersede` | 读/写本地状态 | 按稳定 Signal ID 失效当前 Task 信号 |
+| `task_checkpoint` | 写本地状态 | flat direct Claims/Unknowns；服务端解析 Task/Intent/lifecycle、内容寻址并原子持久化 queued outbox；ACK/same-content replay 不写 Git |
 | `task_context` | 只读 | 按 external Session locator 重读已有 ActiveTask 的 TaskContextPack |
 | `repository_scan` | 读/写本地状态 | 只扫描已在 Catalog 配置的 checkout，要求显式非空 repo-relative paths，并返回有界 Artifact/skip 摘要；不接受 RepositoryId 注入 |
 | `engineering_reference_record` | 写知识事实 | 为已有 Context Revision 记录有证据的工程定位观察 |
 | `association_explain` | 只读 | 展示解析状态、证据、歧义候选和 Graph Paths，不代选 |
 | `association_rebuild` | 写派生状态 | 从 Git References 派生按 Repository 分组去重的 ScanPlan，并据此原子重建或诊断投影 |
-| `task_checkpoint` | 写本地状态；close 或后续 verified lifecycle boundary 可写 Candidate Event | 提交结构化 Claim、Evidence Ref 和未知项；显式 close 或 Hook 对已持久 Checkpoint 的 close 触发同一确定性 Candidate Builder |
-| `candidate_list` | 读 | 查看当前 Task 自动生成的 Candidate |
-| `candidate_get` | 读 | 获取一个自动 Candidate 的完整、不可信 Review 内容 |
+| `candidate_list` | 读/恢复 | bounded/fair 恢复 queued outbox并查看当前 Task 自动生成的 untrusted Candidate；恢复可能追加 proposal Event |
+| `candidate_get` | 读/恢复 | target-aware 恢复并获取一个自动 Candidate 的完整、不可信 Review 内容 |
 | `candidate_discard` | 写本地状态 | 在 Task/Intent/Review CAS 下显式放弃 Pending Review；不写知识事实 |
-| `candidate_confirm` | 写知识事实 | 在显式人工选择、Task/Intent/Review CAS 与完整分析下，原子确认 Candidate、Primary/Related Space、Context Revision、Association 与 Publish |
+| `candidate_confirm` | 写知识事实 | 在显式人工选择、Task/Intent/Review CAS 与完整分析下，原子确认 Candidate、Primary/Related Space、最终 Context Revision、Association、Publication 与 Confirmation |
 | `context_search` | 读 | 面向诊断和显式探索的结构化搜索 |
 | `context_get` | 读 | 获取确定 Context Revision、Evidence 和关系 |
-| `space_search` | 读 | 显式查找 Space，不参与默认 Task 路由 |
+| `space_list` | 读 | 列出 Space，不参与默认 Task 路由 |
 
-Candidate 内容由 WorkEpisode 和 AgentCheckpoint 生成。
+共 16 个工具。Candidate 内容由 WorkEpisode 和 AgentCheckpoint 生成；只有 `candidate_confirm` 创建 accepted knowledge facts。
 
 ### 13.3 Canonical Agent Event
 
@@ -1064,18 +1101,19 @@ tool_name / outcome / normalized_file_hints（仅 PostToolUse）
 
 Adapter 只翻译厂商 Payload。Working Intent、TaskIntentRevision、Git Diff、代码扫描、检索和 Candidate Builder 属于共享 Runtime，不得复制进厂商 Adapter。
 
-### 13.4 动态检索策略
+### 13.4 Repository 准入与动态检索策略
 
-- SessionStart：仅注入系统能力说明；不得构造或执行空查询 Context Pack，也不注入任何知识项或假定 Space 摘要。
-- PromptSubmit：仅作为 PromptEnvelope 返回能力提示，不从 Prompt 文本构造 Intent 或 Signal；工作 Agent 显式调用 `task_intent_update`。
-- PostToolUse：保留 Breadcrumb；可识别 Test/Check/Lint 工具只合并非定位 TestOutcome。File Hint 不再写入工程 TaskSignal，也不会隐式发起 ArtifactFocusQuery；Prompt 前没有 Session 时不隐式创建，不保存原始 Tool Output、Transcript 或命令文本。
-- PreCompact：工作 Agent 先显式提交完整 current-Intent Checkpoint；Hook 不从摘要伪造 Claim，只在该 Checkpoint 存在时原子关闭 Episode 并调用共享 Candidate Builder。缺失或 stale Checkpoint 时 Episode 保持 Open，并返回修正提示。
-- TurnStop：执行同一 AutomatedEpisodeBoundary；重复、乱序和并发事件复用 Closed Episode 与稳定 Build/Submission/Candidate 身份。Builder 暂时失败时 Hook fail-open，后续重复事件或显式 CLI 可恢复。
-- SessionEnd：只清理过期 Capture/Review 状态，不关闭 Episode、不生成 Candidate。
+- SessionStart：先用本地 Catalog 与 `AuthorizedSessionScopeStore` 同步、non-blocking 地解析 exact locator。Enabled 只注入固定 bounded activation marker，要求 substantive work 前显式调用 `task_intent_update`，但不构造或执行 Context Pack，也不注入知识项或 Space 摘要；Disabled 返回 neutral。先成功落盘的 locator decision 后续只读复用，不因 cwd 改变而重判。
+- PromptSubmit：不重复 activation marker、不从 Prompt 文本构造 Intent 或 Signal，也不访问 Runtime/Search；SessionStart marker 是工作 Agent 进入完整 Shared Context 流程并显式调用 `task_intent_update` 的本地准入信号。MCP Server 已强制 current Enabled Session lease，最小 Skill gate 只在可信 marker 后读取一次完整 workflow。
+- PostToolUse：若 Enabled Session 尚无 ActiveTask，第一次安全工具事件原子设置 delivery-only `intent_bootstrap_notified` 并返回一次 bounded IntentBootstrapReminder；后续事件不重复。该字段不参与 authorization/Catalog/TTL/renewal/reauthorization，Hook 不从 Prompt 或工具内容生成 WorkingIntentSnapshot，也不自动创建 Task。
+- PostToolUse：Enabled 事件只把安全的结构化 tool category/outcome 合并成非事实 TaskSignal，不保存原始 Tool Output、Transcript、命令文本，也不生成 Claim Evidence 或隐式 ArtifactFocusQuery。
+- PreCompact / TurnStop：Hook 只提示工作 Agent 用 flat `task_checkpoint` 提交 complete direct Claims/Unknowns，并可尝试恢复已有 outbox。Task/Intent/lifecycle 由 Server 解析；Hook text 和 lifecycle data 都不是 Claim Evidence。
+- 无 ActiveTask 的 PreCompact/TurnStop 不创建 Task/Episode/Claim，只返回 bounded guidance。
+- SessionEnd：清理本地 Review retention state 并 non-blocking 地移除 exact locator lease；不创作 Claim、不确认 Candidate，也不清理其他 locator。
 
 Agent Hook 不支持某事件时，通过 MCP 主动调用和 CLI 完成同一核心流程；能力差异只影响自动化程度，不改变领域模型。
 
-若工作 Agent 已成功提交 `continue` Checkpoint，但 Hook 随后缺失、fail-open 或结果不确定，则用同一个 `task_checkpoint` 提交 `boundary=close`、当前 Episode version 和空 Claims/Unknowns。Runtime 在 Task/Intent/Episode CAS 下关闭既有 Checkpoint并调用 Builder，不创建第二个 Checkpoint，也不要求重新填写认知。
+若 `task_checkpoint` ACK 丢失或超时，工作 Agent 必须用同一 Session locator 和语义相同的 Claims/Unknowns 重试。Server 通过 scoped content-addressed operation receipt 回放相同结果；不得添加 transport key、改写内容绕过错误或提交旧 lifecycle 字段。
 
 ## 14. Git Writer 与一致性
 
@@ -1138,13 +1176,13 @@ Writer：
 
 - 原始 Conversation/Transcript 默认不写入 Git 或 Runtime SQLite。
 - 原始 Tool Output 默认不保存，只保留归一化 Observation、最小 Evidence Snapshot 或摘要。
-- Capture、Checkpoint 和 Candidate 写入前执行 Secret/PII 扫描。
+- Checkpoint 和 Candidate 写入前执行 Secret/PII 扫描。
 - Event 和 Evidence 进入 Git 前再次扫描。
 - Context 内容按不可信数据处理，不执行其中的命令或脚本。
 - Candidate、Annotation、EngineeringReference 和检索分数不得提升为系统指令。
 - 只有满足自动注入门槛的 Active Context 可以进入 Hook Additional Context。
 - 本地业务代码扫描遵循显式 Allowlist/Denylist，并限制读取范围、文件大小和二进制类型。
-- Capture 使用 TTL、单条大小和总容量上限。
+- Hook TaskSignal 只保存 bounded、非事实的机械分类，不保存 Claim Evidence。
 - Git Store 位于当前用户目录，不宣称抵御当前用户主动篡改。
 
 ## 16. Rust 模块与分发
@@ -1180,7 +1218,7 @@ crates/
 - `engineering-graph`：Artifact 扫描、Resolution、Association 和图扩展。
 - `retrieval`：Task 多路召回、排序、解释和 Context Pack。
 - `candidate-builder`：Claim/Evidence 聚合、去重、冲突与 Space 推荐。
-- `local-state`：runtime.sqlite、Capture、TTL、隐私扫描和配置。
+- `local-state`：本地配置、Session scope 与隐私扫描。
 - `agent-adapter`：厂商无关的 Canonical Event/Action。
 - `adapter-*`：Cursor/Codex Payload 和配置适配。
 - `mcp`：stdio MCP Server。
@@ -1190,9 +1228,9 @@ crates/
 ### 16.2 NPM 分发
 
 ```text
-@company/shared-context
-@company/shared-context-darwin-arm64
-@company/shared-context-darwin-x64
+@bytedance-dev/shared-context
+@bytedance-dev/shared-context-darwin-arm64
+@bytedance-dev/shared-context-darwin-x64
 ```
 
 - 主包提供极薄的 JavaScript Launcher。
@@ -1215,22 +1253,36 @@ Agent 配置引用：
 ### 17.1 Setup
 
 ```bash
-npx -y @company/shared-context@<version> setup --agents cursor,codex
+sctx setup --agents cursor,codex [--knowledge-store-url <GIT_URL>]
 ```
 
 Setup：
 
 1. 检查 macOS、CPU、Git、签名和磁盘空间。
-2. 创建 `~/.shared-context/` 和唯一 Context Git Store。
+2. 创建 `~/.shared-context/` 和唯一 Knowledge Store；若提供 URL，则在事务目录 clone 已有非空远端。
 3. 创建或重建 `index.sqlite` 与 `runtime.sqlite`。
 4. 检测 Cursor/Codex 能力。
 5. 展示并原子合并 Hook/MCP 配置。
 6. 运行 Git、SQLite、MCP、Adapter 和 Task Runtime Smoke Test。
 7. 显示需要重启或 Trust 的 Agent。
 
-Setup 不要求选择业务仓库或 Space。业务 Workspace 只提供非定位 TaskSignal/Breadcrumb，不自动生成 Artifact Focus。
+Setup 不要求选择业务仓库或 Space。业务 Workspace 只提供非定位 TaskSignal，不自动生成 Artifact Focus。
 
-### 17.2 Demo
+远端 Setup 使用系统 Git credential helper 或 SSH Agent，拒绝内嵌 credential、query 和 fragment。Clone 必须在临时目录通过 HEAD/toplevel/clean、committed Event/Object、Reducer 与 scratch Index 校验，随后以同文件系统 rename 原子安装。安装清单只持久化 remote transport、默认分支、stable installation ID、`shared-context/<installation-id>` 工作分支和 URL digest，不保存或输出原始 URL。
+
+Setup 从 `origin/<default>` 创建不跟踪 upstream 的 InstallationWorkBranch，既不提交到本地默认分支，也不 push 任何远端 ref。同 URL 重复 Setup 仅核对本地 manifest/checkout 并保持幂等；不同 URL、既有 local Store、空远端或校验失败全部拒绝覆盖。Hook、MCP 和普通业务 CLI 只能 `open_existing`，不得隐式 init、clone 或访问网络。
+
+### 17.2 Knowledge Sync
+
+```bash
+sctx knowledge sync
+```
+
+同步持安装级排他 maintenance guard 与 setup lock，要求当前分支严格等于 manifest 中的 `shared-context/<installation-id>`、工作树 clean 且无 pending batch。命令显式 fetch `origin/<default>` 和可选 `origin/<work>`，先合并远端工作分支，再合并默认分支；每次合并后的当前 Tree 必须只包含 managed append additions，并通过 committed Event/Object、Reducer 和 Index projection 校验。
+
+Merge conflict 会 abort 并 `reset --hard` 到本次同步开始时已证明 clean 的精确 HEAD；该 reset 不覆盖用户未提交内容，因为 dirty/untracked 输入在联网前就被拒绝。Push refspec 唯一允许 `HEAD:refs/heads/shared-context/<installation-id>`，不使用 force/delete；非快进 race 重新 fetch/merge/validate，最多尝试三次。输出 `base_branch`、`work_branch`、`ahead`、`behind`、`pushed`、`needs_merge`，由用户在任意 Git 托管平台完成 PR。Hook/MCP 不调用此流程，不实现后台同步或平台 API。
+
+### 17.3 Demo
 
 ```bash
 sctx demo seed
@@ -1249,7 +1301,7 @@ Demo 验证：
 8. 确认 Candidate 并生成 Context、SpaceAssociation 和 Lifecycle Events。
 9. 删除并重建 SQLite 后得到相同知识 Projection，并重新解析工程关联。
 
-### 17.3 Doctor
+### 17.4 Doctor
 
 ```bash
 sctx doctor
@@ -1264,16 +1316,25 @@ sctx doctor --json
 - `index.sqlite`、`runtime.sqlite`、Generation 和 FTS。
 - EngineeringReference 解析率和过期关联。
 - Cursor/Codex 配置、MCP 和 Hook 能力。
-- Capture TTL、容量和隐私扫描状态。
+- Task Runtime schema、Checkpoint outbox 与隐私扫描状态。
 
 `doctor --fix` 只执行安全、可重建的修复，例如重建 SQLite 和工程关联；不得自动改写 Git 事实或确认 Candidate。
 
-### 17.4 Uninstall
+### 17.5 Data Reset
+
+```bash
+sctx data reset --dry-run
+sctx data reset --yes
+```
+
+Reset 在安装级排他 maintenance guard 下执行：先在同文件系统 `backups/reset-<id>/new` 构造并 smoke 空 Git/Catalog/SQLite/临时目录，再通过持久 `state/reset-journal.json` 逐项 rename。任何中断后普通业务入口保持 `maintenance_busy`；下一次 reset 或 setup 先回滚到完整旧状态再继续。成功后删除 active marker、保留 backup journal 和旧数据。远端只做本地 remote 存在性读取，禁止 fetch/push/force/delete。
+
+### 17.6 Uninstall
 
 默认移除：
 
 - 自己可精确识别的 Agent 配置条目。
-- Runtime、日志、Capture 和可重建 SQLite。
+- Runtime、日志和可重建 SQLite；同时清理旧版本遗留的 Capture 路径。
 
 默认保留 Context Git Store。删除知识数据使用独立命令，并展示绝对路径和二次确认。
 
@@ -1297,15 +1358,17 @@ M1 复用此前已有的 Git Writer、Reducer、SQLite Context 投影、生命�
 - `runtime.sqlite`、TaskSession、TaskIntentRevision 及并发线性 Head 已实现。
 - 完整 Space Intent FTS、Task 多路召回、Space 关联推断、解释路径和 Session 隔离已实现。
 - `task_intent_update` 按 external Session Locator 与 Revision CAS 更新 Runtime；只读 `task_context` 仅重取固定 Task Revision 与知识 Projection 上的 TaskContextPack。
-- PromptSubmit 只返回不含 Prompt 原文的 Skill/工具能力提示，不访问 Runtime 或 Search。
-- PostToolUse 的 File observation 只保留 Breadcrumb；结构化 TestOutcome 进入 Task fingerprint，但不参与 FTS 或 qualified Test 匹配，也不独立产生工程关联。
+- SessionStart 在模型推理前以本地 Catalog/lease 推导 Enabled（一个或多个已登记 Repository）或 Disabled；Enabled 才返回固定 bounded marker。PromptSubmit 始终 neutral，不重复 marker、不访问 Runtime 或 Search。
+- Enabled PostToolUse 把 lease 作为 Session-level 准入，只合并 safe non-locating TaskSignals；unsafe 事件保持零 Signal/Report/Git residue。结构化 TestOutcome 可进入 Task fingerprint，但不参与 FTS 或 qualified Test 匹配，也不独立产生工程关联或 Claim Evidence。
 - M2 跨 crate/E2E oracle 已证明严格 Intent 更新、只读 Locator 请求、无 Space 路由、`0/1/N` Space、同 Workspace Session 隔离、PostTool Signal 生命周期，以及 Tree/Generation/fingerprint 一致性。
 - Workspace 位置 observation 保留在 Session 但不参与 FTS 或 Task fingerprint；裸 Repository/File 工程 Signal 已删除。
 - Cursor Prompt 仍为显式 MCP；Symbol/Diff/API/Schema 的代码扫描、解析和关系扩展属于 M3，不冒充 M2 RetrievalPath。
+- 固定 expected `fixtures/m2/repository-scoped-activation-v1.json` 与真实文档化 Codex/Cursor payload 验收单仓库会话、共同父目录派生的多仓库会话、Disabled、Catalog unavailable、resume/compact、并发重复 SessionStart、Prompt 前 marker 顺序以及完整生命周期残留；expected 不由 production 输出生成。
+- MCP Server authorization 已由 #191 按 current Enabled Session lease 实现；#192 用最小 gate 让完整 workflow 只在可信 marker 后渐进加载；#193 已用固定 Enabled/Disabled wire oracle 和 NPM gate 关闭字节 proxy 验收。该合约不物理卸载用户级 MCP 进程/工具 Schema，也不测量真实计费 token。
 
 ### M3：Engineering Graph — 已实现
 
-- 本机显式 Repository Catalog 是稳定 RepositoryId 的权威；SQLite Registry 只由 Catalog 同步并可删除恢复。一个 ID 支持 `0..N` checkout/worktree，绝不按 basename、remote、Git common-dir 或共同父目录推断合并/发现。
+- 团队显式约定 exact-case RepositoryId；本机 Catalog 只权威绑定该 ID 与本机 checkout，SQLite Registry 由 Catalog 同步并可删除恢复。一个 ID 支持 `0..N` checkout/worktree，绝不按 basename、remote、Git common-dir 或共同父目录推断合并/发现。
 - `ResolvedRepositoryPath` 可无损转换为本次 File `ResolvedFocus`，但 Hook 当前不发起 ArtifactFocusQuery；热路径不启动 Git、不 scan/rebuild，不配置 sibling。Catalog lock/parse 故障 fail-open。
 - Reference-derived `RepositoryScanPlan` 按 RepositoryId 分组、按精确 RepoRelativePath 去重；受限 tracked-source Scanner 只解析显式非空计划并生成 Module/File/Symbol/API/Schema/Test Artifact 摘要，不保存或返回完整源码，不执行全仓 `git ls-files` 枚举。
 - 持久 EngineeringReference Event、ArtifactResolution、ContextArtifactAssociation 和 generation-stable historical Projection 已实现。
@@ -1328,25 +1391,42 @@ WorkingIntentSnapshot 只保存当前非事实工作理解，不含 maturity、E
 
 Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、ContextRevision 与 EngineeringReference 等工程断言。TaskIntentRevision 持久 authoritative text 和 canonical semantic hash；相同 continue 返回 `already_current`，真实变化创建唯一 successor，显式 new 始终创建独立 Task。M3 的 Context Evidence、EngineeringReference support/limitations、Graph provenance 与 build-time safety 服务知识断言链，不回流为 Working Intent Evidence。
 
-### M4：Low-tax Capture — 已实现
+### M4：Direct Checkpoint / Candidate Review — 已实现
 
-- WorkEpisode/Capture 显式持久 API和 AgentCheckpoint MCP/CLI/Skill 已实现。PreCompact/TurnStop AutomatedEpisodeBoundary 只消费工作 Agent 已写入的 current-Intent Checkpoint，补齐 ordered refs、关闭 Episode 并调用共享 Builder；Adapter 不复制 Builder，SessionEnd 只清理 TTL。
-- Candidate Builder 与最小充分 Evidence 组装已实现：closed Episode 的每个充分 Claim 形成一个无 Space Draft；Inline Validation 原样复用，normalized WorkObservation 可转换为 self-contained snapshot，Context Evidence 从一个 exact Index snapshot 复用。TaskSignal 本身仍是非事实线索；只有 Claim 显式引用的 owned Diff/TestOutcome 才由 Builder 转换为带完整解释与限制的 EvidenceSnapshot，Prompt/Workspace 线索不能成为工程 Evidence；原始 Capture 不进 Git。
-- Builder 在 Git 前用 Runtime v8 固化 BuildId、Claim-scoped SubmissionId 和 content hash，#117 后回填 CandidateId/EventId；两个 crash window、语义重试和并发 close/build 均复用同一操作身份。缺 Claim、Unknown-only、Evidence 不充分为零 Git 写；kind 无 hint 固定 Discovery，topic 缺失保留 Unknown，不做关键词推断。
+- `task_checkpoint` 的 flat exact contract、direct Agent Evidence、server-resolved Task/Intent/lifecycle 和 content-addressed retry 已实现。不存在 public Capture list、transport request key 或 v2 接口。
+- Runtime schema 13 把 operation receipt、final AgentCheckpoint、closed Episode、BuildId 与 Claim-scoped SubmissionId 同事务持久化；相同 scoped content 在 timeout/concurrency 下回放同一身份。
+- Checkpoint ACK 与 replay 为 zero-Git-write durable queue。`candidate_list` 做 bounded/fair recovery，`candidate_get` 做 target-aware recovery；recovery 只创建 untrusted proposal facts，人工 Confirm 前 accepted knowledge closure 仍为空。
+- 每个有 Evidence 的 Claim 形成一个无 Space Candidate draft；Unknown-only 不生成 Candidate。Agent-attested Evidence 从 Checkpoint 到 Review 始终不可信，Hook/TaskSignal 不进入 Claim Evidence。
 - Candidate relationship assessment 与 Space 推荐已实现为 Runtime derived review state：只有完整 canonical draft equality 是 exact duplicate；same statement/different Evidence 是 supports；same topic 加 explicit Context 或 exact Artifact Graph 是 revises；topic/scope 不同 statement 只是 potential contradiction；纯 FTS 是 unresolved related；无候选才 novel。所有结果固定 Context/Graph generation、typed path、confidence、RRF/top-k/token budget 与 stable target tie。
-- Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related，无安全 Primary 时生成一个完整 system-suggested Intent。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
-- Runtime v9 只在 finalized Builder item 同事务初始化 Pending Candidate Review；list/get 以 ExternalSession ActiveTask 为发现边界，返回完整 draft/Evidence/provenance/analysis/Space 推荐并标记为不可信数据。手工或孤立 Git Candidate 不进入 Review，runtime 删除后也不会从 Git 复活。
+- Existing Space 推荐融合 assessment targets、source Task associations 与 Space Intent；conflicted Intent/unsafe Context 只作诊断或 Related。无安全 Primary 时，所有来自同一 `(TaskId, TaskIntentRevisionId)` 的 Candidates 使用同一个稳定 ProposedSpaceGroupKey 和由 `WorkingIntent.goal` 清洗、按词边界截断的完整 Space Intent；不从单个 Candidate statement 派生标题。首次 new-Space Confirm 在 Runtime reservation 中独占该 group 并映射到服务端 SpaceId，提交后的其他 Pending Review 推荐这个 Existing Primary；旧 proposed ID 拒绝且不写 Git，新 Intent revision 使用不同 group。该机制不合并 Candidate、不做语义去重，也不产生 Active Space。分析可由 `candidate analyze` 重跑替换，不写 Git、不改变 Candidate submission/content/ID，不参与 Context Search、Hook 或自动注入。
+- Finalized Builder item 初始化 Pending Candidate Review；list/get 以 ExternalSession ActiveTask 为发现边界，返回完整 draft/Evidence/provenance/analysis/Space 推荐并标记为不可信数据。孤立 Git Candidate 不进入 Review，runtime 删除后也不会从 Git 复活。
 - Review list 使用稳定 cursor、limit 和 whole-summary token budget；analysis pending/failed 以 typed diagnostic 可见但不 ready。discard 使用 Task/Intent/Review version CAS，同 reason timeout retry幂等，默认 list 隐藏 Discarded。
-- CandidateConfirmation 与 ContextSpaceAssociation 的领域/Event/Reducer/Index 契约已实现：确认 input 只选择 existing/new Primary、Related 与 field-level edits；事实闭包引用 exact Candidate、Revision、Association、causal Publish 和 final draft hash。Association 是独立因果 DAG，不写入 ContextRelation；初始确认仍强制 result Context 的嵌套 owner 等于 Primary，未来 correction 不改变当前 Search owner。
+- CandidateConfirmation 与 ContextSpaceAssociation 的领域/Event/Reducer/Index 契约已实现：确认 input 只选择 existing/new Primary、Related 与 field-level edits；事实闭包引用 exact Candidate、Revision、Association、causal Publish 和 final draft hash。Association 是独立因果 DAG，不写入 ContextRelation；EngineeringReference 在确认后通过独立验证入口记录。
+- 唯一 current ContextSpaceAssociation 的 Related Space 是可解释召回角色：Task 可通过 Related B 找到 Primary A 拥有的 Context，结果保留 `association_space_id=B`、`context.space_id=A` 和 typed `space_association/related` 路径；多 Head 冲突不派生自动 Related 角色。
 - 一个 Candidate 的重复确认不论内容相同或不同都形成显式 conflict；Association 多 Head 同样显式 conflict。确认只验证其 causal Publication Event 为 exact Publish，后续 Withdraw/Supersede 不使历史 Confirmation 失效，当前检索继续服从现有 lifecycle。
-- TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Runtime v10 在 Git 前保留完整 ConfirmationPlan，GitStore 将 existing/new Primary 的4/5个事实写入一个 Journal/Commit，Index v11 重建 operation/plan/batch/commit mapping，Git-before-Runtime retry可恢复 Review Confirmed audit。
-- Candidate Confirm 只接受 existing Space 或 current proposed recommendation ID，不接受完整 new Intent 或生成 ID；Potential/ExactDuplicate assessment 可在明确人工调用下确认并在响应中回显 acknowledgment。PreCompact/TurnStop 已接入幂等 Episode close/Builder 触发，但绝不自动 Checkpoint、Review、Discard 或 Confirm。
+- TTL cleanup 只删除重型 Runtime analysis并保留 terminal Expired tombstone；后续 Builder retry不得重新初始化 Pending。Runtime 在 Git 前保留完整 ConfirmationPlan，GitStore 将 existing/new Primary 的 4/5 个事实写入一个 Journal/Commit，Index 重建 operation/plan/batch/commit mapping，Git-before-Runtime retry可恢复 Review Confirmed audit。
+- Candidate Confirm 只接受 existing Space 或 current proposed recommendation ID，不接受完整 new Intent 或生成 ID；Potential/ExactDuplicate assessment 可在明确人工调用下确认并在响应中回显 acknowledgment。Hook 绝不自动 Checkpoint、Review、Discard 或 Confirm。
 - Candidate Builder 是 Candidate 创建的唯一产品入口，复用内部 #117 admission，并提供内部 CLI `candidate build-closed-episode` 恢复边界。公开 MCP/CLI 已删除手工 Candidate submission；孤立 Git Candidate 仍不进入 Review discovery。
 - Mandatory Gate #117 已完成：一次创建操作携带稳定 `submission_id`，首次提交由服务端生成 `candidate_id`/`event_id`/路径并持久化 submission mapping；重试复用同一 `submission_id`。
 - 相同 `submission_id` 加相同权威内容返回原 Candidate；相同 `submission_id` 加不同内容返回 `IdempotencyKeyConflict`；不同 `submission_id` 创建新的 Candidate，即使完整草稿相同。语义相近去重属于知识聚合，不由幂等键处理。
 - `submission_id`、closed Episode ownership 和 writer batch annotation 进入 Git Event；SQLite 建 submission/conflict 投影并从 Git Tree 与引入 commit 重建。Candidate 主写路径使用索引 lookup，不扫描 Event 或读取 commit subject。known-v1 malformed Candidate 仅在有界解析出合法 SubmissionId 时合并到该 ID 的 conflict；unknown schema、无 hint 和其他 ID 只保留 diagnostic，不形成全局阻断。
 - #156 的 WorkEpisode query 已接入 Candidate admission；不存在、Open、跨 Task 或 stale Intent 的来源在任何 Git 写入前拒绝。
-- #164 固定 oracle 位于 `fixtures/m4/fixed-oracle.json`，直接驱动 WorkingIntent→Checkpoint close→Builder→Review list/get→existing/new Confirm，并与固定 Working Intent Hint、跨端 Graph、真实 Cursor/Codex Hook/Capture、submission crash/concurrency、analysis safety、pagination/budget/privacy 套件共同关闭 M4。Oracle 输入为手写 fixture，不从 production 结果生成。
+- #164 固定 oracle位于 `fixtures/m4/fixed-oracle.json`；Mew #226–#228 显式取代其旧 Checkpoint/Capture 输入事实。当前 `direct_evidence_workflow`、`direct_relation_workflow`、MCP contract、ACK performance 与 installed host tests覆盖 flat contract、queued recovery、untrusted Review、human Confirm、privacy 与 crash/concurrency；expected 不从 production 输出生成。
+
+### Retrieval quality（Mew #207）— 已实现，待人工验收
+
+- #214 的 126-byte SessionStart marker 明确要求 substantive work 前调用 `task_intent_update`；Enabled no-ActiveTask PostToolUse 只提醒一次，Prompt 不读取/持久化，PreCompact/TurnStop 只留 typed local diagnostic，不自动创建 Task。
+- #215 以 exact `(TaskId, TaskIntentRevisionId)` 派生稳定 `psg_`，同 revision Claims 共用 goal-derived Proposed Space Intent；首次 new-Space Confirmation 在 Git 前原子预留 mapping，后续 Review 推荐 Existing Space，不合并 Candidate。
+- #222 对自动文本执行 stopword/short/generic/high-DF 过滤和五类替代准入门；Explicit 查询保持诊断能力，弱 Space/context 文本与关系 seed 不得扩散无关 Context。
+- #216 只在 Graph snapshot 不可用时启用 RepositoryId + full locator canonical-key strict fallback；available Graph 的 resolved/missing/ambiguous/unreachable 全部保持 Graph 语义，不 fuzzy、不持久化、不声称 Artifact edge。
+- #217 黑盒 `retrieval_quality_workflow` 通过真实 CLI binary 的 Hook/MCP/CLI public surfaces 串联 bootstrap→two-Claim group→Existing reuse→strong/generic FTS→strict File fallback；不直接调用 Runtime/Reducer/Index。
+
+### Team-shared Knowledge Store — 已实现
+
+- RepositoryId 由团队约定为 exact-case 可读字符串；每台安装的 Catalog 只绑定自己的 checkout，因此 `FE + RepoRelativePath` 可跨机器保持身份而不共享绝对路径。
+- 远端 Setup、InstallationWorkBranch 和显式 `knowledge sync` 形成受保护默认分支协议：安装只 clone，sync 只发布本安装工作分支，人工 PR/merge 才能推进 integrated default。
+- 手写 `fixtures/team-sharing/team-sharing-v1.json` 驱动两个独立 HOME/root、两个不同 FE checkout 与一个 bare remote。A 创建 accepted Context 和 EngineeringReference 后发布工作分支；测试模拟人工合并，B 同步并用 B 的绝对路径形成同一 RepositoryId/Locator 的 ResolvedFocus 与 EngineeringGraph retrieval。
+- 同一 oracle 随后对 B 执行真实 data reset，逐字节证明 runtime、manifest、Agent 配置和 Skill 保留；活动 Git、Catalog、Context/Reference 与派生状态为空，远端全部 refs 不变。该证据不外推为后台同步、自动 PR 或 Git 托管平台集成。
 
 ## 19. 验收标准
 
@@ -1374,16 +1454,18 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 10. 删除 Registry SQLite 后从 Catalog 恢复相同 RepositoryId 与 locator；未配置、Workspace 外和 symlink path 均被 typed 拒绝。
 11. 真实 cross 父 Workspace 中多个独立 Repo 的同名相对路径由不同 RepositoryId 隔离；Hook 新增映射 p95 <10ms、p99 <25ms，且无 Git/scan/rebuild 热路径。
 
-### 19.3 Low-tax Capture
+### 19.3 Direct Checkpoint / Candidate Review
 
-0. Capture/WorkEpisode 基础必须证明 typed CaptureId、Session/Task ownership、ordered Intent/Signal refs、Episode CAS、same-Capture idempotency、跨 Task 拒绝、runtime deletion isolation 与 source Episode verification；Hook 不得自动启动聚合。
-1. Agent 完成一次包含代码探索、修改和测试的 Task 后，系统自动生成 ContextCandidate。
-2. Candidate 自动包含 Statement、Rationale、Applicability、Evidence、RecheckWhen 和 Space 推荐。
-3. 用户确认 Candidate 时不需要重新填写完整结构化内容。
-4. Candidate 可以在没有确定 Space 时保存和展示。
-5. Candidate Confirm 在一个 Batch 中原子生成已有/新 Space 所需事件、Context、SpaceAssociation 和 Lifecycle Events。
-6. Candidate 与已有 Context 重复或矛盾时，确认前必须展示关系和证据。
-7. 原始 Transcript 和 Tool Output 不进入 Git。
+0. `task_checkpoint` 顶层、Claim、Evidence、Unknown 必填字段与 Rust/MCP/host declaration 完全一致，未知字段严格拒绝。
+1. Agent 只提交 Session locator 与 complete direct Claims/Unknowns；Server 拥有 Task/Intent/lifecycle/operation identity。
+2. 同 scoped content 重试必须返回相同 operation、Checkpoint、Episode、Build 和 Submission identities；无需 transport key 或 v2 API。
+3. Checkpoint ACK 和 same-content replay 必须 zero Git writes，并明确返回 queued Build receipt。
+4. `candidate_list/get` 必须 bounded、fair、target-aware 且幂等恢复；允许写 untrusted proposal facts，但人工 Confirm 前 accepted knowledge closure 必须为空。
+5. Agent-attested Evidence 在 Candidate Review 中保持不可信；Hook/TaskSignal 不得充当 Claim Evidence。
+6. 用户确认 Candidate 时不需要重新填写完整结构化内容；Confirm 在一个 Batch 中原子生成 existing/new Space 的 accepted facts。
+7. Candidate 与已有 Context 重复或矛盾时，确认前必须展示关系和证据。
+8. 原始 Transcript、Prompt、Hook text、command 和 Tool Output 不进入 Git。
+9. Related Space 召回必须保留原 Primary owner，并用独立 typed path 解释匹配角色，不能伪装成 ContextRelation 或复制 Context。
 
 ### 19.4 Git 与 Projection
 
@@ -1409,7 +1491,7 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 ## 20. 核心不变量
 
 1. ContextSpace 是 Requirement Intent 与 Context 组织容器，不是检索前置条件。
-2. Workspace 只提供非定位 TaskSignal/Breadcrumb，不能决定 Artifact 或 Space。
+2. Workspace 只提供非定位 TaskSignal，不能决定 Artifact 或 Space。
 3. Task 与 Space 是动态多对多关联，不存在全局 Active Space。
 4. ContextCandidate 可以没有 Space，确认后再形成显式 SpaceAssociation。
 5. ContextItem 的身份独立于 Space；归属修正不改变 Context ID。
@@ -1422,7 +1504,7 @@ Evidence 继续只约束 WorkObservation、CheckpointClaim、Candidate、Context
 12. Revision、SpaceAssociation、Lifecycle 和 Conflict 只按显式因果关系归约。
 13. 多个 Head 必须暴露为冲突，禁止 Last-Write-Wins。
 14. 关联置信度只能影响检索，不能提升 Context 生命周期或自动注入资格。
-15. Candidate、Annotation 和 Capture 内容不得作为高权限指令注入。
+15. Candidate、Annotation 和 TaskSignal 内容不得作为高权限指令注入。
 16. 产品写入路径只创建新文件，自动提交不得吸收或覆盖其他变化。
 17. 相同 Context Git Tree 和实现版本必须得到相同知识 Projection 与稳定查询顺序。
 

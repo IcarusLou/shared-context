@@ -14,8 +14,8 @@ use sctx_domain::{
     candidate_submission_content_hash, reduce,
 };
 use sctx_event_schema::{
-    ContextSpaceAssociationOrigin, Event, EventPayload, EventType, ParsedEvent,
-    candidate_submission_hint, parse_event,
+    ConfirmationProvenance, ContextSpaceAssociationOrigin, Event, EventPayload, EventType,
+    ParsedEvent, V1_JSON_SCHEMA, candidate_submission_hint, parse_event,
 };
 use sctx_local_state::{PrivacyScan, PrivacyScanner, UserConfigStore};
 use serde::Serialize;
@@ -29,6 +29,12 @@ use crate::{
 
 const JOURNAL_VERSION: u32 = 1;
 const MANAGED_ROOTS: [&str; 3] = ["events", "objects", "schemas"];
+const V1_SCHEMA_PATH: &str = "schemas/event-v1.schema.json";
+/// Upper bound on the Events one internal atomic batch may commit together.
+const MAX_INTERNAL_BATCH_EVENTS: usize = 512;
+
+/// Largest number of Candidate submissions one atomic batch may carry.
+pub const MAX_CANDIDATE_SUBMISSION_BATCH: usize = MAX_INTERNAL_BATCH_EVENTS;
 
 /// One UTF-8 content-addressed evidence object to append with an event.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,6 +197,76 @@ pub enum CandidateSubmissionStatus {
     AlreadyExists,
 }
 
+/// Exact result of one request inside a multi-Candidate submission write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateSubmissionBatchEntry {
+    pub submission_id: SubmissionId,
+    pub append: AppendOutcome,
+    pub record: CandidateSubmissionRecord,
+    pub status: CandidateSubmissionStatus,
+}
+
+/// Result of submitting several Candidates under one Candidate Writer lock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateSubmissionBatchWrite {
+    /// One entry per input request, in input order.
+    pub entries: Vec<CandidateSubmissionBatchEntry>,
+    /// The single Git batch that committed every newly created Candidate.
+    ///
+    /// Absent when every request was already present as a same-content replay, which writes
+    /// nothing.
+    pub written: Option<AppendBatchOutcome>,
+    /// `AlreadyExists` only when no request in the batch wrote anything.
+    pub status: CandidateSubmissionStatus,
+}
+
+/// Internal failure that remembers which submission batch member is responsible.
+enum SubmissionBatchFailure {
+    /// One input request is at fault and nothing was written.
+    Request {
+        position: usize,
+        submission_id: SubmissionId,
+        error: Error,
+    },
+    /// The failure belongs to the batch as a whole, not to one request.
+    Batch(Error),
+}
+
+impl SubmissionBatchFailure {
+    fn request(position: usize, submission_id: SubmissionId, error: Error) -> Self {
+        Self::Request {
+            position,
+            submission_id,
+            error,
+        }
+    }
+
+    /// Unlabeled error for the single-request entry point.
+    fn into_error(self) -> Error {
+        match self {
+            Self::Request { error, .. } | Self::Batch(error) => error,
+        }
+    }
+
+    /// Error that names the exact failing batch member for the multi-request entry point.
+    fn into_labeled_error(self) -> Error {
+        match self {
+            Self::Request {
+                position,
+                submission_id,
+                error,
+            } => Error::new(
+                error.kind(),
+                format!(
+                    "{} (batch item {position}, submission {submission_id}); no Candidate in this batch was written",
+                    error.message()
+                ),
+            ),
+            Self::Batch(error) => error,
+        }
+    }
+}
+
 /// Complete indexed metadata for one unique Candidate Confirmation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CandidateConfirmationRecord {
@@ -267,6 +343,75 @@ pub struct CandidateConfirmationOutcome {
     pub append: AppendBatchOutcome,
     pub record: CandidateConfirmationRecord,
     pub status: CandidateConfirmationWriteStatus,
+}
+
+/// Exact result of one plan inside a multi-Confirmation write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationBatchEntry {
+    pub candidate_id: CandidateId,
+    pub append: AppendBatchOutcome,
+    pub record: CandidateConfirmationRecord,
+    pub status: CandidateConfirmationWriteStatus,
+}
+
+/// Result of confirming several reserved plans under one Confirmation lock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateConfirmationBatchWrite {
+    /// One entry per input plan, in input order.
+    pub entries: Vec<CandidateConfirmationBatchEntry>,
+    /// The single Git batch that committed every newly created Confirmation.
+    ///
+    /// Absent when every plan was already present as a same-content replay, which writes nothing.
+    pub written: Option<AppendBatchOutcome>,
+    /// `AlreadyExists` only when no plan in the batch wrote anything.
+    pub status: CandidateConfirmationWriteStatus,
+}
+
+/// Internal failure that remembers which batch member is responsible.
+enum ConfirmationBatchFailure {
+    /// One input plan is at fault and nothing was written.
+    Plan {
+        position: usize,
+        candidate_id: CandidateId,
+        error: Error,
+    },
+    /// The failure belongs to the batch as a whole, not to one plan.
+    Batch(Error),
+}
+
+impl ConfirmationBatchFailure {
+    fn plan(position: usize, candidate_id: CandidateId, error: Error) -> Self {
+        Self::Plan {
+            position,
+            candidate_id,
+            error,
+        }
+    }
+
+    /// Unlabeled error for the single-plan entry point.
+    fn into_error(self) -> Error {
+        match self {
+            Self::Plan { error, .. } | Self::Batch(error) => error,
+        }
+    }
+
+    /// Error that names the exact failing batch member for the multi-plan entry point.
+    fn into_labeled_error(self) -> Error {
+        match self {
+            Self::Plan {
+                position,
+                candidate_id,
+                error,
+            } => Error::new(
+                error.kind(),
+                format!(
+                    "{} (batch item {position}, candidate {candidate_id}); no Candidate in this batch was written",
+                    error.message()
+                ),
+            ),
+            Self::Batch(error) => error,
+        }
+    }
 }
 
 impl CandidateSubmissionOutcome {
@@ -354,23 +499,30 @@ pub struct GitStore {
     confirmation_index: Arc<dyn CandidateConfirmationIndex>,
 }
 
+/// Safe metadata discovered while cloning a remote Knowledge Store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteBootstrap {
+    pub default_branch: String,
+    pub work_branch: String,
+}
+
 impl GitStore {
-    /// Initializes or opens the unique store under `home/.shared-context`.
+    /// Bootstraps or opens the local-only store under `home/.shared-context`.
     ///
     /// # Errors
     ///
     /// Returns an error if the fixed repository path is not a valid standalone
     /// Git worktree or if initialization cannot be completed.
-    pub fn initialize_for_home(home: impl AsRef<Path>) -> Result<Self> {
-        Self::initialize(home.as_ref().join(".shared-context"))
+    pub fn bootstrap_local_for_home(home: impl AsRef<Path>) -> Result<Self> {
+        Self::bootstrap_local(home.as_ref().join(".shared-context"))
     }
 
-    /// Initializes or opens the unique store at an explicit installation root.
+    /// Bootstraps or opens a local-only store at an explicit installation root.
     ///
     /// # Errors
     ///
     /// Returns an error if filesystem or Git initialization fails.
-    pub fn initialize(root: impl AsRef<Path>) -> Result<Self> {
+    pub fn bootstrap_local(root: impl AsRef<Path>) -> Result<Self> {
         let root = absolute(root.as_ref())?;
         let config = UserConfigStore::initialize(&root)?;
         let state = root.join("state");
@@ -411,16 +563,118 @@ impl GitStore {
                 fs::create_dir_all(repository.join(directory))
                     .map_err(io_error("create managed repository directory"))?;
             }
-            git.run([
-                "commit",
-                "--allow-empty",
-                "-m",
-                "Initialize Shared Context repository",
-            ])?;
+            write_bundled_v1_schema(&repository)?;
+            git.stage_paths(&[V1_SCHEMA_PATH.to_owned()])?;
+            git.run(["commit", "-m", "Initialize Shared Context repository"])?;
         }
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
 
-        Ok(Self {
+        Ok(Self::from_paths(root, repository, state))
+    }
+
+    /// Clones a non-empty remote Knowledge Store into a new installation root.
+    ///
+    /// The caller is responsible for using a staging installation root and atomically moving the
+    /// validated repository into its final location. This method never pushes or mutates a remote
+    /// ref. It checks out a new, untracked installation work branch from the remote default branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an existing destination, embedded URL credentials, an empty or invalid
+    /// remote, a dirty clone, or a work branch that is not a valid Git branch name.
+    pub fn bootstrap_remote(
+        root: impl AsRef<Path>,
+        remote_url: &str,
+        work_branch: &str,
+    ) -> Result<(Self, RemoteBootstrap)> {
+        validate_remote_url(remote_url)?;
+        let root = absolute(root.as_ref())?;
+        let config = UserConfigStore::initialize(&root)?;
+        let state = root.join("state");
+        let repository = config.repository().to_path_buf();
+        fs::create_dir_all(state.join("pending")).map_err(io_error("create pending root"))?;
+        let lock = open_lock(&state.join("writer.lock"))?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock writer.lock"))?;
+        if fs::symlink_metadata(&repository).is_ok() {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "remote Knowledge Store destination already exists",
+            ));
+        }
+        let output = std::process::Command::new("git")
+            .args(["clone", "--origin", "origin", "--no-tags", "--"])
+            .arg(remote_url)
+            .arg(&repository)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::External,
+                    format!("failed to execute git clone: {error}"),
+                )
+            })?;
+        if !output.status.success() {
+            return Err(Error::new(
+                ErrorKind::External,
+                format!(
+                    "git clone failed with {}; verify the Knowledge Store URL and Git credentials",
+                    output.status
+                ),
+            ));
+        }
+        verify_repository(&repository)?;
+        let git = Git::new(&repository);
+        let remote_head = git.output_text([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])?;
+        let default_branch = remote_head
+            .strip_prefix("origin/")
+            .filter(|branch| !branch.is_empty())
+            .ok_or_else(|| invariant("remote default branch could not be determined"))?
+            .to_owned();
+        git.run(["check-ref-format", "--branch", work_branch])?;
+        let base = format!("origin/{default_branch}");
+        git.run(["checkout", "--no-track", "-b", work_branch, &base])?;
+        git.run(["config", "user.name", "Shared Context Writer"])?;
+        git.run(["config", "user.email", "shared-context@localhost"])?;
+        verify_clean_repository(&repository)?;
+        FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
+
+        Ok((
+            Self::from_paths(root, repository, state),
+            RemoteBootstrap {
+                default_branch,
+                work_branch: work_branch.to_owned(),
+            },
+        ))
+    }
+
+    /// Opens an already bootstrapped store without initializing or cloning repository state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixed config, state, or repository layout is absent or invalid.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self> {
+        let root = absolute(root.as_ref())?;
+        let config = UserConfigStore::open_existing(&root)?;
+        let state = root.join("state");
+        if !state.is_dir() {
+            return Err(invariant(format!(
+                "state directory does not exist: {}",
+                state.display()
+            )));
+        }
+        let repository = config.repository().to_path_buf();
+        verify_repository(&repository)?;
+        Ok(Self::from_paths(root, repository, state))
+    }
+
+    fn from_paths(root: PathBuf, repository: PathBuf, state: PathBuf) -> Self {
+        Self {
             root,
             repository,
             state,
@@ -428,7 +682,7 @@ impl GitStore {
             observer: Arc::new(NoopCommitObserver),
             candidate_index: Arc::new(UnavailableCandidateSubmissionIndex),
             confirmation_index: Arc::new(UnavailableCandidateConfirmationIndex),
-        })
+        }
     }
 
     /// Replaces the crash injector, primarily for seam testing.
@@ -483,6 +737,72 @@ impl GitStore {
         &self.state
     }
 
+    /// Installs the bundled immutable Event schemas when opening a legacy Store.
+    ///
+    /// Existing committed schema bytes are never overwritten. A missing schema is added in one
+    /// append-only commit, while an existing conflicting or dirty schema path fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema path is unsafe, existing bytes differ from the bundled
+    /// contract, or Git cannot commit the missing schema.
+    pub fn ensure_bundled_schemas(&self) -> Result<bool> {
+        let lock = self.writer_lock()?;
+        let result = self.ensure_bundled_schemas_locked();
+        let unlock = FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"));
+        match (result, unlock) {
+            (Ok(changed), Ok(())) => Ok(changed),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn ensure_bundled_schemas_locked(&self) -> Result<bool> {
+        let git = Git::new(&self.repository);
+        if let Some(committed) = git.head_file(V1_SCHEMA_PATH)? {
+            if committed != V1_JSON_SCHEMA.as_bytes() {
+                return Err(invariant(format!(
+                    "committed Event schema differs from the bundled immutable contract: {V1_SCHEMA_PATH}"
+                )));
+            }
+            verify_worktree_v1_schema(&self.repository)?;
+            return Ok(false);
+        }
+
+        let schema = self.repository.join(V1_SCHEMA_PATH);
+        match fs::symlink_metadata(&schema) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = fs::read(&schema).map_err(io_error("read untracked Event schema"))?;
+                if bytes != V1_JSON_SCHEMA.as_bytes() {
+                    return Err(invariant(format!(
+                        "untracked Event schema differs from the bundled immutable contract: {V1_SCHEMA_PATH}"
+                    )));
+                }
+            }
+            Ok(_) => {
+                return Err(invariant(format!(
+                    "Event schema path is not a regular file: {V1_SCHEMA_PATH}"
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_bundled_v1_schema(&self.repository)?;
+            }
+            Err(error) => return Err(io_error("inspect Event schema path")(error)),
+        }
+
+        let paths = [V1_SCHEMA_PATH.to_owned()];
+        git.stage_paths(&paths)?;
+        git.commit_paths("Install Shared Context event schema v1", &paths)?;
+        let committed = git
+            .head_file(V1_SCHEMA_PATH)?
+            .ok_or_else(|| invariant("committed Event schema is missing after installation"))?;
+        if committed != V1_JSON_SCHEMA.as_bytes() {
+            return Err(invariant(
+                "committed Event schema differs after installation",
+            ));
+        }
+        Ok(true)
+    }
+
     /// Appends one immutable event and its text objects in one Git commit.
     ///
     /// # Errors
@@ -525,82 +845,254 @@ impl GitStore {
         &self,
         request: CandidateSubmissionRequest,
     ) -> Result<CandidateSubmissionOutcome> {
-        request.content.validate()?;
-        let requested_hash = request.content_hash();
-        let lock = open_lock(&self.state.join("candidate-writer.lock"))?;
-        lock.lock_exclusive()
-            .map_err(io_error("lock candidate-writer.lock"))?;
-        self.candidate_index.synchronize()?;
-        let writer_lock = self.writer_lock()?;
-        self.recover_all_locked(None)?;
-        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
-        self.candidate_index.synchronize()?;
-        match self.candidate_index.lookup(request.submission_id)? {
-            CandidateSubmissionLookup::Found(record) => {
-                if record.content_hash != requested_hash {
-                    return Err(Error::new(
-                        ErrorKind::IdempotencyKeyConflict,
-                        "SubmissionId was reused with different authoritative Candidate content",
-                    ));
-                }
-                let append = append_from_submission_record(&record, true);
-                FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
-                return Ok(CandidateSubmissionOutcome {
-                    append,
-                    record,
-                    status: CandidateSubmissionStatus::AlreadyExists,
-                });
-            }
-            CandidateSubmissionLookup::Conflict { .. } => {
-                return Err(Error::new(
-                    ErrorKind::IdempotencyKeyConflict,
-                    "SubmissionId has conflicting authoritative Candidate Events",
-                ));
-            }
-            CandidateSubmissionLookup::NotFound => {}
-        }
-        let batch_id = BatchId::new();
-        let event = Event::context_candidate_created(
-            request.submission_id,
-            request.source_episode,
-            request.content,
-            batch_id.as_str(),
-            None,
-        )?;
-        let (journal, object_refs) = self.prepare_candidate_with_batch(&event, batch_id)?;
-        debug_assert!(object_refs.is_empty());
-        self.crash.check(CrashSeam::AfterJournal)?;
-        let writer_lock = self.writer_lock()?;
-        self.recover_all_locked(Some(&journal.batch_id))?;
-        let append = self.commit_journal_locked(&journal, false)?;
-        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
-        self.candidate_index.synchronize()?;
-        let record = match self.candidate_index.lookup(request.submission_id)? {
-            CandidateSubmissionLookup::Found(record) if record.content_hash == requested_hash => {
-                record
-            }
-            CandidateSubmissionLookup::Found(_) | CandidateSubmissionLookup::Conflict { .. } => {
-                return Err(invariant(
-                    "committed Candidate submission projected conflicting content",
-                ));
-            }
-            CandidateSubmissionLookup::NotFound => {
-                return Err(invariant(
-                    "committed Candidate submission is absent from synchronized index",
-                ));
-            }
-        };
-        FileExt::unlock(&lock).map_err(io_error("unlock candidate-writer.lock"))?;
+        let requests = [request];
+        let write = self
+            .submit_candidate_requests(&requests)
+            .map_err(SubmissionBatchFailure::into_error)?;
+        let entry = write
+            .entries
+            .into_iter()
+            .next()
+            .ok_or_else(|| invariant("Candidate submission produced no result"))?;
         Ok(CandidateSubmissionOutcome {
-            append,
-            record,
+            append: entry.append,
+            record: entry.record,
+            status: entry.status,
+        })
+    }
+
+    /// Submits several Candidate creations under one lock cycle and one Git commit.
+    ///
+    /// One Candidate Writer lock, one index synchronization pair, one pending journal and one Git
+    /// commit cover the whole slice, while every Candidate keeps its own `SubmissionId`
+    /// idempotency and its own Writer batch id, so the submission index still maps a Candidate to
+    /// exactly its own Event. A request whose `SubmissionId` is already present with identical
+    /// content keeps its single-request replay meaning: it is reported as `AlreadyExists` and
+    /// contributes no Event, while the remaining new requests are still written. Any request that
+    /// fails validation or that reuses a `SubmissionId` with different content rejects the whole
+    /// slice before the first write and names its position and `SubmissionId`.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty slice, a repeated `SubmissionId`, an oversized batch, content conflicts,
+    /// unavailable index state, privacy violations, pending recovery failures, Git failures, and
+    /// injected crash seams.
+    pub fn submit_candidates(
+        &self,
+        requests: &[CandidateSubmissionRequest],
+    ) -> Result<CandidateSubmissionBatchWrite> {
+        self.submit_candidate_requests(requests)
+            .map_err(SubmissionBatchFailure::into_labeled_error)
+    }
+
+    /// Single implementation shared by the one-request and multi-request submission entry points.
+    fn submit_candidate_requests(
+        &self,
+        requests: &[CandidateSubmissionRequest],
+    ) -> std::result::Result<CandidateSubmissionBatchWrite, SubmissionBatchFailure> {
+        use SubmissionBatchFailure as Failure;
+
+        if requests.is_empty() {
+            return Err(Failure::Batch(Error::new(
+                ErrorKind::InvalidInput,
+                "Candidate submission requires at least one request",
+            )));
+        }
+        if requests.len() > MAX_CANDIDATE_SUBMISSION_BATCH {
+            return Err(Failure::Batch(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Candidate submission batch requires at most {MAX_CANDIDATE_SUBMISSION_BATCH} Candidates"
+                ),
+            )));
+        }
+        let mut identities = Vec::with_capacity(requests.len());
+        let mut seen = BTreeSet::new();
+        for (position, request) in requests.iter().enumerate() {
+            let submission_id = request.submission_id;
+            request
+                .content
+                .validate()
+                .map_err(|error| Failure::request(position, submission_id, error))?;
+            if !seen.insert(submission_id) {
+                return Err(Failure::request(
+                    position,
+                    submission_id,
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "Candidate submission batch must not repeat a SubmissionId",
+                    ),
+                ));
+            }
+            identities.push((submission_id, request.content_hash()));
+        }
+        let lock = open_lock(&self.state.join("candidate-writer.lock")).map_err(Failure::Batch)?;
+        lock.lock_exclusive()
+            .map_err(io_error("lock candidate-writer.lock"))
+            .map_err(Failure::Batch)?;
+        let write = self.submit_candidate_requests_locked(requests, &identities)?;
+        FileExt::unlock(&lock)
+            .map_err(io_error("unlock candidate-writer.lock"))
+            .map_err(Failure::Batch)?;
+        Ok(write)
+    }
+
+    /// Submission body executed while the Candidate Writer lock is held.
+    fn submit_candidate_requests_locked(
+        &self,
+        requests: &[CandidateSubmissionRequest],
+        identities: &[(SubmissionId, String)],
+    ) -> std::result::Result<CandidateSubmissionBatchWrite, SubmissionBatchFailure> {
+        use SubmissionBatchFailure as Failure;
+
+        self.synchronize_submissions_over_pending()
+            .map_err(Failure::Batch)?;
+        let existing = self.indexed_submissions(identities)?;
+        let unwritten = (0..requests.len())
+            .filter(|position| existing[*position].is_none())
+            .collect::<Vec<_>>();
+        if unwritten.is_empty() {
+            return replayed_submission_batch(identities, existing);
+        }
+
+        let (events, payloads) = submission_batch_events(requests, &unwritten)?;
+        let journal = self
+            .prepare_internal_event_batch(&events, &payloads, BatchId::new())
+            .map_err(Failure::Batch)?;
+        self.crash
+            .check(CrashSeam::AfterJournal)
+            .map_err(Failure::Batch)?;
+        let writer_lock = self.writer_lock().map_err(Failure::Batch)?;
+        self.recover_all_locked(Some(&journal.batch_id))
+            .map_err(Failure::Batch)?;
+        let primary = self
+            .commit_journal_locked(&journal, false)
+            .map_err(Failure::Batch)?;
+        FileExt::unlock(&writer_lock)
+            .map_err(io_error("unlock writer.lock"))
+            .map_err(Failure::Batch)?;
+        self.candidate_index.synchronize().map_err(Failure::Batch)?;
+
+        let mut entries = Vec::with_capacity(identities.len());
+        let mut written_event_ids = Vec::new();
+        let mut written_event_paths = Vec::new();
+        for (position, (identity, replayed)) in identities.iter().zip(existing).enumerate() {
+            let (record, status) = if let Some(record) = replayed {
+                (record, CandidateSubmissionStatus::AlreadyExists)
+            } else {
+                let record = self.committed_submission(position, identity)?;
+                written_event_ids.push(record.event_id);
+                written_event_paths.push(record.event_path.clone());
+                (record, CandidateSubmissionStatus::Created)
+            };
+            let recovered = status == CandidateSubmissionStatus::AlreadyExists || primary.recovered;
+            entries.push(CandidateSubmissionBatchEntry {
+                submission_id: identity.0,
+                append: append_from_submission_record(&record, recovered),
+                record,
+                status,
+            });
+        }
+        Ok(CandidateSubmissionBatchWrite {
+            entries,
+            written: Some(AppendBatchOutcome {
+                batch_id: journal.batch_id,
+                event_ids: written_event_ids,
+                event_paths: written_event_paths,
+                commit_oid: primary.commit_oid,
+                recovered: primary.recovered,
+            }),
             status: CandidateSubmissionStatus::Created,
         })
     }
 
+    /// Brings the Candidate index up to a repository with no pending batch left behind.
+    fn synchronize_submissions_over_pending(&self) -> Result<()> {
+        self.candidate_index.synchronize()?;
+        let writer_lock = self.writer_lock()?;
+        self.recover_all_locked(None)?;
+        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
+        self.candidate_index.synchronize()
+    }
+
+    /// Classifies every request as an identical replay or as not yet submitted.
+    fn indexed_submissions(
+        &self,
+        identities: &[(SubmissionId, String)],
+    ) -> std::result::Result<Vec<Option<CandidateSubmissionRecord>>, SubmissionBatchFailure> {
+        use SubmissionBatchFailure as Failure;
+
+        let mut existing = Vec::with_capacity(identities.len());
+        for (position, (submission_id, content_hash)) in identities.iter().enumerate() {
+            match self
+                .candidate_index
+                .lookup(*submission_id)
+                .map_err(Failure::Batch)?
+            {
+                CandidateSubmissionLookup::Found(record) => {
+                    if record.content_hash != *content_hash {
+                        return Err(Failure::request(
+                            position,
+                            *submission_id,
+                            Error::new(
+                                ErrorKind::IdempotencyKeyConflict,
+                                "SubmissionId was reused with different authoritative Candidate content",
+                            ),
+                        ));
+                    }
+                    existing.push(Some(record));
+                }
+                CandidateSubmissionLookup::Conflict { .. } => {
+                    return Err(Failure::request(
+                        position,
+                        *submission_id,
+                        Error::new(
+                            ErrorKind::IdempotencyKeyConflict,
+                            "SubmissionId has conflicting authoritative Candidate Events",
+                        ),
+                    ));
+                }
+                CandidateSubmissionLookup::NotFound => existing.push(None),
+            }
+        }
+        Ok(existing)
+    }
+
+    /// Reads back one just committed submission from the synchronized index.
+    fn committed_submission(
+        &self,
+        position: usize,
+        identity: &(SubmissionId, String),
+    ) -> std::result::Result<CandidateSubmissionRecord, SubmissionBatchFailure> {
+        use SubmissionBatchFailure as Failure;
+
+        let (submission_id, content_hash) = identity;
+        match self
+            .candidate_index
+            .lookup(*submission_id)
+            .map_err(Failure::Batch)?
+        {
+            CandidateSubmissionLookup::Found(record) if record.content_hash == *content_hash => {
+                Ok(record)
+            }
+            CandidateSubmissionLookup::Found(_) | CandidateSubmissionLookup::Conflict { .. } => {
+                Err(Failure::request(
+                    position,
+                    *submission_id,
+                    invariant("committed Candidate submission projected conflicting content"),
+                ))
+            }
+            CandidateSubmissionLookup::NotFound => Err(Failure::request(
+                position,
+                *submission_id,
+                invariant("committed Candidate submission is absent from synchronized index"),
+            )),
+        }
+    }
+
     /// Atomically appends one reserved Candidate Confirmation fact closure.
     ///
-    /// The Confirmation lock spans index synchronization, pending recovery, the four/five Event
+    /// The Confirmation lock spans index synchronization, pending recovery, the complete Event
     /// commit, and post-commit lookup. Public generic append remains single-Event only.
     ///
     /// # Errors
@@ -611,87 +1103,280 @@ impl GitStore {
         &self,
         plan: &CandidateConfirmationPlan,
     ) -> Result<CandidateConfirmationOutcome> {
-        plan.validate()?;
-        let operation_hash = plan.operation_hash.clone();
-        let plan_hash = plan.plan_hash();
-        let candidate_id = plan.operation.candidate_id;
-        let lock = open_lock(&self.state.join("candidate-confirmation.lock"))?;
+        self.confirm_candidate_with_provenance(plan, &ConfirmationProvenance::human())
+    }
+
+    /// Appends one reserved Candidate Confirmation, recording who decided it.
+    ///
+    /// Identical to [`Self::confirm_candidate`] in every written fact; the provenance reaches only
+    /// the `candidate.confirmed` event's `annotations` and no hash a replay compares.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`Self::confirm_candidate`].
+    pub fn confirm_candidate_with_provenance(
+        &self,
+        plan: &CandidateConfirmationPlan,
+        provenance: &ConfirmationProvenance,
+    ) -> Result<CandidateConfirmationOutcome> {
+        let write = self
+            .confirm_candidate_plans(std::slice::from_ref(plan), provenance)
+            .map_err(ConfirmationBatchFailure::into_error)?;
+        let entry = write
+            .entries
+            .into_iter()
+            .next()
+            .ok_or_else(|| invariant("Candidate Confirmation produced no result"))?;
+        Ok(CandidateConfirmationOutcome {
+            append: entry.append,
+            record: entry.record,
+            status: entry.status,
+        })
+    }
+
+    /// Atomically appends the reserved fact closures of several Candidate Confirmations.
+    ///
+    /// One Confirmation lock, one Writer batch and one Git commit cover the whole slice: the
+    /// committed Events are the per-plan Events concatenated in input order. Any plan that fails
+    /// validation, that is already confirmed with different semantics, or that has conflicting
+    /// Confirmation facts rejects the whole slice before the first write and names its position
+    /// and `CandidateId`. A plan that is already present with identical semantics keeps its
+    /// single-plan replay meaning: it is reported as `AlreadyExists` and contributes no Event,
+    /// while the remaining new plans are still written.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty slice, a repeated Candidate, an oversized batch, plan/hash conflicts,
+    /// privacy failures, unavailable index state, pending recovery, Git failures, and injected
+    /// crash seams.
+    pub fn confirm_candidates(
+        &self,
+        plans: &[CandidateConfirmationPlan],
+    ) -> Result<CandidateConfirmationBatchWrite> {
+        self.confirm_candidates_with_provenance(plans, &ConfirmationProvenance::human())
+    }
+
+    /// Appends several reserved Candidate Confirmations, recording who decided them.
+    ///
+    /// One batch is one disposition decision, so one provenance covers every plan in it.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`Self::confirm_candidates`].
+    pub fn confirm_candidates_with_provenance(
+        &self,
+        plans: &[CandidateConfirmationPlan],
+        provenance: &ConfirmationProvenance,
+    ) -> Result<CandidateConfirmationBatchWrite> {
+        self.confirm_candidate_plans(plans, provenance)
+            .map_err(ConfirmationBatchFailure::into_labeled_error)
+    }
+
+    /// Single implementation shared by the one-plan and multi-plan Confirmation entry points.
+    fn confirm_candidate_plans(
+        &self,
+        plans: &[CandidateConfirmationPlan],
+        provenance: &ConfirmationProvenance,
+    ) -> std::result::Result<CandidateConfirmationBatchWrite, ConfirmationBatchFailure> {
+        use ConfirmationBatchFailure as Failure;
+
+        if plans.is_empty() {
+            return Err(Failure::Batch(Error::new(
+                ErrorKind::InvalidInput,
+                "Candidate Confirmation requires at least one reserved plan",
+            )));
+        }
+        let mut identities = Vec::with_capacity(plans.len());
+        let mut seen = BTreeSet::new();
+        let mut expected_events = 0_usize;
+        for (position, plan) in plans.iter().enumerate() {
+            let candidate_id = plan.operation.candidate_id;
+            plan.validate()
+                .map_err(|error| Failure::plan(position, candidate_id, error))?;
+            if !seen.insert(candidate_id) {
+                return Err(Failure::plan(
+                    position,
+                    candidate_id,
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "Candidate Confirmation batch must not repeat a Candidate",
+                    ),
+                ));
+            }
+            expected_events = expected_events.saturating_add(plan.expected_event_count());
+            identities.push((candidate_id, plan.operation_hash.clone(), plan.plan_hash()));
+        }
+        if expected_events > MAX_INTERNAL_BATCH_EVENTS {
+            return Err(Failure::Batch(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "Candidate Confirmation batch requires at most {MAX_INTERNAL_BATCH_EVENTS} Events"
+                ),
+            )));
+        }
+        let lock =
+            open_lock(&self.state.join("candidate-confirmation.lock")).map_err(Failure::Batch)?;
         lock.lock_exclusive()
-            .map_err(io_error("lock candidate-confirmation.lock"))?;
+            .map_err(io_error("lock candidate-confirmation.lock"))
+            .map_err(Failure::Batch)?;
+        let write = self.confirm_candidate_plans_locked(plans, &identities, provenance)?;
+        FileExt::unlock(&lock)
+            .map_err(io_error("unlock candidate-confirmation.lock"))
+            .map_err(Failure::Batch)?;
+        Ok(write)
+    }
+
+    /// Confirmation body executed while the Confirmation lock is held.
+    fn confirm_candidate_plans_locked(
+        &self,
+        plans: &[CandidateConfirmationPlan],
+        identities: &[(CandidateId, String, String)],
+        provenance: &ConfirmationProvenance,
+    ) -> std::result::Result<CandidateConfirmationBatchWrite, ConfirmationBatchFailure> {
+        use ConfirmationBatchFailure as Failure;
+
+        self.synchronize_confirmations_over_pending()
+            .map_err(Failure::Batch)?;
+        let existing = self.indexed_confirmations(identities)?;
+        let unwritten = (0..plans.len())
+            .filter(|position| existing[*position].is_none())
+            .collect::<Vec<_>>();
+        if unwritten.is_empty() {
+            return replayed_confirmation_batch(identities, existing);
+        }
+
+        let (events, payloads) = confirmation_batch_events(plans, &unwritten, provenance)?;
+        let journal = self
+            .prepare_internal_event_batch(&events, &payloads, BatchId::new())
+            .map_err(Failure::Batch)?;
+        self.crash
+            .check(CrashSeam::AfterJournal)
+            .map_err(Failure::Batch)?;
+        let writer_lock = self.writer_lock().map_err(Failure::Batch)?;
+        self.recover_all_locked(Some(&journal.batch_id))
+            .map_err(Failure::Batch)?;
+        let primary = self
+            .commit_journal_locked(&journal, false)
+            .map_err(Failure::Batch)?;
+        FileExt::unlock(&writer_lock)
+            .map_err(io_error("unlock writer.lock"))
+            .map_err(Failure::Batch)?;
+        self.confirmation_index
+            .synchronize()
+            .map_err(Failure::Batch)?;
+
+        let mut entries = Vec::with_capacity(identities.len());
+        let mut written_event_ids = Vec::new();
+        let mut written_event_paths = Vec::new();
+        for (identity, replayed) in identities.iter().zip(existing) {
+            let (record, status) = if let Some(record) = replayed {
+                (record, CandidateConfirmationWriteStatus::AlreadyExists)
+            } else {
+                let record = self.committed_confirmation(identity)?;
+                written_event_ids.extend(record.event_ids.iter().copied());
+                written_event_paths.extend(record.event_paths.iter().cloned());
+                (record, CandidateConfirmationWriteStatus::Created)
+            };
+            let recovered =
+                status == CandidateConfirmationWriteStatus::AlreadyExists || primary.recovered;
+            entries.push(CandidateConfirmationBatchEntry {
+                candidate_id: identity.0,
+                append: append_batch_from_confirmation_record(&record, recovered),
+                record,
+                status,
+            });
+        }
+        Ok(CandidateConfirmationBatchWrite {
+            entries,
+            written: Some(AppendBatchOutcome {
+                batch_id: journal.batch_id,
+                event_ids: written_event_ids,
+                event_paths: written_event_paths,
+                commit_oid: primary.commit_oid,
+                recovered: primary.recovered,
+            }),
+            status: CandidateConfirmationWriteStatus::Created,
+        })
+    }
+
+    /// Brings the Confirmation index up to a repository with no pending batch left behind.
+    fn synchronize_confirmations_over_pending(&self) -> Result<()> {
         self.confirmation_index.synchronize()?;
         let writer_lock = self.writer_lock()?;
         self.recover_all_locked(None)?;
         FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
-        self.confirmation_index.synchronize()?;
-        match self.confirmation_index.lookup(candidate_id)? {
-            CandidateConfirmationLookup::Found(record) => {
-                if record.operation_hash != operation_hash || record.plan_hash != plan_hash {
-                    return Err(Error::new(
-                        ErrorKind::Conflict,
-                        "Candidate already has a different Confirmation operation",
+        self.confirmation_index.synchronize()
+    }
+
+    /// Classifies every plan as an identical replay or as not yet confirmed.
+    fn indexed_confirmations(
+        &self,
+        identities: &[(CandidateId, String, String)],
+    ) -> std::result::Result<Vec<Option<CandidateConfirmationRecord>>, ConfirmationBatchFailure>
+    {
+        use ConfirmationBatchFailure as Failure;
+
+        let mut existing = Vec::with_capacity(identities.len());
+        for (position, (candidate_id, operation_hash, plan_hash)) in identities.iter().enumerate() {
+            match self
+                .confirmation_index
+                .lookup(*candidate_id)
+                .map_err(Failure::Batch)?
+            {
+                CandidateConfirmationLookup::Found(record) => {
+                    if record.operation_hash != *operation_hash || record.plan_hash != *plan_hash {
+                        return Err(Failure::plan(
+                            position,
+                            *candidate_id,
+                            Error::new(
+                                ErrorKind::Conflict,
+                                "Candidate already has a different Confirmation operation",
+                            ),
+                        ));
+                    }
+                    existing.push(Some(record));
+                }
+                CandidateConfirmationLookup::Conflict { .. } => {
+                    return Err(Failure::plan(
+                        position,
+                        *candidate_id,
+                        Error::new(
+                            ErrorKind::Conflict,
+                            "Candidate has conflicting Confirmation facts",
+                        ),
                     ));
                 }
-                let append = append_batch_from_confirmation_record(&record, true);
-                FileExt::unlock(&lock).map_err(io_error("unlock candidate-confirmation.lock"))?;
-                return Ok(CandidateConfirmationOutcome {
-                    append,
-                    record,
-                    status: CandidateConfirmationWriteStatus::AlreadyExists,
-                });
+                CandidateConfirmationLookup::NotFound => existing.push(None),
             }
-            CandidateConfirmationLookup::Conflict { .. } => {
-                return Err(Error::new(
-                    ErrorKind::Conflict,
-                    "Candidate has conflicting Confirmation facts",
-                ));
-            }
-            CandidateConfirmationLookup::NotFound => {}
         }
-        let batch_id = BatchId::new();
-        let events = Event::from_candidate_confirmation_plan(plan, batch_id.as_str())?;
-        if !matches!(events.len(), 4 | 5) {
-            return Err(invariant(
-                "Candidate Confirmation plan must materialize four or five Events",
-            ));
-        }
-        let journal = self.prepare_internal_event_batch(&events, batch_id)?;
-        self.crash.check(CrashSeam::AfterJournal)?;
-        let writer_lock = self.writer_lock()?;
-        self.recover_all_locked(Some(&journal.batch_id))?;
-        let primary = self.commit_journal_locked(&journal, false)?;
-        FileExt::unlock(&writer_lock).map_err(io_error("unlock writer.lock"))?;
-        self.confirmation_index.synchronize()?;
-        let record = match self.confirmation_index.lookup(candidate_id)? {
+        Ok(existing)
+    }
+
+    /// Reads back the exact record the Confirmation batch just committed.
+    fn committed_confirmation(
+        &self,
+        (candidate_id, operation_hash, plan_hash): &(CandidateId, String, String),
+    ) -> std::result::Result<CandidateConfirmationRecord, ConfirmationBatchFailure> {
+        use ConfirmationBatchFailure as Failure;
+
+        match self
+            .confirmation_index
+            .lookup(*candidate_id)
+            .map_err(Failure::Batch)?
+        {
             CandidateConfirmationLookup::Found(record)
-                if record.operation_hash == operation_hash && record.plan_hash == plan_hash =>
+                if record.operation_hash == *operation_hash && record.plan_hash == *plan_hash =>
             {
-                record
+                Ok(record)
             }
             CandidateConfirmationLookup::Found(_)
-            | CandidateConfirmationLookup::Conflict { .. } => {
-                return Err(invariant(
-                    "committed Candidate Confirmation projected conflicting semantics",
-                ));
-            }
-            CandidateConfirmationLookup::NotFound => {
-                return Err(invariant(
-                    "committed Candidate Confirmation is absent from synchronized index",
-                ));
-            }
-        };
-        let append = AppendBatchOutcome {
-            batch_id: primary.batch_id,
-            event_ids: record.event_ids.clone(),
-            event_paths: record.event_paths.clone(),
-            commit_oid: primary.commit_oid,
-            recovered: primary.recovered,
-        };
-        FileExt::unlock(&lock).map_err(io_error("unlock candidate-confirmation.lock"))?;
-        Ok(CandidateConfirmationOutcome {
-            append,
-            record,
-            status: CandidateConfirmationWriteStatus::Created,
-        })
+            | CandidateConfirmationLookup::Conflict { .. } => Err(Failure::Batch(invariant(
+                "committed Candidate Confirmation projected conflicting semantics",
+            ))),
+            CandidateConfirmationLookup::NotFound => Err(Failure::Batch(invariant(
+                "committed Candidate Confirmation is absent from synchronized index",
+            ))),
+        }
     }
 
     /// Lists valid durable pending journals without changing Git state.
@@ -759,6 +1444,113 @@ impl GitStore {
         sync_directory(&aside_root)?;
         FileExt::unlock(&lock).map_err(io_error("unlock writer.lock"))?;
         Ok(destination)
+    }
+
+    /// Validates every committed content-addressed object in the current `HEAD` tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an object path is not canonical or its SHA-256 digest does not match
+    /// the committed bytes.
+    pub fn validate_committed_objects(&self) -> Result<usize> {
+        let git = Git::new(&self.repository);
+        let paths = git.head_paths("objects")?;
+        for path in &paths {
+            let bytes = git
+                .head_file(path)?
+                .ok_or_else(|| invariant(format!("object disappeared while validating: {path}")))?;
+            let digest = path.rsplit('/').next().unwrap_or_default();
+            if digest.len() != 64 || sha256(&bytes) != digest || object_path(digest) != *path {
+                return Err(invariant(format!(
+                    "committed object path or digest does not match content: {path}"
+                )));
+            }
+        }
+        Ok(paths.len())
+    }
+
+    /// Strictly validates committed Events before a remote Store is first activated.
+    ///
+    /// Known Events must use their canonical path and parse into one reducer input set without
+    /// quarantine. Unknown future schemas remain forward-compatible, while malformed JSON or a
+    /// malformed known schema is rejected instead of being silently inherited by a new install.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, misplaced, or reducer-quarantined committed Events.
+    pub fn validate_committed_events(&self) -> Result<usize> {
+        let git = Git::new(&self.repository);
+        let paths = git.head_paths("events")?;
+        let mut reducer_events = Vec::new();
+        for path in &paths {
+            let bytes = git
+                .head_file(path)?
+                .ok_or_else(|| invariant(format!("event disappeared while validating: {path}")))?;
+            match parse_event(&bytes) {
+                Ok(ParsedEvent::Known(event)) => {
+                    if generated_event_path(event.event_id()) != *path {
+                        return Err(invariant(format!(
+                            "committed Event path is not canonical: {path}"
+                        )));
+                    }
+                    if let Some(event) = event.reducer_event() {
+                        reducer_events.push(event);
+                    }
+                }
+                Ok(ParsedEvent::UnknownSchema(_)) => {}
+                Err(error) => {
+                    return Err(invariant(format!(
+                        "committed Event is invalid at {path}: {error}"
+                    )));
+                }
+            }
+        }
+        let projection = reduce(&reducer_events);
+        if let Some(event_id) = projection.quarantined_event_ids.iter().next() {
+            return Err(invariant(format!(
+                "committed Event set is quarantined at {event_id}"
+            )));
+        }
+        Ok(paths.len())
+    }
+
+    /// Verifies that every committed change since one trusted revision is an append-only managed
+    /// file addition.
+    ///
+    /// # Errors
+    ///
+    /// Rejects modified, deleted, renamed, copied, or foreign paths between the supplied revision
+    /// and current `HEAD`.
+    pub fn validate_append_only_since(&self, base_revision: &str) -> Result<usize> {
+        let git = Git::new(&self.repository);
+        git.run([
+            "rev-parse",
+            "--verify",
+            &format!("{base_revision}^{{commit}}"),
+        ])?;
+        let changed = git.changed_between(base_revision)?;
+        let mut path_count = 0;
+        for entry in changed {
+            if entry.status != "A" {
+                return Err(invariant(format!(
+                    "committed change {} is not append-only",
+                    entry.status
+                )));
+            }
+            for path in entry.paths {
+                let path = path_string(path)?;
+                if !MANAGED_ROOTS
+                    .iter()
+                    .any(|root| path.starts_with(&format!("{root}/")))
+                {
+                    return Err(invariant(format!(
+                        "committed foreign path is not part of the Shared Context store: {path}"
+                    )));
+                }
+                path_count += 1;
+            }
+        }
+        Ok(path_count)
     }
 
     /// Validates staged changes as append-only additions and reduces the exact
@@ -877,48 +1669,46 @@ impl GitStore {
         self.prepare_serialized_with_batch(&event, text_objects, batch_id, event_bytes)
     }
 
-    fn prepare_candidate_with_batch(
+    /// Journals one already serialized internal Event batch without reordering it.
+    ///
+    /// `events` stays in caller order so a multi-Confirmation batch commits the per-plan Events
+    /// concatenated in input order. The first `CandidateConfirmed` Event remains the journal's
+    /// primary Event, which is the sentinel used to detect a fully committed batch during
+    /// recovery.
+    fn prepare_internal_event_batch(
         &self,
-        event: &Event,
+        events: &[Event],
+        payloads: &[Vec<u8>],
         batch_id: BatchId,
-    ) -> Result<(Journal, Vec<ObjectRef>)> {
-        let event_bytes = serialize_generated_event(event)?;
-        self.prepare_serialized_with_batch(event, Vec::new(), batch_id, event_bytes)
-    }
-
-    fn prepare_internal_event_batch(&self, events: &[Event], batch_id: BatchId) -> Result<Journal> {
-        if events.is_empty() || events.len() > 64 {
+    ) -> Result<Journal> {
+        if events.is_empty() || events.len() > MAX_INTERNAL_BATCH_EVENTS {
+            return Err(invariant(format!(
+                "internal Event batch requires between one and {MAX_INTERNAL_BATCH_EVENTS} Events"
+            )));
+        }
+        if events.len() != payloads.len() {
             return Err(invariant(
-                "internal Event batch requires between one and 64 Events",
+                "internal Event batch payloads do not match its Events",
             ));
         }
-        let scanner = PrivacyScanner::default();
-        let mut ordered = events.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|event| event.event_type() != EventType::CandidateConfirmed);
-        let primary = ordered[0];
-        let serialized = ordered
+        let primary_index = events
             .iter()
-            .enumerate()
-            .map(|(index, event)| {
-                let bytes = serialize_generated_event(event)?;
-                reject_sensitive(&scanner, &format!("internal event {index}"), &bytes)?;
-                Ok((*event, bytes))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .position(|event| event.event_type() == EventType::CandidateConfirmed)
+            .unwrap_or_default();
         let batch_dir = self.pending_dir(&batch_id);
         let files_dir = batch_dir.join("files");
         fs::create_dir(&batch_dir).map_err(io_error("create confirmation pending batch"))?;
         fs::create_dir(&files_dir).map_err(io_error("create confirmation pending files"))?;
-        let mut files = Vec::with_capacity(serialized.len());
-        for (index, (event, bytes)) in serialized.into_iter().enumerate() {
+        let mut files = Vec::with_capacity(events.len());
+        for (index, (event, bytes)) in events.iter().zip(payloads).enumerate() {
             let target_path = generated_event_path(event.event_id());
             let payload_file = format!("{index:04}.payload");
-            write_new_synced(&files_dir.join(&payload_file), &bytes)?;
+            write_new_synced(&files_dir.join(&payload_file), bytes)?;
             files.push(PendingFile {
                 kind: PendingFileKind::Event,
                 target_path,
                 payload_file,
-                sha256: sha256(&bytes),
+                sha256: sha256(bytes),
                 size: bytes.len() as u64,
             });
         }
@@ -926,10 +1716,12 @@ impl GitStore {
         let journal = Journal {
             version: JOURNAL_VERSION,
             batch_id,
-            event_id: primary.event_id().to_string(),
-            additional_event_ids: ordered[1..]
+            event_id: events[primary_index].event_id().to_string(),
+            additional_event_ids: events
                 .iter()
-                .map(|event| event.event_id().to_string())
+                .enumerate()
+                .filter(|(index, _)| *index != primary_index)
+                .map(|(_, event)| event.event_id().to_string())
                 .collect(),
             base_head_oid: None,
             phase: JournalPhase::Prepared,
@@ -1418,6 +2210,101 @@ fn verify_repository(repository: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_bundled_v1_schema(repository: &Path) -> Result<()> {
+    let schemas = repository.join("schemas");
+    match fs::symlink_metadata(&schemas) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Err(invariant("managed schemas path is not a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&schemas).map_err(io_error("create schemas directory"))?;
+        }
+        Err(error) => return Err(io_error("inspect schemas directory")(error)),
+    }
+    let path = repository.join(V1_SCHEMA_PATH);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(io_error("create bundled Event schema"))?;
+    file.write_all(V1_JSON_SCHEMA.as_bytes())
+        .map_err(io_error("write bundled Event schema"))?;
+    file.sync_all()
+        .map_err(io_error("sync bundled Event schema"))?;
+    sync_directory(&schemas)
+}
+
+fn verify_worktree_v1_schema(repository: &Path) -> Result<()> {
+    let path = repository.join(V1_SCHEMA_PATH);
+    let metadata = fs::symlink_metadata(&path).map_err(io_error("inspect Event schema path"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(invariant(format!(
+            "Event schema path is not a regular file: {V1_SCHEMA_PATH}"
+        )));
+    }
+    let bytes = fs::read(path).map_err(io_error("read Event schema"))?;
+    if bytes != V1_JSON_SCHEMA.as_bytes() {
+        return Err(invariant(format!(
+            "working Event schema differs from the bundled immutable contract: {V1_SCHEMA_PATH}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_clean_repository(repository: &Path) -> Result<()> {
+    let status =
+        Git::new(repository).output_text(["status", "--porcelain", "--untracked-files=all"])?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err(invariant("cloned Knowledge Store is not clean"))
+    }
+}
+
+fn validate_remote_url(remote_url: &str) -> Result<()> {
+    if remote_url.is_empty() || remote_url.trim() != remote_url {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Knowledge Store URL must be non-empty and have no surrounding whitespace",
+        ));
+    }
+    if remote_url.chars().any(char::is_control) || remote_url.starts_with('-') {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Knowledge Store URL contains unsafe characters",
+        ));
+    }
+    if remote_url.contains(['?', '#']) {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Knowledge Store URL must not contain query parameters or fragments",
+        ));
+    }
+    if let Some((scheme, remainder)) = remote_url.split_once("://") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "file" | "http" | "https" | "ssh" | "git"
+        ) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "unsupported Knowledge Store URL scheme",
+            ));
+        }
+        let authority = remainder.split('/').next().unwrap_or_default();
+        if let Some((userinfo, _)) = authority.rsplit_once('@') {
+            let ssh_username_only = scheme.eq_ignore_ascii_case("ssh")
+                && !userinfo.is_empty()
+                && !userinfo.contains(':');
+            if !ssh_username_only {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "Knowledge Store URL must not contain embedded credentials",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_journal(journal: &Journal) -> Result<()> {
     if journal.version != JOURNAL_VERSION {
         return Err(invariant(format!(
@@ -1640,6 +2527,149 @@ fn append_from_submission_record(
         objects: Vec::new(),
         recovered,
     }
+}
+
+/// Materializes and serializes the selected Candidate submissions, in input order.
+fn submission_batch_events(
+    requests: &[CandidateSubmissionRequest],
+    selected: &[usize],
+) -> std::result::Result<(Vec<Event>, Vec<Vec<u8>>), SubmissionBatchFailure> {
+    use SubmissionBatchFailure as Failure;
+
+    let scanner = PrivacyScanner::default();
+    let mut events = Vec::with_capacity(selected.len());
+    let mut payloads = Vec::with_capacity(selected.len());
+    for position in selected {
+        let request = &requests[*position];
+        let submission_id = request.submission_id;
+        // Each Candidate keeps its own Writer batch so the submission index still maps a
+        // SubmissionId to exactly its own Event, even though one Git commit carries the slice.
+        let event = Event::context_candidate_created(
+            submission_id,
+            request.source_episode,
+            request.content.clone(),
+            BatchId::new().as_str(),
+            None,
+        )
+        .map_err(|error| Failure::request(*position, submission_id, error))?;
+        let bytes = serialize_generated_event(&event)
+            .map_err(|error| Failure::request(*position, submission_id, error))?;
+        reject_sensitive(&scanner, "event", &bytes)
+            .map_err(|error| Failure::request(*position, submission_id, error))?;
+        payloads.push(bytes);
+        events.push(event);
+    }
+    Ok((events, payloads))
+}
+
+/// Batch result for the case where every request was already submitted with identical content.
+fn replayed_submission_batch(
+    identities: &[(SubmissionId, String)],
+    existing: Vec<Option<CandidateSubmissionRecord>>,
+) -> std::result::Result<CandidateSubmissionBatchWrite, SubmissionBatchFailure> {
+    let entries = identities
+        .iter()
+        .zip(existing)
+        .map(|((submission_id, _), record)| {
+            let record = record.ok_or_else(|| {
+                SubmissionBatchFailure::Batch(invariant(
+                    "Candidate submission replay lost its indexed record",
+                ))
+            })?;
+            Ok(CandidateSubmissionBatchEntry {
+                submission_id: *submission_id,
+                append: append_from_submission_record(&record, true),
+                record,
+                status: CandidateSubmissionStatus::AlreadyExists,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, SubmissionBatchFailure>>()?;
+    Ok(CandidateSubmissionBatchWrite {
+        entries,
+        written: None,
+        status: CandidateSubmissionStatus::AlreadyExists,
+    })
+}
+
+/// Serializes and privacy-scans one plan's Events before any pending state exists.
+fn serialize_internal_events(events: &[Event]) -> Result<Vec<Vec<u8>>> {
+    let scanner = PrivacyScanner::default();
+    events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let bytes = serialize_generated_event(event)?;
+            reject_sensitive(&scanner, &format!("internal event {index}"), &bytes)?;
+            Ok(bytes)
+        })
+        .collect()
+}
+
+/// Materializes and serializes the selected plans, concatenated in input order.
+fn confirmation_batch_events(
+    plans: &[CandidateConfirmationPlan],
+    selected: &[usize],
+    provenance: &ConfirmationProvenance,
+) -> std::result::Result<(Vec<Event>, Vec<Vec<u8>>), ConfirmationBatchFailure> {
+    use ConfirmationBatchFailure as Failure;
+
+    let total = selected
+        .iter()
+        .map(|position| plans[*position].expected_event_count())
+        .sum();
+    let mut events = Vec::with_capacity(total);
+    let mut payloads = Vec::with_capacity(total);
+    for position in selected {
+        let plan = &plans[*position];
+        let candidate_id = plan.operation.candidate_id;
+        // Each plan keeps its own Writer batch so the Confirmation index still maps a Candidate to
+        // exactly its own fact closure, even though one Git commit carries the whole slice.
+        let plan_events =
+            Event::from_candidate_confirmation_plan(plan, BatchId::new().as_str(), provenance)
+                .map_err(|error| Failure::plan(*position, candidate_id, error))?;
+        if plan_events.len() != plan.expected_event_count() {
+            return Err(Failure::plan(
+                *position,
+                candidate_id,
+                invariant("Candidate Confirmation plan materialized an unexpected Event count"),
+            ));
+        }
+        payloads.extend(
+            serialize_internal_events(&plan_events)
+                .map_err(|error| Failure::plan(*position, candidate_id, error))?,
+        );
+        events.extend(plan_events);
+    }
+    Ok((events, payloads))
+}
+
+/// Batch result for the case where every plan was already confirmed with identical semantics.
+fn replayed_confirmation_batch(
+    identities: &[(CandidateId, String, String)],
+    existing: Vec<Option<CandidateConfirmationRecord>>,
+) -> std::result::Result<CandidateConfirmationBatchWrite, ConfirmationBatchFailure> {
+    let entries = identities
+        .iter()
+        .zip(existing)
+        .map(|((candidate_id, _, _), record)| {
+            let record = record.ok_or_else(|| {
+                ConfirmationBatchFailure::Batch(invariant(
+                    "Confirmation replay lost its indexed record",
+                ))
+            })?;
+            Ok(CandidateConfirmationBatchEntry {
+                candidate_id: *candidate_id,
+                append: append_batch_from_confirmation_record(&record, true),
+                record,
+                status: CandidateConfirmationWriteStatus::AlreadyExists,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, ConfirmationBatchFailure>>()?;
+    Ok(CandidateConfirmationBatchWrite {
+        entries,
+        written: None,
+        status: CandidateConfirmationWriteStatus::AlreadyExists,
+    })
 }
 
 fn append_batch_from_confirmation_record(

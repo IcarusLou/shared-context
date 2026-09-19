@@ -7,6 +7,7 @@ use std::fmt;
 mod confirmation;
 mod engineering;
 mod episode;
+pub mod hints;
 mod ids;
 mod model;
 mod reducer;
@@ -18,7 +19,8 @@ pub use confirmation::{
     CandidateConfirmationNewSpace, CandidateConfirmationOperation, CandidateConfirmationPlan,
     CandidateConfirmationPlanEventIds, CandidateConfirmationPrimaryReference,
     CandidateConfirmationRequest, CandidatePrimarySelection, ContextSpaceAssociation,
-    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, OptionalCandidateEdits,
+    ContextSpaceAssociationDraft, ContextSpaceAssociationOrigin, DecisionSource,
+    OptionalCandidateEdits, ProblemViewEdit, SemanticConflictOpening, SemanticConflictOpeningDraft,
     TopicKeyEdit, context_revision_as_draft, context_revision_content_hash,
 };
 pub use engineering::{
@@ -31,17 +33,18 @@ pub use episode::{
     AgentCheckpoint, ArtifactAction, ArtifactRef, AutomaticCandidateStatus,
     AutomaticContextCandidate, CandidateAnalysis, CandidateAnalysisStatus, CandidateAssessmentPath,
     CandidateAssessmentRelation, CandidateBuilderProvenance, CandidateConfidence,
-    CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewStatus,
-    CandidateReviewSummary, CandidateReviewView, CandidateSpaceRecommendation,
-    CandidateSpaceRecommendationPath, CaptureEvidenceRef, CaptureSourceRef, CaptureUnknown,
-    CheckpointClaim, ContextCandidate, ContextRevisionRef, ContextUseDisposition,
-    IntentRevisionRange, NonLocatingSignalRef, NormalizedBreadcrumbKind, NormalizedWorkObservation,
+    CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewScope,
+    CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
+    CandidateSpaceRecommendation, CandidateSpaceRecommendationPath, CheckpointClaim,
+    CheckpointEvidenceRef, CheckpointUnknown, ContextCandidate, ContextRevisionRef,
+    ContextUseDisposition, IntentRevisionRange, NonLocatingSignalRef, NormalizedWorkObservation,
     RecommendedSpaceRole, TestOutcomeStatus, WorkEpisode, WorkEpisodeRef, WorkEpisodeStatus,
     WorkObservation, WorkSourceRef, candidate_submission_content_hash,
 };
 pub use ids::{
-    AgentCheckpointId, CandidateBuildId, CandidateId, CaptureId, CheckpointClaimId, ConfirmationId,
-    ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError, PublicationId,
+    AgentCheckpointId, CandidateBuildId, CandidateId, CheckpointClaimId, ConfirmationId,
+    ConflictId, ContextId, EventId, EvidenceId, ExternalSessionId, IdParseError,
+    ProposedSpaceGroupKey, PublicationId, REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN,
     ReferenceId, RepositoryId, ResolutionId, ReviewId, RevisionId, SignalId, SpaceAssociationId,
     SpaceId, SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
     WorkEpisodeId, WorkObservationId,
@@ -61,7 +64,7 @@ pub use reducer::{
     DomainProjection, EngineeringReferenceProjection, IntentProjection, ReducerDiagnostic,
     ReducerDiagnosticCode, ReducerEvent, ReducerPayload, ReviewSummary, RevisionLifecycle,
     RevisionProjection, SemanticConflictCandidate, SemanticConflictOpenReason,
-    SemanticConflictProjection, SemanticConflictStatus, reduce,
+    SemanticConflictProjection, SemanticConflictStatus, reduce, space_is_provisional,
 };
 pub use task::{
     ExternalSessionLocator, ExternalSessionSnapshot, TaskIntentRevision, TaskSessionSnapshot,
@@ -96,6 +99,8 @@ pub enum ErrorKind {
     RepositoryNotConfigured,
     /// A stable idempotency key was reused with different authoritative content.
     IdempotencyKeyConflict,
+    /// Another process currently owns the installation-wide maintenance boundary.
+    MaintenanceBusy,
 }
 
 /// The shared, user-presentable error type for workspace crates.

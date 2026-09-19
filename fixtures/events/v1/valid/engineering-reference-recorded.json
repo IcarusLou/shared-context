@@ -6,7 +6,7 @@
   "revision_id": "rev_00000000-0000-4000-8000-000000000211",
   "reference": {
     "reference_id": "ref_00000000-0000-4000-8000-000000000901",
-    "repository_id": "rpo_00000000-0000-4000-8000-000000000901",
+    "repository_id": "FE",
     "artifact_kind": "file",
     "relation": "implements",
     "locator": {

@@ -8,57 +8,77 @@
 //! writes only disposable local Task Runtime state.
 
 use std::{
+    cell::OnceCell,
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt, fs,
     io::{self, BufRead, Write},
     path::{Path, PathBuf},
+    process::Command,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock, mpsc},
+    thread,
+    time::{Duration, Instant},
 };
 
 use sctx_domain::{
     AgentCheckpointId, Applicability, ArtifactKey, ArtifactKind, ArtifactLocator, ArtifactRef,
     AutomaticCandidateStatus, AutomaticContextCandidate, CandidateAnalysis,
-    CandidateAnalysisStatus, CandidateBuilderProvenance, CandidateConfidence,
-    CandidateConfirmationOperation, CandidateConfirmationPlan,
-    CandidateConfirmationPrimaryReference, CandidatePrimarySelection, CandidateRelationAssessment,
-    CandidateReviewDiagnostic, CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
-    CandidateSpaceRecommendation, CaptureEvidenceRef, CaptureUnknown, CheckpointClaim,
-    CheckpointClaimId, ContextId, ContextKind, ContextRevisionDraft, ContextRevisionRef,
-    EngineeringReferenceDraft, Error, ErrorKind, EvidenceSnapshotDraft, EvidenceType,
-    ExternalSessionLocator, NormalizedWorkObservation, OptionalCandidateEdits, ReferenceId,
+    CandidateAnalysisStatus, CandidateAssessmentRelation, CandidateBuilderProvenance,
+    CandidateConfidence, CandidateConfirmationOperation, CandidateConfirmationPlan,
+    CandidateConfirmationPrimaryReference, CandidateId, CandidatePrimarySelection,
+    CandidateRelationAssessment, CandidateReviewDiagnostic, CandidateReviewScope,
+    CandidateReviewStatus, CandidateReviewSummary, CandidateReviewView,
+    CandidateSpaceRecommendation, CandidateSpaceRecommendationPath, CheckpointClaim,
+    CheckpointClaimId, CheckpointEvidenceRef, CheckpointUnknown, ConflictParticipant,
+    ContextGovernanceStatus, ContextId, ContextKind, ContextRelation, ContextRelationKind,
+    ContextRevisionDraft, DecisionSource, EngineeringReferenceDraft, Error, ErrorKind, EventId,
+    EvidenceSnapshotDraft, EvidenceType, ExternalSessionLocator, IntentSnapshot,
+    NormalizedWorkObservation, OptionalCandidateEdits, ProblemViewEdit, ProposedSpaceGroupKey,
+    REPOSITORY_ID_MAX_BYTES, REPOSITORY_ID_PATTERN, RecommendedSpaceRole, ReferenceId,
     ReferenceRelation, RepoRelativePath, RepositoryId, ResolutionStatus, ResolvedFocus, Result,
-    RevisionId, SignalId, SpaceId, SpaceRecommendationId, SubmissionId, TaskId,
-    TaskIntentRevisionId, TaskSessionId, TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle,
-    TaskSignalRecord, TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeStatus, WorkObservation,
-    WorkObservationId, WorkSourceRef, WorkingIntentSnapshot,
+    RevisionId, SemanticConflictOpeningDraft, SemanticConflictStatus, SignalId, SpaceId,
+    SpaceRecommendationId, SubmissionId, TaskId, TaskIntentRevisionId, TaskSessionId,
+    TaskSessionSnapshot, TaskSignalKind, TaskSignalLifecycle, TaskSignalRecord,
+    TaskSpaceAssociation, WorkEpisodeId, WorkEpisodeRef, WorkEpisodeStatus, WorkObservation,
+    WorkObservationId, WorkingIntentSnapshot, context_revision_as_draft,
+    context_revision_content_hash,
 };
 use sctx_engineering_graph::{
     CandidateMatchEvidence, CatalogRepositorySpec, EngineeringProjectionStore,
     EngineeringReferenceResolver, MAX_REPOSITORY_SCAN_PLAN_PATHS, ProjectedEngineeringReference,
     RegisteredRepository, RepositoryAvailability, RepositoryCatalogSyncReport, RepositoryRegistry,
     RepositoryScanOutcome, RepositoryScanPlan, RepositoryScanner, ResolvedReferenceProjection,
-    SkippedFileReason, build_graph_context_snapshots,
+    SkippedFileReason, build_graph_context_snapshots, find_relocation_candidate, relocatable_path,
 };
-use sctx_event_schema::{Event, EventPayload};
+use sctx_event_schema::{ConfirmationProvenance, Event, EventPayload};
 use sctx_git_store::{
-    AppendRequest, CandidateConfirmationWriteStatus, CandidateSubmissionRequest,
-    CandidateSubmissionStatus, GitStore,
+    AppendBatchOutcome, AppendRequest, CandidateConfirmationWriteStatus,
+    CandidateSubmissionRequest, CandidateSubmissionStatus, GitStore,
+    MAX_CANDIDATE_SUBMISSION_BATCH,
 };
 use sctx_index::{DomainSnapshot, ProjectionIndex};
-use sctx_local_state::{PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore};
+use sctx_local_state::{
+    AuthorizedSessionScope, AuthorizedSessionScopeRead, AuthorizedSessionScopeStore,
+    MaintenanceLock, Policy, PrivacyScanner, RepositoryCatalogSnapshot, UserConfigStore,
+    installation_policy,
+};
 use sctx_search::{
-    CandidateAnalysisRequest, ConflictView, ContextPackOmitted, ContextStatus,
-    DEFAULT_TASK_MAX_SPACES, MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K,
-    MAX_TASK_MAX_SPACES, MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET,
-    ScopeFilter, SearchEngine, SearchFilters, SearchRequest, TaskContextItem, TaskContextRequest,
-    TaskGraphDiagnostic, TaskRetrievalPath,
+    AutomaticQueryTokenExplanation, CandidateAnalysisRequest, CompactSpaceAssociation,
+    CompactTaskContextItem, ConflictView, ContextPackDetailLevel, ContextPackOmitted,
+    ContextStatus, ContextTtlSettings, ContextUsageCounts, DEFAULT_TASK_MAX_SPACES,
+    MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MAX_CANDIDATE_ANALYSIS_TOP_K, MAX_TASK_MAX_SPACES,
+    MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET, MIN_TASK_CONTEXT_TOKEN_BUDGET, ScopeFilter, SearchEngine,
+    SearchFilters, SearchMatchMode, SearchRequest, SemanticChannelHandle, TaskContextItem,
+    TaskContextRequest, TaskGraphDiagnostic, UsagePriorSource,
 };
 use sctx_task_runtime::{
-    AgentCheckpointWrite, AutomatedEpisodeBoundary, CandidateBuildItemPreparation,
-    CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView, CandidateReviewDiscard,
-    CandidateReviewDiscardStatus, CandidateReviewRecord, CheckpointBoundary, CheckpointClaimDraft,
-    IntentRevisionWriteStatus, TaskRuntime, WorkEpisodeView,
+    AgentCheckpointSubmission, CandidateBuildDuplicatePreparation, CandidateBuildItemPreparation,
+    CandidateBuildItemStatus, CandidateBuildStatus, CandidateBuildView,
+    CandidateConfirmationFinalize, CandidateReviewDiscard, CandidateReviewDiscardStatus,
+    CandidateReviewRecord, CheckoutReferenceResolver, ClaimResolver, ContextInjectionSource,
+    ContextUsageOutcome, ContextUsageRecord, DirectCheckpointClaimDraft, DirectEvidenceDraft,
+    InjectedContext, IntentRevisionWriteStatus, ProposedSpaceGroupMappingStatus, TaskRuntime,
+    WorkEpisodeView, reference_derivation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -72,6 +92,16 @@ const DEFAULT_CANDIDATE_REVIEW_LIST_LIMIT: usize = 20;
 const DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 4_096;
 const MIN_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 512;
 const MAX_CANDIDATE_REVIEW_TOKEN_BUDGET: usize = 32_768;
+const MAX_TASK_CHECKPOINT_BYTES: usize = 64 * 1024;
+const MAX_TASK_CHECKPOINT_CLAIMS: usize = 64;
+const MAX_TASK_CHECKPOINT_UNKNOWNS: usize = 64;
+const MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM: usize = 32;
+const MAX_TASK_CHECKPOINT_LIST_ITEMS: usize = 64;
+const MAX_TASK_CHECKPOINT_TEXT_BYTES: usize = 4 * 1024;
+const MAX_RECOVERABLE_BUILDS_PER_READ: usize = 32;
+/// Token Jaccard at or above which one Claim is treated as restating an existing Candidate.
+/// It is a Builder-local deduplication threshold, never a knowledge relation or analysis fact.
+const CANDIDATE_DUPLICATE_SIMILARITY_BASIS_POINTS: u16 = 8_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -119,73 +149,42 @@ pub struct TaskSignalSupersedeInput {
     pub signal_ids: Vec<String>,
 }
 
-/// Explicit Episode transition requested by one Agent-authored Checkpoint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskCheckpointBoundary {
-    Continue,
-    Close,
-}
-
-impl From<TaskCheckpointBoundary> for CheckpointBoundary {
-    fn from(value: TaskCheckpointBoundary) -> Self {
-        match value {
-            TaskCheckpointBoundary::Continue => Self::Continue,
-            TaskCheckpointBoundary::Close => Self::Close,
-        }
-    }
-}
-
-/// Existing or self-contained Evidence supplied for one Checkpoint Claim.
+/// One self-contained, Agent-attested Evidence draft for a Checkpoint Claim.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum TaskCheckpointEvidenceInput {
-    Observation {
-        observation_id: String,
-    },
-    TaskSignal {
-        signal_id: String,
-    },
-    ContextEvidence {
-        context_id: String,
-        revision_id: String,
-        evidence_id: String,
-    },
-    InlineValidation {
-        evidence: EvidenceSnapshotDraft,
-    },
+#[serde(deny_unknown_fields)]
+pub struct TaskCheckpointEvidenceInput {
+    pub evidence_type: EvidenceType,
+    pub summary: String,
+    pub limitations: Vec<String>,
 }
 
 /// Complete Claim draft without caller-owned Claim or Observation identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCheckpointClaimInput {
-    #[serde(default)]
-    pub context_kind_hint: Option<ContextKind>,
-    #[serde(default)]
-    pub topic_key_hint: Option<String>,
+    pub context_kind: ContextKind,
     pub statement: String,
     pub rationale: String,
-    pub applicability: Applicability,
-    pub assumptions: Vec<String>,
-    pub recheck_when: Vec<String>,
+    pub conditions: Vec<String>,
     pub evidence: Vec<TaskCheckpointEvidenceInput>,
-    pub artifact_refs: Vec<ArtifactRef>,
-    pub related_contexts: Vec<ContextRevisionRef>,
 }
 
-/// Strict public Agent Checkpoint request guarded by Task, Intent and Episode CAS.
+/// One unresolved Agent-authored question with no model-owned lifecycle metadata.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCheckpointUnknownInput {
+    pub statement: String,
+    pub blocking: bool,
+}
+
+/// Strict public Agent Checkpoint request. Runtime ownership and close guards are server-owned.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskCheckpointInput {
     pub agent_kind: String,
     pub external_session_id: String,
-    pub expected_task_id: String,
-    pub expected_intent_revision_id: String,
-    pub expected_episode_version: u64,
-    pub boundary: TaskCheckpointBoundary,
     pub claims: Vec<TaskCheckpointClaimInput>,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<TaskCheckpointUnknownInput>,
 }
 
 /// Safe, typed Checkpoint diagnostic without Agent-authored source text.
@@ -195,18 +194,72 @@ pub enum TaskCheckpointDiagnostic {
     InlineValidationRecorded { observation_id: WorkObservationId },
 }
 
-/// Server-owned Checkpoint and resulting Episode boundary.
+/// One accepted server-owned Checkpoint and resulting closed Episode boundary.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TaskCheckpointResponse {
+pub struct TaskCheckpointAcceptedResponse {
+    pub status: TaskCheckpointAcceptedStatus,
+    pub operation_id: String,
     pub checkpoint_id: AgentCheckpointId,
     pub claim_ids: Vec<CheckpointClaimId>,
     pub episode_id: WorkEpisodeId,
     pub episode_version: u64,
     pub episode_status: WorkEpisodeStatus,
-    pub created: bool,
+    pub replayed: bool,
     pub diagnostics: Vec<TaskCheckpointDiagnostic>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub candidate_build: Option<CandidateBuildResponse>,
+    pub candidate_build: CandidateBuildReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCheckpointAcceptedStatus {
+    Accepted,
+}
+
+/// Durable Build outbox identity and current recovery status returned by Checkpoint ACK.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBuildReceipt {
+    pub build_id: sctx_domain::CandidateBuildId,
+    pub episode_id: WorkEpisodeId,
+    pub status: CandidateBuildResponseStatus,
+}
+
+/// Successful Checkpoint result. Empty submissions are explicit mutation-free no-ops.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum TaskCheckpointResponse {
+    Accepted(TaskCheckpointAcceptedResponse),
+    NoOp(TaskCheckpointNoOpResponse),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskCheckpointNoOpResponse {
+    pub status: TaskCheckpointNoOpStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCheckpointNoOpStatus {
+    NoOp,
+}
+
+impl TaskCheckpointResponse {
+    /// Returns the persisted Checkpoint result, or `None` for a successful no-op.
+    #[must_use]
+    pub const fn accepted(&self) -> Option<&TaskCheckpointAcceptedResponse> {
+        match self {
+            Self::Accepted(response) => Some(response),
+            Self::NoOp(_) => None,
+        }
+    }
+
+    /// Consumes the response and returns the persisted Checkpoint result when one exists.
+    #[must_use]
+    pub fn into_accepted(self) -> Option<TaskCheckpointAcceptedResponse> {
+        match self {
+            Self::Accepted(response) => Some(response),
+            Self::NoOp(_) => None,
+        }
+    }
 }
 
 /// Aggregate state returned after deterministically building one closed Episode.
@@ -216,6 +269,16 @@ pub struct CandidateBuildResponse {
     pub episode_id: WorkEpisodeId,
     pub status: CandidateBuildResponseStatus,
     pub items: Vec<CandidateBuildItemSummary>,
+    pub duplicates: Vec<CandidateBuildDuplicateSummary>,
+}
+
+/// One Claim the Builder collapsed onto an existing Candidate instead of proposing it twice.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateBuildDuplicateSummary {
+    pub checkpoint_id: AgentCheckpointId,
+    pub claim_id: CheckpointClaimId,
+    pub duplicate_of_candidate_id: sctx_domain::CandidateId,
+    pub similarity_basis_points: u16,
 }
 
 /// Public aggregate Candidate Build status without exposing `SQLite` details.
@@ -250,7 +313,7 @@ pub struct CandidateBuildItemSummary {
     pub candidate_status: AutomaticCandidateStatus,
     pub analysis: CandidateAnalysis,
     pub confidence: CandidateConfidence,
-    pub unknowns: Vec<CaptureUnknown>,
+    pub unknowns: Vec<CheckpointUnknown>,
     pub space_recommendations: Vec<CandidateSpaceRecommendation>,
 }
 
@@ -280,6 +343,10 @@ pub struct CandidateListInput {
     pub external_session_id: String,
     #[serde(default = "default_candidate_review_status")]
     pub status: CandidateReviewStatus,
+    /// How wide the listing reaches. Defaults to the caller's own Task, which is the only scope
+    /// that ever existed; `session` widens it to a read-only view of every Task in the Session.
+    #[serde(default)]
+    pub scope: CandidateReviewScope,
     #[serde(default = "default_candidate_review_list_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -308,6 +375,10 @@ pub struct CandidateDiscardInput {
     pub candidate_id: String,
     pub expected_review_version: u64,
     pub reason: String,
+    /// Who decided this discard. Omitting it means `human`, which is what every client that
+    /// predates the field sends and what every discard written before it recorded.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
 }
 
 /// Why a whole Review Summary was omitted from one bounded page.
@@ -326,14 +397,258 @@ pub struct CandidateReviewOmitted {
     pub estimated_tokens: usize,
 }
 
+/// Collects the Spaces whose single current Intent head is still the server's proposal.
+///
+/// A Space with conflicting Intent heads is never reported as provisional: no head won, so no
+/// head can speak for the Space.
+fn provisional_space_ids(snapshot: &DomainSnapshot) -> BTreeSet<SpaceId> {
+    snapshot
+        .projection
+        .spaces
+        .iter()
+        .filter(|(_, space)| sctx_domain::space_is_provisional(space))
+        .map(|(space_id, _)| *space_id)
+        .collect()
+}
+
 /// Stable page of whole untrusted Summaries; no Review content is truncated.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CandidateListResponse {
     pub reviews: Vec<CandidateReviewSummary>,
+    pub detail_level: ContextPackDetailLevel,
+    /// Compact projection of the same budgeted page; empty under `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_reviews: Vec<CompactCandidateReview>,
+    /// Spaces whose current Intent head is still the server's proposal. This is an in-process
+    /// aid for marking the Full Review rows; it never reaches the wire.
+    #[serde(skip)]
+    pub provisional_space_ids: BTreeSet<SpaceId>,
     pub omitted: Vec<CandidateReviewOmitted>,
     pub next_cursor: Option<String>,
     pub estimated_tokens: usize,
     pub token_budget: usize,
+    pub recovery: CandidateRecoverySummary,
+}
+
+impl CandidateListResponse {
+    /// Projects the page onto the triage list an Agent reads before expanding one Review.
+    #[must_use]
+    pub fn compact(&self) -> CompactCandidateListResponse {
+        CompactCandidateListResponse {
+            reviews: self.compact_reviews.clone(),
+            detail_level: ContextPackDetailLevel::Compact,
+            omitted: self.omitted.clone(),
+            next_cursor: self.next_cursor.clone(),
+            estimated_tokens: self.estimated_tokens,
+            token_budget: self.token_budget,
+            recovery: self.recovery,
+        }
+    }
+}
+
+/// Compact Candidate Review triage page. Every entry stays addressable by `candidate_id`, and
+/// `candidate_get` still returns the whole untrusted Review.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactCandidateListResponse {
+    pub reviews: Vec<CompactCandidateReview>,
+    pub detail_level: ContextPackDetailLevel,
+    pub omitted: Vec<CandidateReviewOmitted>,
+    pub next_cursor: Option<String>,
+    pub estimated_tokens: usize,
+    pub token_budget: usize,
+    pub recovery: CandidateRecoverySummary,
+}
+
+/// Strongest relation the analyzer found for one Candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactCandidateAssessment {
+    pub relation: CandidateAssessmentRelation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_context_id: Option<ContextId>,
+    pub confidence_basis_points: u16,
+}
+
+/// Non-binding primary Space recommendation, reduced to what a reviewer decides on.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactSpaceRecommendation {
+    Existing {
+        recommendation_id: SpaceRecommendationId,
+        space_id: SpaceId,
+        role: RecommendedSpaceRole,
+        /// True when the recommended Space is still the server's unnamed provisional proposal.
+        provisional: bool,
+    },
+    ProposedNewSpaceIntent {
+        recommendation_id: SpaceRecommendationId,
+        title: String,
+        /// Always true: confirming a proposed recommendation opens a provisional Space.
+        provisional: bool,
+    },
+}
+
+/// One compact Candidate Review row.
+///
+/// The four flags are four independent answers a triaging Agent needs on one line, and they are a
+/// published wire shape: folding them into an enum or a nested object would change the JSON for
+/// hosts that already read it, and would not make any of them fewer.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompactCandidateReview {
+    pub candidate_id: sctx_domain::CandidateId,
+    /// The Task that produced this Candidate, present only when the listing reached past the
+    /// caller's own Task. Within one Task it would repeat the Task the caller already named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_task_id: Option<TaskId>,
+    pub kind: ContextKind,
+    pub statement: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_assessment: Option<CompactCandidateAssessment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_space_recommendation: Option<CompactSpaceRecommendation>,
+    /// Whether this row belongs in triage at all: the Review is pending, the analysis finished,
+    /// and the analysis produced a state a reviewer can act on.
+    ///
+    /// It is **not** a licence to confirm automatically, and reading it as one is what made the
+    /// two faces of this state contradict each other. It is true for `needs_space_review`,
+    /// `exact_duplicate_review` and `potential_contradiction_review` too — every state that wants
+    /// a reviewer's attention. `auto_confirmable` is the field that answers the other question.
+    pub ready_for_review: bool,
+    /// The analysis verdict `candidate_confirm`'s permission surface reads. Published here because
+    /// it is the field the refusal names, and a row that omitted it could not explain itself.
+    pub candidate_status: AutomaticCandidateStatus,
+    /// Whether the server would permit `decision_source: "agent_policy"` on this row *as it
+    /// stands*: Review pending, `candidate_status` exactly `ready_for_review`, and a top relation
+    /// of `novel` or `supports`.
+    ///
+    /// Derived from the same three functions `require_auto_confirm_permitted` evaluates, so this
+    /// and the refusal cannot drift apart. The one clause it cannot answer is `edits`, which lives
+    /// in the request: send edits and the confirmation is refused however this reads. Everything
+    /// else is a promise — a `true` row confirmed with no edits is accepted.
+    pub auto_confirmable: bool,
+    /// Non-blocking reminder that the knowledge base default language is Chinese. See
+    /// [`language_hint`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_hint: Option<String>,
+    /// Whether `applicability.domains`/`platforms` came from the Task Working Intent rather than
+    /// from the Claim. See [`APPLICABILITY_INHERITED`].
+    pub applicability_inherited: bool,
+    /// Always true; the row stays marked as untrusted Agent-authored content.
+    pub untrusted_data: bool,
+}
+
+/// Every Candidate reaches Candidate Build through a direct Checkpoint, and a direct Checkpoint
+/// Claim carries only `conditions`: its `domains` and `platforms` are always copied from the Task
+/// Working Intent. Runtime keeps no per-Claim flag, so the response reports the constant this is
+/// rather than inventing a per-Candidate answer.
+const APPLICABILITY_INHERITED: bool = true;
+
+/// Advisory text offered when a Candidate statement carries no Chinese at all.
+const CHINESE_KNOWLEDGE_BASE_HINT: &str =
+    "knowledge base default language is Chinese; consider restating in Chinese";
+
+/// Non-blocking language advisory for one Candidate statement.
+///
+/// The knowledge base is written in Chinese, but the Checkpoint contract stays language-agnostic:
+/// nothing is rejected or rewritten here. A statement with no CJK character at all simply carries a
+/// reminder a reviewer may act on. Code identifiers, paths, and commands legitimately stay Latin,
+/// so the test is "contains no Chinese", never "contains only Chinese".
+fn language_hint(statement: &str) -> Option<String> {
+    (!statement.chars().any(is_cjk)).then(|| CHINESE_KNOWLEDGE_BASE_HINT.to_owned())
+}
+
+/// True for the CJK ranges a Chinese statement is written in.
+const fn is_cjk(character: char) -> bool {
+    matches!(character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{20000}'..='\u{2a6df}')
+}
+
+/// Projects one whole Review onto its compact triage row.
+fn compact_candidate_review(
+    review: &CandidateReviewView,
+    source_task_id: Option<TaskId>,
+    provisional_space_ids: &BTreeSet<SpaceId>,
+) -> CompactCandidateReview {
+    let top_assessment = review
+        .analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)
+        .map(|assessment| CompactCandidateAssessment {
+            relation: assessment.relation,
+            target_context_id: assessment.target.map(|target| target.context_id),
+            confidence_basis_points: assessment.confidence.basis_points,
+        });
+    let primary = review
+        .space_recommendations
+        .iter()
+        .find(|recommendation| {
+            matches!(
+                recommendation,
+                CandidateSpaceRecommendation::Existing {
+                    role: RecommendedSpaceRole::Primary,
+                    ..
+                }
+            )
+        })
+        .or_else(|| {
+            review.space_recommendations.iter().find(|recommendation| {
+                matches!(
+                    recommendation,
+                    CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. }
+                )
+            })
+        })
+        .or_else(|| review.space_recommendations.first());
+    let primary_space_recommendation = primary.map(|recommendation| match recommendation {
+        CandidateSpaceRecommendation::Existing {
+            recommendation_id,
+            space_id,
+            role,
+            ..
+        } => CompactSpaceRecommendation::Existing {
+            recommendation_id: *recommendation_id,
+            space_id: *space_id,
+            role: *role,
+            provisional: provisional_space_ids.contains(space_id),
+        },
+        CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+            recommendation_id,
+            proposed_new_space_intent,
+            ..
+        } => CompactSpaceRecommendation::ProposedNewSpaceIntent {
+            recommendation_id: *recommendation_id,
+            title: proposed_new_space_intent.title.clone(),
+            provisional: true,
+        },
+    });
+    CompactCandidateReview {
+        candidate_id: review.candidate_id,
+        source_task_id,
+        kind: review.content.kind,
+        statement: review.content.statement.clone(),
+        top_assessment,
+        primary_space_recommendation,
+        ready_for_review: review.ready_for_review,
+        candidate_status: review.candidate_status,
+        auto_confirmable: auto_confirmable(review),
+        language_hint: language_hint(&review.content.statement),
+        applicability_inherited: APPLICABILITY_INHERITED,
+        untrusted_data: review.untrusted_data,
+    }
+}
+
+/// Non-sensitive current status of bounded Candidate Build recovery.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateRecoverySummary {
+    pub attempted: usize,
+    pub recovered: usize,
+    pub failed_attempts: usize,
+    pub pending: usize,
+    pub incomplete: usize,
 }
 
 /// Exact public discard disposition.
@@ -373,7 +688,8 @@ pub enum CandidateConfirmPrimaryInput {
     Proposed(NewCandidatePrimaryInput),
 }
 
-/// Strict explicit human Candidate confirmation request.
+/// Strict explicit Candidate confirmation request — human by default, or `agent_policy`
+/// inside the server-verified surface (ADR-0005).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfirmInput {
@@ -387,6 +703,94 @@ pub struct CandidateConfirmInput {
     pub related_space_ids: Vec<String>,
     #[serde(default)]
     pub edits: OptionalCandidateEdits,
+    /// Who decided this confirmation. `agent_policy` is accepted only inside the permission
+    /// surface the server itself verifies; omitting the field means `human` and changes nothing.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
+}
+
+/// Strict explicit confirmation of several owned Pending Candidates, by a human or, inside the
+/// server-verified permission surface, by the session Agent.
+///
+/// It shares one Space organization and one Review version across the batch; per-Candidate field
+/// `edits` and proposed new Space recommendations stay single-Candidate operations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfirmBatchInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub candidate_ids: Vec<String>,
+    pub expected_review_version: u64,
+    pub primary: CandidateConfirmPrimaryInput,
+    pub related_space_ids: Vec<String>,
+    /// Who decided this batch. One batch is one decision, so it carries one source; under
+    /// `agent_policy` a single member outside the permission surface rejects the whole batch.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
+}
+
+/// Batch discard request; the Review version and reason apply to every listed Candidate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateDiscardBatchInput {
+    pub agent_kind: String,
+    pub external_session_id: String,
+    pub expected_task_id: String,
+    pub expected_intent_revision_id: String,
+    pub candidate_ids: Vec<String>,
+    pub expected_review_version: u64,
+    pub reason: String,
+    /// Who decided this batch discard; omitting it means `human`.
+    #[serde(default)]
+    pub decision_source: DecisionSource,
+}
+
+/// Either public shape accepted by `candidate_confirm`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateConfirmRequest {
+    Single(Box<CandidateConfirmInput>),
+    Batch(Box<CandidateConfirmBatchInput>),
+}
+
+/// Either public shape accepted by `candidate_discard`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateDiscardRequest {
+    Single(Box<CandidateDiscardInput>),
+    Batch(Box<CandidateDiscardBatchInput>),
+}
+
+/// Result of one atomically validated Candidate Confirmation batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateConfirmBatchResponse {
+    pub status: CandidateConfirmResponseStatus,
+    pub confirmations: Vec<CandidateConfirmResponse>,
+}
+
+/// Result of one atomic Candidate Review discard batch.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CandidateDiscardBatchResponse {
+    pub status: CandidateDiscardResponseStatus,
+    pub reviews: Vec<CandidateReviewView>,
+}
+
+/// Either public shape returned by `candidate_confirm`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateConfirmOutcome {
+    Single(Box<CandidateConfirmResponse>),
+    Batch(CandidateConfirmBatchResponse),
+}
+
+/// Either public shape returned by `candidate_discard`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CandidateDiscardOutcome {
+    Single(Box<CandidateDiscardResponse>),
+    Batch(CandidateDiscardBatchResponse),
 }
 
 /// Exact idempotent Candidate Confirmation result.
@@ -414,12 +818,22 @@ pub struct CandidateConfirmResponse {
     pub indexed_tree_oid: String,
     pub projection_generation: u64,
     pub assessment_acknowledgments: Vec<CandidateRelationAssessment>,
+    pub graph_rebuild_pending: bool,
+    /// What to do about `graph_rebuild_pending`, present only when it is true.
+    ///
+    /// The flag alone was reported honestly and then read by nobody: a caller that does not know
+    /// what a pending rebuild costs has no reason to mention it. The sentence travels with the
+    /// flag so the fix is in the same place as the fact. Absent on responses written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice: Option<String>,
 }
 
 /// Public Claim-scoped submission state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateBuildItemResponseStatus {
+    Queued,
     Prepared,
     NeedsEvidence,
     Created,
@@ -430,6 +844,7 @@ pub enum CandidateBuildItemResponseStatus {
 impl From<CandidateBuildItemStatus> for CandidateBuildItemResponseStatus {
     fn from(value: CandidateBuildItemStatus) -> Self {
         match value {
+            CandidateBuildItemStatus::Queued => Self::Queued,
             CandidateBuildItemStatus::Prepared => Self::Prepared,
             CandidateBuildItemStatus::NeedsEvidence => Self::NeedsEvidence,
             CandidateBuildItemStatus::Created => Self::Created,
@@ -447,12 +862,14 @@ pub struct TaskIntentUpdateResponse {
     pub active_signals: Vec<TaskSignalRecord>,
 }
 
-/// Whether one Working Intent call created a Revision or matched current canonical semantics.
+/// Whether one Working Intent call created a Revision, matched current canonical semantics, or
+/// forked a parallel `TaskSession` for a concurrent Agent sharing one `external_session_id`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IntentRevisionStatus {
     Created,
     AlreadyCurrent,
+    Forked,
 }
 
 impl From<IntentRevisionWriteStatus> for IntentRevisionStatus {
@@ -460,6 +877,7 @@ impl From<IntentRevisionWriteStatus> for IntentRevisionStatus {
         match value {
             IntentRevisionWriteStatus::Created => Self::Created,
             IntentRevisionWriteStatus::AlreadyCurrent => Self::AlreadyCurrent,
+            IntentRevisionWriteStatus::Forked => Self::Forked,
         }
     }
 }
@@ -674,32 +1092,112 @@ impl ArtifactFocusQuery {
     }
 }
 
-/// Flattened explanation index for one returned Task Context item.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TaskContextRetrievalPaths {
-    pub association_space_id: SpaceId,
-    pub context_id: ContextId,
-    pub paths: Vec<TaskRetrievalPath>,
-}
-
 /// Session-aware Task Context result shared by MCP and the CLI test entry.
+///
+/// The Rust entry points always build the explainable [`ContextPackDetailLevel::Full`] shape.
+/// The MCP tool surface defaults to `compact` and returns [`CompactTaskContextResponse`] instead,
+/// which is this response projected onto the fields an Agent needs to inherit a fact.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskContextResponse {
     pub task_session_id: TaskSessionId,
     pub task_id: TaskId,
     pub intent_revision_id: TaskIntentRevisionId,
+    pub detail_level: ContextPackDetailLevel,
     pub candidate_spaces: Vec<TaskSpaceAssociation>,
+    /// Compact projection of the surviving Space associations; empty under `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_candidate_spaces: Vec<CompactSpaceAssociation>,
     pub items: Vec<TaskContextItem>,
-    pub retrieval_paths: Vec<TaskContextRetrievalPaths>,
+    /// Compact projection of the same budgeted selection; empty under `full`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compact_items: Vec<CompactTaskContextItem>,
     pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
     pub task_fingerprint: String,
     pub tree: String,
     pub generation: u64,
     pub artifact_generation: Option<String>,
     pub graph_context_tree_oid: Option<String>,
     pub token_budget: usize,
+    /// What this Pack costs its reader, in caliber-v2 tokens: the payload charged at the shape it
+    /// reaches the host in, both wire copies -- see `TaskContextPack::estimated_tokens`. It is not
+    /// comparable with the number this field carried before that change.
     pub estimated_tokens: usize,
     pub omitted: Vec<ContextPackOmitted>,
+    /// Carried for the compact projection only; the explainable shape has never reported it and
+    /// gains no field here.
+    #[serde(skip)]
+    pub pending_candidates_in_other_tasks: Option<u32>,
+}
+
+impl TaskContextResponse {
+    /// Projects the budgeted selection onto the compact injection payload. Ranking, fusion, and
+    /// per-item Retrieval Path details are dropped; each item keeps its `relations` and the
+    /// deduplicated `retrieval_channels` names, while compact `candidate_spaces` carry only
+    /// `space_id`, `title`, `score`, `provisional`, and up to two human-readable reasons.
+    #[must_use]
+    pub fn compact(&self) -> CompactTaskContextResponse {
+        CompactTaskContextResponse {
+            task_session_id: self.task_session_id,
+            task_id: self.task_id,
+            intent_revision_id: self.intent_revision_id,
+            detail_level: ContextPackDetailLevel::Compact,
+            candidate_spaces: self.compact_candidate_spaces.clone(),
+            items: self.compact_items.clone(),
+            graph_diagnostics: self.graph_diagnostics.clone(),
+            query_token_explanation: self.query_token_explanation.clone(),
+            task_fingerprint: self.task_fingerprint.clone(),
+            tree: self.tree.clone(),
+            generation: self.generation,
+            token_budget: self.token_budget,
+            estimated_tokens: self.estimated_tokens,
+            omitted: self.omitted.clone(),
+            pending_candidates_in_other_tasks: self.pending_candidates_in_other_tasks,
+        }
+    }
+}
+
+/// Compact Task Context payload. It keeps identity, budget accounting, and the inheritable facts
+/// while dropping every explanation channel that only a debugging reader can act on.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactTaskContextResponse {
+    pub task_session_id: TaskSessionId,
+    pub task_id: TaskId,
+    pub intent_revision_id: TaskIntentRevisionId,
+    pub detail_level: ContextPackDetailLevel,
+    pub candidate_spaces: Vec<CompactSpaceAssociation>,
+    pub items: Vec<CompactTaskContextItem>,
+    pub graph_diagnostics: Vec<TaskGraphDiagnostic>,
+    /// Automatic query-token selection, projected onto its totals plus a few named drops. It is
+    /// the one explanation a compact Pack keeps: a Pack that came back with nothing still says
+    /// how much of the question this Tree could answer at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_token_explanation: Option<AutomaticQueryTokenExplanation>,
+    pub task_fingerprint: String,
+    pub tree: String,
+    pub generation: u64,
+    pub token_budget: usize,
+    /// What this Pack costs its reader, in caliber-v2 tokens: the payload charged at the shape it
+    /// reaches the host in, both wire copies -- see `TaskContextPack::estimated_tokens`. It is not
+    /// comparable with the number this field carried before that change.
+    pub estimated_tokens: usize,
+    pub omitted: Vec<ContextPackOmitted>,
+    /// How many Pending Candidates the other Tasks of this Session are holding, when there are
+    /// any. It is a count and never the content: a sibling Task's Candidate is untrusted
+    /// Agent-authored text this Task never asked for, so nothing of it enters this Pack. Reading
+    /// them is `candidate_list` with `scope: "session"`, which stays an explicit, separate call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_candidates_in_other_tasks: Option<u32>,
+}
+
+/// Compact form of [`TaskIntentUpdateResponse`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactTaskIntentUpdateResponse {
+    #[serde(flatten)]
+    pub context: CompactTaskContextResponse,
+    pub revision_status: IntentRevisionStatus,
+    pub active_signals: Vec<TaskSignalRecord>,
 }
 
 /// Result of one request-local Focus resolution and its immediate Task Context retrieval.
@@ -707,6 +1205,13 @@ pub struct TaskContextResponse {
 pub struct ArtifactFocusQueryResponse {
     pub resolved_focus: ResolvedFocus,
     pub context: TaskContextResponse,
+}
+
+/// Compact form of [`ArtifactFocusQueryResponse`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactArtifactFocusQueryResponse {
+    pub resolved_focus: ResolvedFocus,
+    pub context: CompactTaskContextResponse,
 }
 
 /// Register-and-scan request for one canonical local Git worktree root.
@@ -783,6 +1288,27 @@ pub struct EngineeringReferenceRecordResponse {
     pub generation: u64,
 }
 
+/// Explicit Space creation input. The Intent carries exactly the fields `sctx space create`
+/// requires and is validated by the same [`IntentSnapshot::validate`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpaceCreateInput {
+    pub intent: IntentSnapshot,
+}
+
+/// One Space a human or Agent named on purpose; it is never provisional.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SpaceCreateResponse {
+    pub space_id: SpaceId,
+    pub intent_revision_id: RevisionId,
+    pub provisional: bool,
+    pub event_id: sctx_domain::EventId,
+    pub batch_id: String,
+    pub commit_oid: String,
+    pub tree: String,
+    pub generation: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssociationExplainInput {
@@ -803,6 +1329,10 @@ pub struct AssociationExplainResponse {
     pub explanation: String,
     pub artifact_generation: String,
     pub context_tree_oid: Option<String>,
+    /// The rename local history states for a `Missing` File or Module Reference, when there is
+    /// exactly one. Absent otherwise, including when history is ambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relocation_candidate: Option<ReferenceRelocationCandidate>,
     pub tree: String,
     pub generation: u64,
 }
@@ -833,6 +1363,26 @@ pub struct ResolutionStatusCounts {
     pub unavailable: usize,
 }
 
+/// One rename the Repository's own history states, reported beside a `Missing` Reference.
+///
+/// It is a diagnosis, never a repair. Resolution still never guesses after a move: nothing here
+/// rewrites a Reference, feeds an `ArtifactResolution`, or creates an association. A rename is
+/// reported because the Repository stated it -- this exact path became that exact path in this
+/// exact commit -- and the person who accepted the Context is the one who decides whether the
+/// claim still holds at the new path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceRelocationCandidate {
+    pub reference_id: ReferenceId,
+    pub repository_id: RepositoryId,
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    pub from: String,
+    pub to: String,
+    pub commit: String,
+    /// The explicit act that repairs it.
+    pub advice: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssociationRebuildResponse {
     pub diagnose_only: bool,
@@ -842,8 +1392,119 @@ pub struct AssociationRebuildResponse {
     pub reference_count: usize,
     pub repositories: Vec<RepositoryRebuildSummary>,
     pub status_counts: ResolutionStatusCounts,
+    /// Renames local history states for the `Missing` File and Module References. Empty on a
+    /// budgeted automatic rescan, which never reads history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relocation_candidates: Vec<ReferenceRelocationCandidate>,
+    /// Episodes whose Claim derivation left an ambiguity and will be asked again on their next
+    /// Candidate Build. Zero on a diagnose-only or budgeted rescan, which change nothing.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reopened_reference_derivations: usize,
     pub tree: String,
     pub generation: u64,
+}
+
+/// `skip_serializing_if` for a count whose zero is the ordinary case.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// Wall-clock budget for the bounded Graph rescan that follows an interactive Engineering write.
+///
+/// Short enough that an Agent waiting on `candidate_confirm` never notices it, and the scan it
+/// bounds only ever visits the paths the Engineering References actually name.
+const AUTO_SCAN_BUDGET: Duration = Duration::from_secs(2);
+
+/// Wall-clock budget for the first Graph scan after an explicit Repository registration.
+///
+/// Registration is a deliberate operation a person is watching, not an Agent's hot path, so this
+/// scan is allowed the seconds a first read of an unseen checkout actually costs.
+const REPOSITORY_FIRST_SCAN_BUDGET: Duration = Duration::from_secs(30);
+
+/// What to tell a caller whose Confirmation left the Graph behind the Store.
+const GRAPH_REBUILD_ADVICE: &str = "This Confirmation named Engineering References the Graph has \
+     not resolved yet, so Artifact-anchored retrieval will not find them. Tell the user, and run \
+     `sctx association rebuild` (or wait for the next `sctx doctor --fix`).";
+
+/// Wall-clock budget for one Reference's local history lookup.
+const RELOCATION_REFERENCE_BUDGET: Duration = Duration::from_secs(2);
+/// Wall-clock budget for every history lookup in one explicit rebuild.
+const RELOCATION_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+/// The one repair for a Reference whose Artifact moved.
+const RELOCATION_ADVICE: &str = "confirm the Context still holds at the new path, then record a replacement with engineering_reference_record";
+
+/// Prefix of the only structured `recheck_when` entries the server evaluates.
+pub const RECHECK_BRANCH_ADVANCED_PREFIX: &str = "branch_advanced:";
+
+/// Prefix of the structured `file_changed_since:<commit>:<repository-relative path>` entry.
+pub const RECHECK_FILE_CHANGED_SINCE_PREFIX: &str = "file_changed_since:";
+
+/// One Context's structured `recheck_when` evaluation on this machine.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextRecheckResult {
+    pub context_id: ContextId,
+    pub revision_id: RevisionId,
+    /// Why this Context is considered stale; absent means every structured entry still holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+    /// Structured entries no local checkout could answer. They are not a failure: an unreachable
+    /// checkout, a missing commit, an absent `git`, or a timeout all land here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unevaluated: Vec<String>,
+}
+
+/// Outcome of one `recheck_when` evaluation pass over every accepted Context.
+///
+/// The result is written to the local `context_item.stale_reason` projection column only. It is
+/// never an Event: staleness is this machine's reading of its own checkouts, not a shared fact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ContextRecheckResponse {
+    pub evaluated_contexts: usize,
+    pub stale_contexts: usize,
+    pub unevaluated_entries: usize,
+    pub results: Vec<ContextRecheckResult>,
+    pub tree: String,
+    pub generation: u64,
+}
+
+/// Structured `recheck_when` entry the server can answer deterministically from a local checkout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecheckCondition {
+    /// `branch_advanced:<branch>@<commit>` — the named branch no longer points at `<commit>`.
+    BranchAdvanced { branch: String, commit: String },
+    /// `file_changed_since:<commit>:<path>` — `<path>` changed between `<commit>` and `HEAD`.
+    FileChangedSince { commit: String, path: String },
+}
+
+impl RecheckCondition {
+    /// Parses the structured subset. Every other `recheck_when` entry stays free text and is
+    /// returned untouched to the reader.
+    fn parse(entry: &str) -> Option<Self> {
+        let entry = entry.trim();
+        if let Some(rest) = entry.strip_prefix(RECHECK_BRANCH_ADVANCED_PREFIX) {
+            let (branch, commit) = rest.rsplit_once('@')?;
+            let (branch, commit) = (branch.trim(), commit.trim());
+            return (!branch.is_empty() && is_commit_ish(commit)).then(|| Self::BranchAdvanced {
+                branch: branch.to_owned(),
+                commit: commit.to_owned(),
+            });
+        }
+        let rest = entry.strip_prefix(RECHECK_FILE_CHANGED_SINCE_PREFIX)?;
+        let (commit, path) = rest.split_once(':')?;
+        let (commit, path) = (commit.trim(), path.trim());
+        (is_commit_ish(commit) && !path.is_empty() && !path.starts_with('-')).then(|| {
+            Self::FileChangedSince {
+                commit: commit.to_owned(),
+                path: path.to_owned(),
+            }
+        })
+    }
+}
+
+/// Accepts only abbreviated-or-full hexadecimal object names, so no entry can smuggle a Git flag.
+fn is_commit_ish(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 impl RepositoryScanInput {
@@ -936,6 +1597,37 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
+const fn transport_error_code(kind: TransportErrorKind) -> &'static str {
+    match kind {
+        TransportErrorKind::Io => "transport_io",
+        TransportErrorKind::InvalidFrame => "invalid_frame",
+        TransportErrorKind::UnexpectedEof => "unexpected_eof",
+        TransportErrorKind::FrameTooLarge => "frame_too_large",
+    }
+}
+
+fn emit_mcp_protocol_failure(
+    root: Option<&Path>,
+    operation: &'static str,
+    code: &'static str,
+    family: &'static str,
+) {
+    let Some(root) = root else {
+        return;
+    };
+    let mut event = sctx_telemetry::Event::finished(
+        sctx_telemetry::EntryPoint::Mcp,
+        sctx_telemetry::EventKind::ProtocolFailure,
+        sctx_telemetry::new_invocation_id(),
+        operation,
+        sctx_telemetry::Outcome::Failure,
+    );
+    event.authorization = sctx_telemetry::Authorization::NotApplicable;
+    event.error_code = Some(code.to_owned());
+    event.error_family = Some(family.to_owned());
+    let _ = sctx_telemetry::emit_to(root, &event);
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FrameStyle {
     Newline,
@@ -948,12 +1640,41 @@ struct Frame {
 }
 
 struct Runtime {
-    store: GitStore,
+    /// Installation root. Candidate Build resolves the checkout of the `ExternalSession` that
+    /// authored a Checkpoint, which is not always the session draining the outbox.
+    root: PathBuf,
+    /// Append-only Knowledge Store, opened on first write.
+    ///
+    /// `GitStore::open_existing` verifies the fixed worktree with two `git` child processes,
+    /// which is the single largest fixed cost of opening this Runtime. Read-only tools never
+    /// append an event, so they never pay it; every writing tool still opens and verifies the
+    /// Store before it writes anything.
+    store: OnceCell<GitStore>,
     index: ProjectionIndex,
     repositories: RepositoryRegistry,
     engineering_graph: Option<EngineeringProjectionStore>,
     tasks: TaskRuntime,
     catalog: RepositoryCatalogSnapshot,
+    /// Explicit `[context_ttl]` policy. Contexts past their configured lifetime are `historical`:
+    /// still searchable and explainable, never automatically injected.
+    context_ttl: ContextTtlSettings,
+    /// The process-lifetime embedding channel, handed down from [`McpServer`] so a Pack built on
+    /// this call can consult it. `None` on every installation without `[retrieval]`.
+    semantic: Option<SemanticChannelHandle>,
+    /// `[retrieval] hop2_admission_floor_basis_points`, when this installation tuned one.
+    ///
+    /// `None` is the ordinary state and means the compiled-in ADR-0007 default. The key is read
+    /// here, beside `[context_ttl]`, so a Pack never opens `config.toml` a second time.
+    hop2_admission_floor_basis_points: Option<u16>,
+    /// `[retrieval] pack_wire_token_ceiling`, when this installation's host holds a different
+    /// amount than the one `PACK_WIRE_TOKEN_CEILING` was measured against.
+    ///
+    /// Read here for the same reason the floor is: a Pack never opens `config.toml` twice.
+    pack_wire_token_ceiling: Option<usize>,
+    /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
+    /// Internal entry points carry `None` and fall back to the scope recorded for the Episode's
+    /// own `ExternalSession`.
+    session_scope: Option<AuthorizedSessionScope>,
 }
 
 #[derive(Clone)]
@@ -962,7 +1683,7 @@ struct ClaimBuildMaterial {
     claim_id: CheckpointClaimId,
     draft: Option<ContextRevisionDraft>,
     confidence: CandidateConfidence,
-    unknowns: Vec<CaptureUnknown>,
+    unknowns: Vec<CheckpointUnknown>,
     error_code: Option<&'static str>,
 }
 
@@ -993,33 +1714,116 @@ impl ClaimBuildMaterial {
     }
 }
 
+/// State a caller already opened for this exact call, handed to [`Runtime::open_with_catalog`]
+/// instead of being opened a second time.
+#[derive(Default)]
+struct RuntimeOpenParts {
+    /// Activation scope that authorized this exact call, when the caller is public MCP dispatch.
+    session_scope: Option<AuthorizedSessionScope>,
+    /// `[context_ttl]` already read from the same `config.toml` read that froze the Catalog.
+    context_ttl: Option<ContextTtlSettings>,
+    /// Task Runtime already opened by the identity preflight of this call.
+    tasks: Option<TaskRuntime>,
+    /// The process-lifetime embedding channel, when one is loading or loaded.
+    semantic: Option<SemanticChannelHandle>,
+}
+
 impl Runtime {
     fn open(root: &Path) -> Result<Self> {
-        let base_store = GitStore::initialize(root)?;
-        let index = ProjectionIndex::for_store(&base_store);
-        let store = base_store
-            .with_candidate_submission_index(Arc::new(index.clone()))
-            .with_candidate_confirmation_index(Arc::new(index.clone()));
-        let repositories = RepositoryRegistry::initialize(root)?;
+        Self::open_with_semantic(root, None)
+    }
+
+    fn open_with_semantic(root: &Path, semantic: Option<SemanticChannelHandle>) -> Result<Self> {
+        let _store = GitStore::open_existing(root)?;
         let catalog = UserConfigStore::open_existing(root)?.repository_catalog_wait()?;
+        Self::open_with_catalog(
+            root,
+            catalog,
+            RuntimeOpenParts {
+                semantic,
+                ..RuntimeOpenParts::default()
+            },
+        )
+    }
+
+    /// Opens business state against the exact Catalog snapshot that authorized
+    /// this call. Public MCP dispatch must never re-read a newer Catalog here.
+    fn open_with_catalog(
+        root: &Path,
+        catalog: RepositoryCatalogSnapshot,
+        parts: RuntimeOpenParts,
+    ) -> Result<Self> {
+        // Same two paths `GitStore::open_existing` would hand `ProjectionIndex::for_store`,
+        // without the Git worktree verification that only a writing tool needs.
+        let config = UserConfigStore::open_existing(root)?;
+        let index = ProjectionIndex::new(config.repository(), config.root().join("state"));
+        let repositories = RepositoryRegistry::initialize(root)?;
         sync_repository_catalog_snapshot(&repositories, &catalog)?;
         let engineering_graph = EngineeringProjectionStore::initialize(root).ok();
-        let tasks = TaskRuntime::initialize(root)?;
+        let tasks = match parts.tasks {
+            Some(tasks) => tasks,
+            None => TaskRuntime::initialize(root)?,
+        };
+        let context_ttl = match parts.context_ttl {
+            Some(context_ttl) => context_ttl,
+            None => context_ttl_settings(&config.context_ttl_policy()?),
+        };
+        // One read for both retrieval knobs: they live in the same table, and an unreadable
+        // `[retrieval]` is the same fact for each of them -- the compiled-in default.
+        let retrieval = config.retrieval_settings().ok();
         Ok(Self {
-            store,
+            root: root.to_path_buf(),
+            store: OnceCell::new(),
             index,
             repositories,
             engineering_graph,
             tasks,
             catalog,
+            context_ttl,
+            hop2_admission_floor_basis_points: retrieval
+                .as_ref()
+                .and_then(|retrieval| retrieval.hop2_admission_floor_basis_points),
+            pack_wire_token_ceiling: retrieval
+                .as_ref()
+                .and_then(|retrieval| retrieval.pack_wire_token_ceiling),
+            session_scope: parts.session_scope,
+            semantic: parts.semantic,
         })
     }
 
-    fn snapshot(&self) -> Result<DomainSnapshot> {
-        self.index.domain_snapshot()
+    /// Opens and verifies the append-only Knowledge Store, once per Runtime.
+    fn store(&self) -> Result<&GitStore> {
+        if let Some(store) = self.store.get() {
+            return Ok(store);
+        }
+        let store = GitStore::open_existing(&self.root)?
+            .with_candidate_submission_index(Arc::new(self.index.clone()))
+            .with_candidate_confirmation_index(Arc::new(self.index.clone()));
+        let _ = self.store.set(store);
+        Ok(self
+            .store
+            .get()
+            .expect("the Knowledge Store was just initialized"))
+    }
+
+    /// One reduced Domain Snapshot, shared with every other reader of the same indexed Tree.
+    ///
+    /// The index reuses the reduction it already performed for this exact projection identity, so
+    /// a tool call that reads the Snapshot once and then analyzes several Candidates against it
+    /// pays for one reduction, not one per read.
+    fn snapshot(&self) -> Result<Arc<DomainSnapshot>> {
+        self.index.shared_domain_snapshot()
     }
 
     fn task_context_readonly(&self, input: &TaskContextReadInput) -> Result<TaskContextResponse> {
+        self.task_context_readonly_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn task_context_readonly_with_detail(
+        &self,
+        input: &TaskContextReadInput,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<TaskContextResponse> {
         input.validate()?;
         let locator = input.locator()?;
         let snapshot = self
@@ -1031,16 +1835,31 @@ impl Runtime {
         build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
+            &self.tasks,
+            ContextInjectionSource::TaskContext,
             &snapshot,
             None,
             input.token_budget,
             input.max_spaces,
+            detail_level,
+            self.context_ttl,
+            self.semantic.as_ref(),
+            self.hop2_admission_floor_basis_points,
+            self.pack_wire_token_ceiling,
         )
     }
 
     fn task_artifact_focus(
         &self,
         input: &ArtifactFocusQuery,
+    ) -> Result<ArtifactFocusQueryResponse> {
+        self.task_artifact_focus_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn task_artifact_focus_with_detail(
+        &self,
+        input: &ArtifactFocusQuery,
+        detail_level: ContextPackDetailLevel,
     ) -> Result<ArtifactFocusQueryResponse> {
         input.validate_bounds()?;
         let session_locator = input.locator()?;
@@ -1064,10 +1883,17 @@ impl Runtime {
         let context = build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
+            &self.tasks,
+            ContextInjectionSource::ArtifactFocus,
             &active,
             Some(resolved_focus.clone()),
             input.token_budget,
             input.max_spaces,
+            detail_level,
+            self.context_ttl,
+            self.semantic.as_ref(),
+            self.hop2_admission_floor_basis_points,
+            self.pack_wire_token_ceiling,
         )?;
         Ok(ArtifactFocusQueryResponse {
             resolved_focus,
@@ -1079,14 +1905,24 @@ impl Runtime {
         &self,
         input: &TaskIntentUpdateInput,
     ) -> Result<TaskIntentUpdateResponse> {
+        self.task_intent_update_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn task_intent_update_with_detail(
+        &self,
+        input: &TaskIntentUpdateInput,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<TaskIntentUpdateResponse> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let active = self.tasks.read_snapshot_by_locator(&locator)?;
         input.intent.validate()?;
         let (snapshot, revision_status) = match input.task_boundary {
             TaskBoundary::Continue => {
-                let active = active.ok_or_else(|| {
-                    invalid("task_boundary=continue requires an existing ActiveTask")
-                })?;
+                if active.is_none() {
+                    return Err(invalid(
+                        "task_boundary=continue requires an existing ActiveTask",
+                    ));
+                }
                 let parent = input
                     .expected_revision_id
                     .as_deref()
@@ -1097,17 +1933,10 @@ impl Runtime {
                     })?
                     .parse::<TaskIntentRevisionId>()
                     .map_err(|error| invalid(format!("invalid expected_revision_id: {error}")))?;
-                let outcome = self.tasks.append_intent_revision(
-                    active.task_session_id,
-                    parent,
-                    input.intent.clone(),
-                )?;
-                (
+                let outcome =
                     self.tasks
-                        .read_snapshot(active.task_session_id)?
-                        .ok_or_else(|| invariant("updated ActiveTask disappeared"))?,
-                    outcome.status.into(),
-                )
+                        .continue_working_intent(&locator, parent, input.intent.clone())?;
+                (outcome.snapshot, outcome.status.into())
             }
             TaskBoundary::New => {
                 if let Some(active) = active {
@@ -1145,10 +1974,17 @@ impl Runtime {
         let context = build_task_context_response(
             &self.index,
             self.engineering_graph.as_ref(),
+            &self.tasks,
+            ContextInjectionSource::IntentUpdate,
             &snapshot,
             None,
             default_token_budget(),
             default_max_spaces(),
+            detail_level,
+            self.context_ttl,
+            self.semantic.as_ref(),
+            self.hop2_admission_floor_basis_points,
+            self.pack_wire_token_ceiling,
         )?;
         Ok(TaskIntentUpdateResponse {
             active_signals: active_signal_records(&self.tasks, snapshot.task_session_id)?,
@@ -1200,13 +2036,29 @@ impl Runtime {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
     fn task_checkpoint(&self, input: &TaskCheckpointInput) -> Result<TaskCheckpointResponse> {
+        durable_checkpoint(&self.tasks, input)
+    }
+}
+
+/// The whole durable Checkpoint ACK, over Runtime state alone.
+///
+/// ADR-0003 makes the ACK a receipt plus a Candidate Build outbox entry: it appends no Git event,
+/// reads no retrieval index, consults no checkout, and touches no Repository Registry. It is
+/// therefore given the Runtime database and nothing else, so public dispatch can answer a
+/// Checkpoint without opening the stores only Candidate Build and retrieval need.
+#[allow(clippy::too_many_lines)]
+fn durable_checkpoint(
+    tasks: &TaskRuntime,
+    input: &TaskCheckpointInput,
+) -> Result<TaskCheckpointResponse> {
+    {
         let input_json = serde_json::to_string(input).map_err(|error| {
             invalid(format!(
                 "serialize task_checkpoint privacy boundary: {error}"
             ))
         })?;
+        validate_task_checkpoint_input(input, input_json.len())?;
         let privacy = PrivacyScanner::default().scan(&input_json)?;
         if !privacy.is_clean() {
             return Err(Error::new(
@@ -1218,150 +2070,430 @@ impl Runtime {
             ));
         }
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
-        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
-        let expected_intent_revision_id = parse_id_value(
-            &input.expected_intent_revision_id,
-            "expected_intent_revision_id",
-        )?;
-        let snapshot = self.snapshot()?;
-        let mut claims = Vec::with_capacity(input.claims.len());
-        for claim in &input.claims {
-            let mut evidence_refs = Vec::new();
-            let mut inline_validations = Vec::new();
-            for evidence in &claim.evidence {
-                match evidence {
-                    TaskCheckpointEvidenceInput::Observation { observation_id } => {
-                        evidence_refs.push(CaptureEvidenceRef::Observation {
-                            observation_id: parse_id_value(observation_id, "observation_id")?,
-                        });
-                    }
-                    TaskCheckpointEvidenceInput::TaskSignal { signal_id } => {
-                        evidence_refs.push(CaptureEvidenceRef::TaskSignal {
-                            signal_id: parse_id_value(signal_id, "signal_id")?,
-                        });
-                    }
-                    TaskCheckpointEvidenceInput::ContextEvidence {
-                        context_id,
-                        revision_id,
-                        evidence_id,
-                    } => {
-                        let reference = CaptureEvidenceRef::ContextEvidence {
-                            context_id: parse_id_value(context_id, "context_id")?,
-                            revision_id: parse_id_value(revision_id, "revision_id")?,
-                            evidence_id: parse_id_value(evidence_id, "evidence_id")?,
-                        };
-                        validate_context_evidence_ref(&snapshot, &reference)?;
-                        evidence_refs.push(reference);
-                    }
-                    TaskCheckpointEvidenceInput::InlineValidation { evidence } => {
-                        evidence.validate("task_checkpoint.inline_validation")?;
-                        inline_validations.push(evidence.clone());
-                    }
-                }
-            }
-            for artifact in &claim.artifact_refs {
-                artifact.locator.validate()?;
-                if !self
-                    .catalog
-                    .repositories
-                    .iter()
-                    .any(|entry| entry.repository_id == artifact.repository_id)
-                {
-                    return Err(invalid(format!(
-                        "Checkpoint Artifact Repository does not exist: {}",
-                        artifact.repository_id
-                    )));
-                }
-            }
-            for context in &claim.related_contexts {
-                validate_context_revision_ref(&snapshot, *context)?;
-            }
-            claims.push(CheckpointClaimDraft {
-                context_kind_hint: claim.context_kind_hint,
-                topic_key_hint: claim.topic_key_hint.clone(),
-                statement: claim.statement.clone(),
-                rationale: claim.rationale.clone(),
-                applicability: claim.applicability.clone(),
-                assumptions: claim.assumptions.clone(),
-                recheck_when: claim.recheck_when.clone(),
-                evidence_refs,
-                inline_validations,
-                artifact_refs: claim.artifact_refs.clone(),
-                related_contexts: claim.related_contexts.clone(),
-            });
-        }
-        if input.boundary == TaskCheckpointBoundary::Close
-            && claims.is_empty()
-            && input.unknowns.is_empty()
-        {
-            let boundary = self.tasks.close_checkpointed_work_episode_cas(
-                &locator,
-                expected_task_id,
-                expected_intent_revision_id,
-                input.expected_episode_version,
-            )?;
-            let AutomatedEpisodeBoundary::Closed { episode, .. } = boundary else {
+        if input.claims.is_empty() && input.unknowns.is_empty() {
+            if tasks.read_snapshot_by_locator(&locator)?.is_none() {
                 return Err(invalid(
-                    "empty close requires an existing current-Intent Agent Checkpoint",
+                    "ExternalSession has no ActiveTask for Agent Checkpoint",
                 ));
-            };
-            let checkpoint = episode
-                .checkpoints
-                .last()
-                .ok_or_else(|| invariant("closed Episode lacks its final Agent Checkpoint"))?;
-            let candidate_build = Some(self.build_closed_episode(episode.episode.episode_id)?);
-            return Ok(TaskCheckpointResponse {
-                checkpoint_id: checkpoint.checkpoint_id,
-                claim_ids: checkpoint
+            }
+            return Ok(TaskCheckpointResponse::NoOp(TaskCheckpointNoOpResponse {
+                status: TaskCheckpointNoOpStatus::NoOp,
+            }));
+        }
+        let submission = AgentCheckpointSubmission {
+            locator,
+            claims: input
+                .claims
+                .iter()
+                .map(|claim| DirectCheckpointClaimDraft {
+                    context_kind: claim.context_kind,
+                    statement: claim.statement.clone(),
+                    rationale: claim.rationale.clone(),
+                    conditions: claim.conditions.clone(),
+                    evidence: claim
+                        .evidence
+                        .iter()
+                        .map(|evidence| DirectEvidenceDraft {
+                            evidence_type: evidence.evidence_type,
+                            summary: evidence.summary.clone(),
+                            limitations: evidence.limitations.clone(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            unknowns: input
+                .unknowns
+                .iter()
+                .map(|unknown| CheckpointUnknown {
+                    statement: unknown.statement.clone(),
+                    blocking: unknown.blocking,
+                    recheck_when: Vec::new(),
+                })
+                .collect(),
+        };
+        // ADR-0003: the durable ACK is receipt plus outbox. Reference derivation, duplicate
+        // collapsing and injection-usage comparison are all Candidate Build work, so nothing here
+        // reads a checkout, spawns a process, or opens the retrieval index.
+        let outcome = tasks.submit_agent_checkpoint(&submission)?;
+        Ok(TaskCheckpointResponse::Accepted(
+            TaskCheckpointAcceptedResponse {
+                status: TaskCheckpointAcceptedStatus::Accepted,
+                operation_id: outcome.operation_id,
+                checkpoint_id: outcome.checkpoint.checkpoint_id,
+                claim_ids: outcome
+                    .checkpoint
                     .claims
                     .iter()
                     .map(|claim| claim.claim_id)
                     .collect(),
-                episode_id: episode.episode.episode_id,
-                episode_version: episode.episode.version,
-                episode_status: episode.episode.status,
-                created: false,
-                diagnostics: Vec::new(),
-                candidate_build,
-            });
-        }
-        let outcome = self.tasks.write_agent_checkpoint(&AgentCheckpointWrite {
-            locator,
-            expected_task_id,
-            expected_intent_revision_id,
-            expected_episode_version: input.expected_episode_version,
-            boundary: input.boundary.into(),
-            claims,
-            unknowns: input.unknowns.clone(),
-        })?;
-        let candidate_build = if input.boundary == TaskCheckpointBoundary::Close {
-            Some(self.build_closed_episode(outcome.episode.episode.episode_id)?)
-        } else {
-            None
+                episode_id: outcome.episode.episode.episode_id,
+                episode_version: outcome.episode.episode.version,
+                episode_status: outcome.episode.episode.status,
+                replayed: outcome.replayed,
+                diagnostics: outcome
+                    .inline_observation_ids
+                    .into_iter()
+                    .map(
+                        |observation_id| TaskCheckpointDiagnostic::InlineValidationRecorded {
+                            observation_id,
+                        },
+                    )
+                    .collect(),
+                candidate_build: CandidateBuildReceipt {
+                    build_id: outcome.build.build_id,
+                    episode_id: outcome.build.source_episode.episode_id,
+                    status: outcome.build.status.into(),
+                },
+            },
+        ))
+    }
+}
+
+impl Runtime {
+    /// Places one Episode's Claim path spellings inside the Repositories that Session was
+    /// scoped to.
+    ///
+    /// Returns whether this call wrote the derivation. At most one `git ls-files` runs per
+    /// checkout per Episode for the life of the installation: the runtime records the first
+    /// answer, and a Build rerun after recovery reports it without consulting the checkout
+    /// again. A Session started at the common parent of several checkouts carries several
+    /// Repositories, so a spelling is placed by which checkout actually tracks it: exactly
+    /// one resolving checkout wins, none or several leaves an unresolved retrieval hint.
+    fn derive_episode_claim_references(&self, episode: &WorkEpisodeView) -> Result<bool> {
+        let episode_id = episode.episode.episode_id;
+        let Some(mentions) = self.tasks.pending_claim_reference_candidates(episode_id)? else {
+            return Ok(false);
         };
-        Ok(TaskCheckpointResponse {
-            checkpoint_id: outcome.checkpoint.checkpoint_id,
-            claim_ids: outcome
-                .checkpoint
-                .claims
-                .iter()
-                .map(|claim| claim.claim_id)
-                .collect(),
-            episode_id: outcome.episode.episode.episode_id,
-            episode_version: outcome.episode.episode.version,
-            episode_status: outcome.episode.episode.status,
-            created: outcome.created,
-            diagnostics: outcome
-                .inline_observation_ids
-                .into_iter()
-                .map(
-                    |observation_id| TaskCheckpointDiagnostic::InlineValidationRecorded {
-                        observation_id,
-                    },
+        let resolvers = self
+            .episode_checkouts(episode)?
+            .into_iter()
+            .map(|(repository_id, checkout)| {
+                CheckoutReferenceResolver::from_checkout(
+                    repository_id,
+                    &checkout,
+                    &mentions.paths,
+                    &mentions.symbols,
                 )
-                .collect(),
-            candidate_build,
-        })
+            })
+            .collect::<Vec<_>>();
+        if resolvers.is_empty() {
+            self.tasks
+                .derive_episode_claim_references(episode_id, &ClaimResolver::nothing())?;
+            return Ok(true);
+        }
+        self.tasks.derive_episode_claim_references(
+            episode_id,
+            &ClaimResolver::new(
+                &|candidate| {
+                    reference_derivation::combine_resolutions(
+                        resolvers
+                            .iter()
+                            .map(|resolver| resolver.resolve_path(candidate)),
+                    )
+                },
+                &|symbol| {
+                    reference_derivation::combine_resolutions(
+                        resolvers
+                            .iter()
+                            .map(|resolver| resolver.resolve_symbol(symbol)),
+                    )
+                },
+            ),
+        )?;
+        Ok(true)
+    }
+
+    /// Resolves the checkouts of the `ExternalSession` that authored this Episode's Checkpoints.
+    ///
+    /// A Build can be drained by an Agent Hook or by the CLI, neither of which carries the
+    /// authoring session's activation scope, so the scope is looked up by the Episode's own
+    /// locator. A Disabled or absent lease yields no checkout and derives nothing. The order is
+    /// the lease's own sorted Repository order, so the derivation is deterministic across runs.
+    fn episode_checkouts(&self, episode: &WorkEpisodeView) -> Result<Vec<(RepositoryId, PathBuf)>> {
+        let Some(task) = self.tasks.read_snapshot(episode.episode.task_session_id)? else {
+            return Ok(Vec::new());
+        };
+        let locator = task.external_session_locator;
+        let repository_ids = match &self.session_scope {
+            Some(scope) if scope.external_session_locator == locator => {
+                scope.decision.repository_ids().to_vec()
+            }
+            _ => match read_reconciled_session_scope(&self.root, &locator, &self.catalog) {
+                Ok(AuthorizedSessionScopeRead::Current(scope)) => {
+                    scope.decision.repository_ids().to_vec()
+                }
+                _ => return Ok(Vec::new()),
+            },
+        };
+        Ok(repository_ids
+            .into_iter()
+            .filter_map(|repository_id| {
+                self.catalog
+                    .repositories
+                    .iter()
+                    .find(|entry| entry.repository_id == repository_id)
+                    .and_then(|entry| entry.checkout_paths.first().cloned())
+                    .map(|checkout| (repository_id, checkout))
+            })
+            .collect())
+    }
+
+    /// Records the injection outcome for every Claim this Episode carries.
+    ///
+    /// The Working Intent revisions of the authoring Task come along: an Agent that quotes an
+    /// injected Context into its own direction has demonstrably read and adopted it, whether or
+    /// not any single Claim repeats the identifier.
+    fn record_episode_context_usage(&self, episode: &WorkEpisodeView) -> Result<()> {
+        let claims = episode
+            .checkpoints
+            .iter()
+            .flat_map(|checkpoint| checkpoint.claims.iter().cloned())
+            .collect::<Vec<_>>();
+        let intent_text = self
+            .tasks
+            .read_snapshot(episode.episode.task_session_id)?
+            .map(|task| {
+                task.intent_revisions
+                    .iter()
+                    .map(|revision| working_intent_text(&revision.working_intent))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        if claims.is_empty() && intent_text.is_empty() {
+            return Ok(());
+        }
+        self.record_checkpoint_context_usage(episode.episode.task_id, &claims, &intent_text)
+    }
+
+    /// Compares what this Task was given with what it actually built on.
+    ///
+    /// A Context this Task received counts as `reused` when the Task's own work points back at it.
+    /// Three of the four signals are decided here, all of them server-derived from text and
+    /// coordinates the Agent wrote for its own purpose:
+    ///
+    /// 1. a Claim names the `ContextId` in its statement or rationale;
+    /// 2. a Claim's server-derived Engineering References land on a coordinate that Context
+    ///    already referenced;
+    /// 3. any Working Intent revision of this Task names the `ContextId` in its own prose - an
+    ///    Agent that pastes an injected Context into its `current_direction` and then works from
+    ///    it has adopted that Context, even when no Claim repeats the identifier (session
+    ///    `01a06646` did exactly this and every injection was recorded as an omission).
+    ///
+    /// The fourth signal is the Candidate analysis assessment and arrives later; see
+    /// [`Runtime::record_analysis_context_usage`]. Everything the Task was handed and none of the
+    /// four signals touched is `ignored`.
+    ///
+    /// Text similarity is deliberately not part of the decision: a Claim that merely restates an
+    /// injected Context is the *worst* kind of reuse and is already collapsed as a duplicate,
+    /// while the reuse worth rewarding produces a new conclusion whose wording shares nothing with
+    /// its input.
+    ///
+    /// This runs during Candidate Build, after `derive_episode_claim_references` has placed the
+    /// Claims' path spellings, because the Reference intersection needs those coordinates and the
+    /// ACK deliberately reads no index. Writing the same rows again is a no-op and `ignored` never
+    /// overwrites a stored `reused`, so a Build rerun and a Checkpoint replay both stay idempotent
+    /// and neither can erase a later signal's verdict.
+    fn record_checkpoint_context_usage(
+        &self,
+        task_id: TaskId,
+        claims: &[CheckpointClaim],
+        intent_text: &str,
+    ) -> Result<()> {
+        let injections = self.tasks.read_task_injections(task_id)?;
+        if injections.is_empty() {
+            return Ok(());
+        }
+        let claim_locators = claims
+            .iter()
+            .flat_map(|claim| claim.engineering_references.iter())
+            .map(reference_draft_locator)
+            .collect::<BTreeSet<_>>();
+        let injected = injections
+            .iter()
+            .map(|injection| (injection.context_id, injection.revision_id))
+            .collect::<Vec<_>>();
+        let injected_locators =
+            SearchEngine::new(self.index.clone()).context_reference_locators(&injected)?;
+        let records = injections
+            .iter()
+            .map(|injection| {
+                let named = injection.context_id.to_string();
+                let cited = claims.iter().any(|claim| {
+                    claim.statement.contains(&named) || claim.rationale.contains(&named)
+                });
+                let carried_by_intent = intent_text.contains(&named);
+                let shares_reference =
+                    injected_locators
+                        .get(&injection.context_id)
+                        .is_some_and(|locators| {
+                            locators
+                                .iter()
+                                .any(|locator| claim_locators.contains(locator))
+                        });
+                ContextUsageRecord {
+                    context_id: injection.context_id,
+                    task_id,
+                    outcome: if cited || carried_by_intent || shares_reference {
+                        ContextUsageOutcome::Reused
+                    } else {
+                        ContextUsageOutcome::Ignored
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        self.tasks.record_context_usage(&records)?;
+        Ok(())
+    }
+
+    /// Records the fourth reuse signal: the server's own Candidate analysis relating this Task's
+    /// Candidate to a Context the same Task was injected with.
+    ///
+    /// The analyzer compares the Candidate against the Knowledge Store and writes down what it
+    /// found - `supports`, `revises`, `exact_duplicate`, `potential_contradiction`. When the
+    /// Context on the other side of that relation is one this Task was handed, the server has
+    /// already proved to itself that the injection landed: the Task's conclusion stands in a
+    /// stated relationship to it. Session `3f862e48` is the case in point - the stored analysis
+    /// read `supports ctx_d9689ac4`, and the injection was nonetheless filed as an omission.
+    ///
+    /// `unresolved_related` is excluded on purpose: it asserts no relationship, only that the
+    /// target surfaced during retrieval, which is what injection already means. `novel` carries no
+    /// target at all.
+    ///
+    /// Timing: analysis runs *after* [`Runtime::record_checkpoint_context_usage`] - inside the
+    /// same Candidate Build, in the late `candidate_get` recovery path, and in an explicit
+    /// `candidate_analyze` - so this is a strict upgrade of rows that already exist. The store
+    /// only ever raises a `(context, task)` pair, so re-running analysis rewrites the same
+    /// `reused` row and a later Build rerun's `ignored` cannot pull it back down.
+    fn record_analysis_context_usage(
+        &self,
+        task_id: TaskId,
+        analysis: &CandidateAnalysis,
+    ) -> Result<()> {
+        let assessed = analysis
+            .assessments
+            .iter()
+            .filter(|assessment| {
+                matches!(
+                    assessment.relation,
+                    CandidateAssessmentRelation::Supports
+                        | CandidateAssessmentRelation::Revises
+                        | CandidateAssessmentRelation::ExactDuplicate
+                        | CandidateAssessmentRelation::PotentialContradiction
+                )
+            })
+            .filter_map(|assessment| assessment.target.map(|target| target.context_id))
+            .collect::<BTreeSet<_>>();
+        if assessed.is_empty() {
+            return Ok(());
+        }
+        let injected = self
+            .tasks
+            .read_task_injections(task_id)?
+            .into_iter()
+            .map(|injection| injection.context_id)
+            .collect::<BTreeSet<_>>();
+        let records = assessed
+            .intersection(&injected)
+            .map(|context_id| ContextUsageRecord {
+                context_id: *context_id,
+                task_id,
+                outcome: ContextUsageOutcome::Reused,
+            })
+            .collect::<Vec<_>>();
+        self.tasks.record_context_usage(&records)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    /// Collapses Claims that only restate a Candidate this `ExternalSession` already proposed.
+    ///
+    /// The decision compares normalized statement tokens with Jaccard similarity and never runs on
+    /// a Claim whose Candidate already reached Git, so it cannot retract a submitted proposal or
+    /// change a Candidate that a human is already reviewing.
+    fn deduplicated_claims(
+        &self,
+        episode: &WorkEpisodeView,
+        materials: &[ClaimBuildMaterial],
+        snapshot: &DomainSnapshot,
+    ) -> Result<Vec<CandidateBuildDuplicatePreparation>> {
+        let submitted = self
+            .tasks
+            .read_candidate_build(episode.episode.episode_id)?
+            .map(|build| {
+                build
+                    .items
+                    .iter()
+                    .filter(|item| item.status.is_finalized())
+                    .map(|item| item.claim_id)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let comparable = materials
+            .iter()
+            .filter(|material| material.draft.is_some() && !submitted.contains(&material.claim_id))
+            .count();
+        if comparable == 0 {
+            return Ok(Vec::new());
+        }
+        // Candidates built from this same Episode are excluded so the decision does not depend on
+        // how far this Build already progressed.
+        let corpus = self
+            .tasks
+            .list_session_candidate_reviews(
+                episode.episode.task_session_id,
+                sctx_task_runtime::MAX_SESSION_CANDIDATE_REVIEW_SCAN,
+            )?
+            .into_iter()
+            .filter(|record| record.source_episode.episode_id != episode.episode.episode_id)
+            .filter_map(|record| {
+                snapshot
+                    .projection
+                    .candidates
+                    .get(&record.candidate_id)
+                    .map(|projection| {
+                        (
+                            record.candidate_id,
+                            statement_tokens(&projection.candidate.content.statement),
+                        )
+                    })
+            })
+            .filter(|(_, tokens)| !tokens.is_empty())
+            .collect::<Vec<_>>();
+        if corpus.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut duplicates = Vec::new();
+        for material in materials {
+            if submitted.contains(&material.claim_id) {
+                continue;
+            }
+            let Some(draft) = material.draft.as_ref() else {
+                continue;
+            };
+            let tokens = statement_tokens(&draft.statement);
+            if tokens.is_empty() {
+                continue;
+            }
+            let best = corpus
+                .iter()
+                .map(|(candidate_id, existing)| {
+                    (jaccard_basis_points(&tokens, existing), *candidate_id)
+                })
+                .filter(|(similarity, _)| {
+                    *similarity >= CANDIDATE_DUPLICATE_SIMILARITY_BASIS_POINTS
+                })
+                .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+            if let Some((similarity_basis_points, duplicate_of_candidate_id)) = best {
+                duplicates.push(CandidateBuildDuplicatePreparation {
+                    checkpoint_id: material.checkpoint_id,
+                    claim_id: material.claim_id,
+                    duplicate_of_candidate_id,
+                    similarity_basis_points,
+                });
+            }
+        }
+        Ok(duplicates)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1378,6 +2510,21 @@ impl Runtime {
                 "Candidate Builder source Work Episode must be closed",
             ));
         };
+        // Everything the ACK deliberately skipped happens here, once per Episode: place the path
+        // spellings the Claims carried, then compare what this Task was injected with against what
+        // it claimed. Both are best-effort derivations over text the Agent wrote for itself.
+        let episode = if self.derive_episode_claim_references(&episode)? {
+            self.tasks
+                .read_work_episode(episode_id)?
+                .ok_or_else(|| invariant("Candidate Builder source Work Episode disappeared"))?
+        } else {
+            episode
+        };
+        let _ = self.record_episode_context_usage(&episode);
+        // The question this Task was working on, read once and attached to every Candidate this
+        // Build produces: it is the retrieval column a later Task asks its question against, so it
+        // belongs on the draft a reviewer sees, not only on the confirmed revision.
+        let problem_view = self.episode_problem_view(&episode)?;
         let final_checkpoint = episode
             .checkpoints
             .iter()
@@ -1388,14 +2535,14 @@ impl Runtime {
             .iter()
             .map(|checkpoint| checkpoint.claims.len())
             .sum::<usize>();
-        let materials = if claim_count == 0 {
-            Vec::new()
+        let (materials, duplicates) = if claim_count == 0 {
+            (Vec::new(), Vec::new())
         } else {
             let snapshot = self.snapshot()?;
             let signals = self
                 .tasks
                 .read_signal_history(episode.episode.task_session_id)?;
-            episode
+            let materials = episode
                 .checkpoints
                 .iter()
                 .flat_map(|checkpoint| {
@@ -1407,32 +2554,51 @@ impl Runtime {
                             claim,
                             &signals,
                             &snapshot,
+                            problem_view.as_deref(),
                         )
                     })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let duplicates = self.deduplicated_claims(&episode, &materials, &snapshot)?;
+            (materials, duplicates)
         };
+        let deduplicated = duplicates
+            .iter()
+            .map(|duplicate| duplicate.claim_id)
+            .collect::<BTreeSet<_>>();
         let preparations = materials
             .iter()
+            .filter(|material| !deduplicated.contains(&material.claim_id))
             .map(|material| material.preparation(&episode.episode.ownership()))
             .collect::<Vec<_>>();
-        let mut build = self
-            .tasks
-            .prepare_candidate_build(episode_id, &preparations)?;
+        let mut build = self.tasks.prepare_candidate_build_with_duplicates(
+            episode_id,
+            &preparations,
+            &duplicates,
+        )?;
         let materials = materials
             .iter()
             .map(|material| (material.claim_id, material))
             .collect::<BTreeMap<_, _>>();
-        for item in build.items.clone() {
+        // Analysis is deferred to one pass after every Candidate of this Episode is committed:
+        // it reads the Knowledge Store but writes only local analysis rows, so running it once
+        // over one Domain Snapshot is equivalent to running it per Candidate, minus N-1 full
+        // projection reads. Sibling Candidates of the same build are never analysis targets
+        // (targets come from Spaces, which an unconfirmed Candidate has not joined), so the
+        // deferral cannot change what any Candidate is compared against.
+        let mut pending_analysis = Vec::new();
+        let mut submissions = Vec::new();
+        for item in &build.items {
             if item.status.is_finalized() {
                 if let Some(candidate_id) = item.candidate_id
-                    && self.tasks.read_candidate_analysis(candidate_id)?.is_none()
+                    && self
+                        .tasks
+                        .read_candidate_analysis(candidate_id)?
+                        .is_none_or(|view| {
+                            view.candidate.analysis.status != CandidateAnalysisStatus::Complete
+                        })
                 {
-                    self.analyze_candidate(&CandidateAnalyzeInput {
-                        candidate_id: candidate_id.to_string(),
-                        token_budget: default_candidate_analysis_token_budget(),
-                        top_k: default_candidate_analysis_top_k(),
-                    })?;
+                    pending_analysis.push(candidate_id);
                 }
                 continue;
             }
@@ -1446,43 +2612,58 @@ impl Runtime {
                 .draft
                 .as_ref()
                 .ok_or_else(|| invariant("prepared Candidate Build item lacks a draft"))?;
-            match self.store.submit_candidate(CandidateSubmissionRequest {
+            submissions.push(CandidateSubmissionRequest {
                 submission_id: item.submission_id,
                 source_episode: episode.episode.ownership(),
                 content: draft.clone(),
-            }) {
-                Ok(outcome) => {
-                    let submission_status = match outcome.status {
-                        CandidateSubmissionStatus::Created => CandidateBuildItemStatus::Created,
-                        CandidateSubmissionStatus::AlreadyExists => {
-                            CandidateBuildItemStatus::AlreadyExists
-                        }
-                    };
-                    build = self.tasks.record_candidate_build_item_result(
-                        build.build_id,
-                        item.submission_id,
-                        submission_status,
-                        Some(outcome.record.candidate_id),
-                        Some(outcome.record.event_id),
-                        None,
-                    )?;
-                    self.analyze_candidate(&CandidateAnalyzeInput {
-                        candidate_id: outcome.record.candidate_id.to_string(),
-                        token_budget: default_candidate_analysis_token_budget(),
-                        top_k: default_candidate_analysis_top_k(),
-                    })?;
+            });
+        }
+        // One lock cycle, one index synchronization pair, one journal and one Git commit carry
+        // every Candidate this Episode still owes. Each Candidate keeps its own SubmissionId
+        // idempotency and its own Writer batch id, so replaying the build returns exactly the
+        // same Candidate identities and writes nothing.
+        for chunk in submissions.chunks(MAX_CANDIDATE_SUBMISSION_BATCH) {
+            for (submission_id, result) in self.submit_candidate_chunk(chunk)? {
+                match result {
+                    Ok(record) => {
+                        let submission_status = match record.status {
+                            CandidateSubmissionStatus::Created => CandidateBuildItemStatus::Created,
+                            CandidateSubmissionStatus::AlreadyExists => {
+                                CandidateBuildItemStatus::AlreadyExists
+                            }
+                        };
+                        build = self.tasks.record_candidate_build_item_result(
+                            build.build_id,
+                            submission_id,
+                            submission_status,
+                            Some(record.candidate_id),
+                            Some(record.event_id),
+                            None,
+                        )?;
+                        pending_analysis.push(record.candidate_id);
+                    }
+                    Err(error_code) => {
+                        build = self.tasks.record_candidate_build_item_result(
+                            build.build_id,
+                            submission_id,
+                            CandidateBuildItemStatus::Failed,
+                            None,
+                            None,
+                            Some(error_code),
+                        )?;
+                    }
                 }
-                Err(error) => {
-                    let error_code = candidate_builder_error_code(&error);
-                    build = self.tasks.record_candidate_build_item_result(
-                        build.build_id,
-                        item.submission_id,
-                        CandidateBuildItemStatus::Failed,
-                        None,
-                        None,
-                        Some(error_code),
-                    )?;
-                }
+            }
+        }
+        if !pending_analysis.is_empty() {
+            let snapshot = self.snapshot()?;
+            for candidate_id in pending_analysis {
+                self.analyze_candidate_in_snapshot(
+                    candidate_id,
+                    default_candidate_analysis_token_budget(),
+                    default_candidate_analysis_top_k(),
+                    &snapshot,
+                )?;
             }
         }
         let mut response = candidate_build_response(build, &materials)?;
@@ -1501,7 +2682,97 @@ impl Runtime {
         Ok(response)
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Submits one Candidate slice atomically, degrading to per-Candidate writes on rejection.
+    ///
+    /// The batch entry point rejects the whole slice when one member is at fault, so a rejected
+    /// batch is retried one Candidate at a time. That keeps the pre-batch Builder behaviour where
+    /// exactly the offending Candidate is recorded as `Failed` and its siblings still land.
+    #[allow(clippy::type_complexity)]
+    fn submit_candidate_chunk(
+        &self,
+        requests: &[CandidateSubmissionRequest],
+    ) -> Result<
+        Vec<(
+            SubmissionId,
+            std::result::Result<CandidateSubmissionOutcomeRecord, &'static str>,
+        )>,
+    > {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Ok(write) = self.store()?.submit_candidates(requests) {
+            return Ok(write
+                .entries
+                .into_iter()
+                .map(|entry| {
+                    (
+                        entry.submission_id,
+                        Ok(CandidateSubmissionOutcomeRecord {
+                            candidate_id: entry.record.candidate_id,
+                            event_id: entry.record.event_id,
+                            status: entry.status,
+                        }),
+                    )
+                })
+                .collect());
+        }
+        let mut results = Vec::with_capacity(requests.len());
+        for request in requests {
+            let submission_id = request.submission_id;
+            let result = match self.store()?.submit_candidate(request.clone()) {
+                Ok(outcome) => Ok(CandidateSubmissionOutcomeRecord {
+                    candidate_id: outcome.record.candidate_id,
+                    event_id: outcome.record.event_id,
+                    status: outcome.status,
+                }),
+                Err(error) => Err(candidate_builder_error_code(&error)),
+            };
+            results.push((submission_id, result));
+        }
+        Ok(results)
+    }
+
+    fn recover_candidate_build_episode(&self, episode_id: WorkEpisodeId) -> Result<bool> {
+        match self.build_closed_episode(episode_id) {
+            Ok(build) => {
+                self.tasks
+                    .record_candidate_build_recovery_attempt(episode_id, None)?;
+                Ok(build.status == CandidateBuildResponseStatus::Complete)
+            }
+            Err(error) => {
+                self.tasks.record_candidate_build_recovery_attempt(
+                    episode_id,
+                    Some(candidate_builder_error_code(&error)),
+                )?;
+                Ok(false)
+            }
+        }
+    }
+
+    fn recover_candidate_builds(
+        &self,
+        locator: &ExternalSessionLocator,
+    ) -> Result<CandidateRecoverySummary> {
+        let episodes = self
+            .tasks
+            .list_recoverable_candidate_build_episodes(locator, MAX_RECOVERABLE_BUILDS_PER_READ)?;
+        let mut summary = CandidateRecoverySummary {
+            attempted: episodes.len(),
+            ..CandidateRecoverySummary::default()
+        };
+        for episode_id in episodes {
+            if self.recover_candidate_build_episode(episode_id)? {
+                summary.recovered += 1;
+            } else {
+                summary.failed_attempts += 1;
+            }
+        }
+        let current = self.tasks.candidate_build_recovery_status(locator)?;
+        summary.pending = current.pending;
+        summary.incomplete = current.incomplete;
+        Ok(summary)
+    }
+
     fn analyze_candidate(&self, input: &CandidateAnalyzeInput) -> Result<CandidateAnalyzeResponse> {
         if input.token_budget < MIN_CANDIDATE_ANALYSIS_TOKEN_BUDGET
             || input.token_budget > MAX_CANDIDATE_ANALYSIS_TOKEN_BUDGET
@@ -1512,6 +2783,21 @@ impl Runtime {
         }
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
         let snapshot = self.snapshot()?;
+        self.analyze_candidate_in_snapshot(candidate_id, input.token_budget, input.top_k, &snapshot)
+    }
+
+    /// Analyzes one Candidate against an already read Domain Snapshot.
+    ///
+    /// Analysis only reads the Knowledge Store and writes local analysis rows, so several
+    /// Candidates committed by the same Git commit share one snapshot read.
+    #[allow(clippy::too_many_lines)]
+    fn analyze_candidate_in_snapshot(
+        &self,
+        candidate_id: CandidateId,
+        token_budget: usize,
+        top_k: usize,
+        snapshot: &DomainSnapshot,
+    ) -> Result<CandidateAnalyzeResponse> {
         let persisted = snapshot
             .projection
             .candidates
@@ -1560,6 +2846,15 @@ impl Runtime {
             .find(|revision| revision.revision_id == source_intent_id)
             .map(|revision| revision.working_intent.clone())
             .ok_or_else(|| invariant("Candidate source Intent revision disappeared"))?;
+        let proposed_space_group_key = ProposedSpaceGroupKey::from_task(task.task_id);
+        let proposed_space_group_space_id = self
+            .tasks
+            .read_proposed_space_group(proposed_space_group_key)?
+            .filter(|mapping| {
+                mapping.status == ProposedSpaceGroupMappingStatus::Committed
+                    && mapping.candidate_id != persisted.candidate_id
+            })
+            .map(|mapping| mapping.space_id);
         let signal_history = self
             .tasks
             .read_signal_history(episode.episode.task_session_id)?;
@@ -1569,21 +2864,26 @@ impl Runtime {
             checkpoint,
             claim,
             &signal_history,
-            &snapshot,
+            snapshot,
+            compose_problem_view(&source_intent).as_deref(),
         );
         let engine = self.engineering_graph.as_ref().map_or_else(
             || SearchEngine::new(self.index.clone()),
             |graph| SearchEngine::with_engineering_graph(self.index.clone(), graph.clone()),
         );
         let derived = engine.analyze_candidate(&CandidateAnalysisRequest {
+            has_blocking_unknowns: material.unknowns.iter().any(|unknown| unknown.blocking),
             candidate: persisted.clone(),
             source_task_id: task.task_id,
+            source_intent_revision_id: source_intent_id,
             source_working_intent: source_intent,
             source_task_signals: task.task_signals.clone(),
-            explicit_related_contexts: claim.related_contexts.clone(),
-            artifact_refs: claim.artifact_refs.clone(),
-            token_budget: input.token_budget,
-            top_k: input.top_k,
+            explicit_related_contexts: Vec::new(),
+            // Server-derived References supply the Claim's Artifact coordinates to analysis.
+            artifact_refs: candidate_artifact_refs(claim),
+            proposed_space_group_space_id,
+            token_budget,
+            top_k,
         });
         let mut checkpoint_ids = vec![item.checkpoint_id];
         if !checkpoint_ids.contains(&build.final_checkpoint_id) {
@@ -1593,9 +2893,9 @@ impl Runtime {
             .evidence_refs
             .iter()
             .filter_map(|evidence| match evidence {
-                CaptureEvidenceRef::Observation { observation_id } => Some(*observation_id),
-                CaptureEvidenceRef::TaskSignal { .. }
-                | CaptureEvidenceRef::ContextEvidence { .. } => None,
+                CheckpointEvidenceRef::Observation { observation_id } => Some(*observation_id),
+                CheckpointEvidenceRef::TaskSignal { .. }
+                | CheckpointEvidenceRef::ContextEvidence { .. } => None,
             })
             .collect::<Vec<_>>();
         let provenance = CandidateBuilderProvenance {
@@ -1603,6 +2903,7 @@ impl Runtime {
             source_episode: episode.episode.ownership(),
             checkpoint_ids,
             observation_ids,
+            engineering_references: claim.engineering_references.clone(),
         };
         let unknowns = material.unknowns;
         let (analysis, recommendations, confidence, mut status) = match derived {
@@ -1643,6 +2944,11 @@ impl Runtime {
             status,
         )?;
         let view = self.tasks.replace_candidate_analysis(&candidate)?;
+        // Late reuse signal, recorded wherever an analysis is produced: Candidate Build's deferred
+        // pass, `candidate_analyze`, and the `candidate_get` recovery path all land here. Best
+        // effort, like every other usage record: a Candidate the analyzer could relate to a
+        // Context this Task was given must never be reported as an omission of that Context.
+        let _ = self.record_analysis_context_usage(task.task_id, &view.candidate.analysis);
         Ok(CandidateAnalyzeResponse {
             analysis_generation: view.analysis_generation,
             candidate: view.candidate,
@@ -1650,6 +2956,14 @@ impl Runtime {
     }
 
     fn candidate_list(&self, input: &CandidateListInput) -> Result<CandidateListResponse> {
+        self.candidate_list_with_detail(input, ContextPackDetailLevel::Full)
+    }
+
+    fn candidate_list_with_detail(
+        &self,
+        input: &CandidateListInput,
+        detail_level: ContextPackDetailLevel,
+    ) -> Result<CandidateListResponse> {
         if input.token_budget < MIN_CANDIDATE_REVIEW_TOKEN_BUDGET
             || input.token_budget > MAX_CANDIDATE_REVIEW_TOKEN_BUDGET
         {
@@ -1658,14 +2972,18 @@ impl Runtime {
             ));
         }
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
-        let page = self.tasks.list_candidate_reviews(
+        let recovery = self.recover_candidate_builds(&locator)?;
+        let page = self.tasks.list_candidate_reviews_in_scope(
             &locator,
+            input.scope,
             input.status,
             input.limit,
             input.cursor.as_deref(),
         )?;
         let snapshot = self.snapshot()?;
+        let provisional_space_ids = provisional_space_ids(&snapshot);
         let mut reviews = Vec::new();
+        let mut compact_reviews = Vec::new();
         let mut omitted = Vec::new();
         let mut estimated_tokens = 0_usize;
         for record in page.records {
@@ -1683,7 +3001,16 @@ impl Runtime {
             }
             let summary =
                 CandidateReviewSummary::from(self.candidate_review_view(&record, &snapshot)?);
-            let tokens = estimate_candidate_review_tokens(&summary)?;
+            // Only a Session-scoped page names each row's Task: inside one Task the answer is the
+            // Task the caller itself passed, and repeating it would spend Pack budget on nothing.
+            let source_task_id = (input.scope == CandidateReviewScope::Session)
+                .then_some(record.source_episode.task_id);
+            let compact =
+                compact_candidate_review(&summary.0, source_task_id, &provisional_space_ids);
+            let tokens = match detail_level {
+                ContextPackDetailLevel::Full => estimate_candidate_review_tokens(&summary)?,
+                ContextPackDetailLevel::Compact => estimate_candidate_review_tokens(&compact)?,
+            };
             if estimated_tokens.saturating_add(tokens) > input.token_budget {
                 omitted.push(CandidateReviewOmitted {
                     candidate_id: record.candidate_id,
@@ -1693,26 +3020,65 @@ impl Runtime {
             } else {
                 estimated_tokens = estimated_tokens.saturating_add(tokens);
                 reviews.push(summary);
+                compact_reviews.push(compact);
             }
+        }
+        if detail_level == ContextPackDetailLevel::Full {
+            compact_reviews.clear();
         }
         Ok(CandidateListResponse {
             reviews,
+            detail_level,
+            compact_reviews,
+            provisional_space_ids,
             omitted,
             next_cursor: page.next_cursor,
             estimated_tokens,
             token_budget: input.token_budget,
+            recovery,
         })
     }
 
     fn candidate_get(&self, input: &CandidateGetInput) -> Result<CandidateReviewView> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
-        let record = self
-            .tasks
-            .read_candidate_review(&locator, candidate_id)?
-            .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
+        let mut record = self.tasks.read_candidate_review(&locator, candidate_id)?;
+        let target_episode = if let Some(record) = &record {
+            self.tasks
+                .read_candidate_analysis(candidate_id)?
+                .is_none_or(|view| {
+                    view.candidate.analysis.status != CandidateAnalysisStatus::Complete
+                })
+                .then_some(record.source_episode.episode_id)
+        } else {
+            let snapshot = self.snapshot()?;
+            snapshot
+                .projection
+                .candidates
+                .get(&candidate_id)
+                .map(|candidate| candidate.candidate.source_episode.episode_id)
+        };
+        if let Some(episode_id) = target_episode
+            && self
+                .tasks
+                .owns_candidate_recovery_episode(&locator, episode_id)?
+        {
+            let _recovered = self.recover_candidate_build_episode(episode_id)?;
+            record = self.tasks.read_candidate_review(&locator, candidate_id)?;
+        }
+        let record = record.ok_or_else(|| {
+            invalid(
+                "Candidate Review does not exist or recovery remains pending for the ActiveTask",
+            )
+        })?;
         let snapshot = self.snapshot()?;
-        self.candidate_review_view(&record, &snapshot)
+        let view = self.candidate_review_view(&record, &snapshot)?;
+        if view.analysis.status != CandidateAnalysisStatus::Complete {
+            return Err(invalid(
+                "Candidate Review recovery remains pending for the ActiveTask",
+            ));
+        }
+        Ok(view)
     }
 
     fn candidate_discard(&self, input: &CandidateDiscardInput) -> Result<CandidateDiscardResponse> {
@@ -1738,6 +3104,7 @@ impl Runtime {
                 candidate_id: parse_id_value(&input.candidate_id, "candidate_id")?,
                 expected_review_version: input.expected_review_version,
                 reason: input.reason.clone(),
+                decision_source: input.decision_source,
             })?;
         let snapshot = self.snapshot()?;
         let review = self.candidate_review_view(&outcome.record, &snapshot)?;
@@ -1754,7 +3121,55 @@ impl Runtime {
         })
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Discards several owned Pending Candidates in one atomic Runtime transaction.
+    fn candidate_discard_batch(
+        &self,
+        input: &CandidateDiscardBatchInput,
+    ) -> Result<CandidateDiscardBatchResponse> {
+        let scan = PrivacyScanner::default().scan(&input.reason)?;
+        if !scan.is_clean() {
+            return Err(Error::new(
+                ErrorKind::PrivacyRejected,
+                "Candidate discard reason failed the privacy boundary",
+            ));
+        }
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
+        let expected_intent_revision_id = parse_id_value(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let requests = parse_batch_candidate_ids(&input.candidate_ids)?
+            .into_iter()
+            .map(|candidate_id| CandidateReviewDiscard {
+                locator: locator.clone(),
+                expected_task_id,
+                expected_intent_revision_id,
+                candidate_id,
+                expected_review_version: input.expected_review_version,
+                reason: input.reason.clone(),
+                decision_source: input.decision_source,
+            })
+            .collect::<Vec<_>>();
+        let outcomes = self.tasks.discard_candidate_reviews(&requests)?;
+        let snapshot = self.snapshot()?;
+        let reviews = outcomes
+            .iter()
+            .map(|outcome| self.candidate_review_view(&outcome.record, &snapshot))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(CandidateDiscardBatchResponse {
+            status: if outcomes
+                .iter()
+                .all(|outcome| outcome.status == CandidateReviewDiscardStatus::AlreadyDiscarded)
+            {
+                CandidateDiscardResponseStatus::AlreadyDiscarded
+            } else {
+                CandidateDiscardResponseStatus::Discarded
+            },
+            reviews,
+        })
+    }
+
     fn candidate_confirm(&self, input: &CandidateConfirmInput) -> Result<CandidateConfirmResponse> {
         let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
         let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
@@ -1763,9 +3178,150 @@ impl Runtime {
             "expected_intent_revision_id",
         )?;
         let candidate_id = parse_id_value(&input.candidate_id, "candidate_id")?;
+        let snapshot = self.snapshot()?;
+        let provenance = self.confirmation_provenance(&locator, input.decision_source);
+        let prepared = self
+            .prepare_candidate_confirmation(
+                &snapshot,
+                &locator,
+                candidate_id,
+                input.expected_review_version,
+                &input.primary,
+                &input.related_space_ids,
+                &input.edits,
+                input.decision_source,
+            )
+            .inspect_err(|error| {
+                self.record_auto_confirm_rejection(&provenance, candidate_id, error);
+            })?;
+        self.commit_candidate_confirmation(
+            &locator,
+            expected_task_id,
+            expected_intent_revision_id,
+            prepared,
+            &provenance,
+        )
+    }
+
+    /// Confirms several owned Pending Candidates under one Space organization.
+    ///
+    /// Every Candidate is fully validated and planned before the first Git write, so a rejected
+    /// batch writes nothing and names the exact Candidate that failed. Field edits and a proposed
+    /// new Space are Candidate-scoped and stay single-Candidate operations.
+    fn candidate_confirm_batch(
+        &self,
+        input: &CandidateConfirmBatchInput,
+    ) -> Result<CandidateConfirmBatchResponse> {
+        let locator = ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)?;
+        let expected_task_id = parse_id_value(&input.expected_task_id, "expected_task_id")?;
+        let expected_intent_revision_id = parse_id_value(
+            &input.expected_intent_revision_id,
+            "expected_intent_revision_id",
+        )?;
+        let candidate_ids = parse_batch_candidate_ids(&input.candidate_ids)?;
+        if matches!(input.primary, CandidateConfirmPrimaryInput::Proposed(_)) {
+            return Err(invalid(
+                "batch candidate_confirm requires existing_space_id; a proposed new Space recommendation identifies one Candidate only",
+            ));
+        }
+        let snapshot = self.snapshot()?;
+        let provenance = self.confirmation_provenance(&locator, input.decision_source);
+        let mut prepared = Vec::with_capacity(candidate_ids.len());
+        // Every member is validated against the permission surface before the first reservation,
+        // so an automatic batch with one member outside it writes nothing and names that member.
+        for (position, candidate_id) in candidate_ids.iter().enumerate() {
+            prepared.push(
+                self.prepare_candidate_confirmation(
+                    &snapshot,
+                    &locator,
+                    *candidate_id,
+                    input.expected_review_version,
+                    &input.primary,
+                    &input.related_space_ids,
+                    &OptionalCandidateEdits::default(),
+                    input.decision_source,
+                )
+                .inspect_err(|error| {
+                    self.record_auto_confirm_rejection(&provenance, *candidate_id, error);
+                })
+                .map_err(|error| batch_preparation_error(position, *candidate_id, &error))?,
+            );
+        }
+        let mut reserved = Vec::with_capacity(prepared.len());
+        for (position, prepared) in prepared.into_iter().enumerate() {
+            let candidate_id = prepared.candidate_id;
+            reserved.push(
+                self.reserve_candidate_confirmation(
+                    &locator,
+                    expected_task_id,
+                    expected_intent_revision_id,
+                    prepared,
+                )
+                .map_err(|error| batch_preparation_error(position, candidate_id, &error))?,
+            );
+        }
+        // One Confirmation lock, one Writer batch, one Git commit for the whole slice: a rejected
+        // member leaves no Candidate written, and every accepted member shares one commit.
+        let plans = reserved
+            .iter()
+            .map(|reserved| reserved.plan.clone())
+            .collect::<Vec<_>>();
+        let write = self
+            .store()?
+            .confirm_candidates_with_provenance(&plans, &provenance)?;
+        let finalized = self.tasks.finalize_candidate_confirmations(
+            &write
+                .entries
+                .iter()
+                .map(|entry| CandidateConfirmationFinalize {
+                    candidate_id: entry.candidate_id,
+                    operation_hash: entry.record.operation_hash.clone(),
+                    confirmation_id: entry.record.confirmation_id,
+                    result_context_id: entry.record.result_context_id,
+                    decision_source: input.decision_source,
+                })
+                .collect::<Vec<_>>(),
+        )?;
+        let written = write
+            .entries
+            .into_iter()
+            .zip(&finalized)
+            .map(|(entry, finalized)| WrittenCandidateConfirmation {
+                append: entry.append,
+                already_confirmed: finalized.already_confirmed
+                    || entry.status == CandidateConfirmationWriteStatus::AlreadyExists,
+            })
+            .collect::<Vec<_>>();
+        let confirmations =
+            self.finish_candidate_confirmations(expected_task_id, reserved, written)?;
+        Ok(CandidateConfirmBatchResponse {
+            status: if confirmations.iter().all(|confirmation| {
+                confirmation.status == CandidateConfirmResponseStatus::AlreadyConfirmed
+            }) {
+                CandidateConfirmResponseStatus::AlreadyConfirmed
+            } else {
+                CandidateConfirmResponseStatus::Confirmed
+            },
+            confirmations,
+        })
+    }
+
+    /// Validates one Candidate Confirmation and reserves nothing.
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+    fn prepare_candidate_confirmation(
+        &self,
+        snapshot: &DomainSnapshot,
+        locator: &ExternalSessionLocator,
+        candidate_id: sctx_domain::CandidateId,
+        expected_review_version: u64,
+        primary: &CandidateConfirmPrimaryInput,
+        related_space_ids: &[String],
+        edits: &OptionalCandidateEdits,
+        decision_source: DecisionSource,
+    ) -> Result<PreparedCandidateConfirmation> {
         let review_record = self
             .tasks
-            .read_candidate_review(&locator, candidate_id)?
+            .read_candidate_review(locator, candidate_id)?
             .ok_or_else(|| invalid("Candidate Review does not exist for the ActiveTask"))?;
         if !matches!(
             review_record.status,
@@ -1776,8 +3332,7 @@ impl Runtime {
                 "Only an owned Pending Candidate Review can be confirmed",
             ));
         }
-        let snapshot = self.snapshot()?;
-        let review = self.candidate_review_view(&review_record, &snapshot)?;
+        let review = self.candidate_review_view(&review_record, snapshot)?;
         if review.analysis.status != CandidateAnalysisStatus::Complete
             || review.analysis_generation.is_none()
             || matches!(
@@ -1789,54 +3344,103 @@ impl Runtime {
                 "Candidate Confirmation requires complete current analysis and reviewable Evidence",
             ));
         }
-        let (primary_reference, resolved_primary, primary_space_id) = match &input.primary {
-            CandidateConfirmPrimaryInput::Existing(existing) => {
-                let space_id = parse_id_value(&existing.existing_space_id, "existing_space_id")?;
-                if !snapshot.projection.spaces.contains_key(&space_id) {
-                    return Err(invalid(
-                        "Candidate Confirmation Primary Space does not exist",
-                    ));
+        // The server-enforced surface for an Agent-decided confirmation, checked before any
+        // reservation and against derived values only. A human confirmation reaches none of this,
+        // so its behavior is unchanged in every byte.
+        if decision_source == DecisionSource::AgentPolicy {
+            require_auto_confirm_permitted(&review, edits)?;
+        }
+        let (primary_reference, resolved_primary, primary_space_id, proposed_space_group_key) =
+            match primary {
+                CandidateConfirmPrimaryInput::Existing(existing) => {
+                    let space_id =
+                        parse_id_value(&existing.existing_space_id, "existing_space_id")?;
+                    if !snapshot.projection.spaces.contains_key(&space_id) {
+                        return Err(invalid(
+                            "Candidate Confirmation Primary Space does not exist",
+                        ));
+                    }
+                    (
+                        CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
+                        CandidatePrimarySelection::Existing { space_id },
+                        Some(space_id),
+                        None,
+                    )
                 }
-                (
-                    CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
-                    CandidatePrimarySelection::Existing { space_id },
-                    Some(space_id),
-                )
-            }
-            CandidateConfirmPrimaryInput::Proposed(proposed) => {
-                let recommendation_id = parse_id_value::<SpaceRecommendationId>(
-                    &proposed.new_space_recommendation_id,
-                    "new_space_recommendation_id",
-                )?;
-                let intent = review
-                    .space_recommendations
-                    .iter()
-                    .find_map(|recommendation| match recommendation {
-                        CandidateSpaceRecommendation::ProposedNewSpaceIntent {
-                            recommendation_id: actual,
-                            proposed_new_space_intent,
-                            ..
-                        } if *actual == recommendation_id => {
-                            Some(proposed_new_space_intent.clone())
-                        }
-                        _ => None,
-                    })
+                CandidateConfirmPrimaryInput::Proposed(proposed) => {
+                    let recommendation_id = parse_id_value::<SpaceRecommendationId>(
+                        &proposed.new_space_recommendation_id,
+                        "new_space_recommendation_id",
+                    )?;
+                    let find_proposed = |recommendations: &[CandidateSpaceRecommendation]| {
+                        recommendations
+                            .iter()
+                            .find_map(|recommendation| match recommendation {
+                                CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                                    recommendation_id: actual,
+                                    proposed_space_group_key,
+                                    proposed_new_space_intent,
+                                    ..
+                                } if *actual == recommendation_id => Some((
+                                    proposed_new_space_intent.clone(),
+                                    proposed_space_group_key.as_ref().copied()?,
+                                )),
+                                _ => None,
+                            })
+                    };
+                    // Once a sibling Candidate of this Task has opened the proposed Space,
+                    // `candidate_review_view` replaces the proposal with the resolved Space, so the
+                    // recommendation a caller was handed earlier is no longer in the current view.
+                    // It is still the analysis the server itself produced, so fall back to it and
+                    // land in the Space the group already opened rather than rejecting a caller
+                    // who cannot repair the identity on its own.
+                    let analyzed = self
+                        .tasks
+                        .read_candidate_analysis(candidate_id)?
+                        .map(|view| view.candidate.space_recommendations)
+                        .unwrap_or_default();
+                    let (intent, proposed_space_group_key) = find_proposed(
+                        &review.space_recommendations,
+                    )
+                    .or_else(|| find_proposed(&analyzed))
                     .ok_or_else(|| {
                         invalid(
-                            "new_space_recommendation_id is not an exact current proposed recommendation",
+                            "new_space_recommendation_id is not a proposed recommendation this \
+                             Candidate analysis produced: use candidate_get to refresh \
+                             recommendations, or confirm into an existing Space with \
+                             primary.existing_space_id",
                         )
                     })?;
-                (
-                    CandidateConfirmationPrimaryReference::ProposedRecommendation {
-                        recommendation_id,
-                    },
-                    CandidatePrimarySelection::ProposedNew { intent },
-                    None,
-                )
-            }
-        };
-        let related_space_ids = input
-            .related_space_ids
+                    let committed = self
+                        .tasks
+                        .read_proposed_space_group(proposed_space_group_key)?
+                        .filter(|mapping| {
+                            mapping.status == ProposedSpaceGroupMappingStatus::Committed
+                                && mapping.candidate_id != candidate_id
+                                && snapshot.projection.spaces.contains_key(&mapping.space_id)
+                        })
+                        .map(|mapping| mapping.space_id);
+                    committed.map_or(
+                        (
+                            CandidateConfirmationPrimaryReference::ProposedRecommendation {
+                                recommendation_id,
+                            },
+                            CandidatePrimarySelection::ProposedNew { intent },
+                            None,
+                            Some(proposed_space_group_key),
+                        ),
+                        |space_id| {
+                            (
+                                CandidateConfirmationPrimaryReference::ExistingSpace { space_id },
+                                CandidatePrimarySelection::Existing { space_id },
+                                Some(space_id),
+                                None,
+                            )
+                        },
+                    )
+                }
+            };
+        let related_space_ids = related_space_ids
             .iter()
             .map(|value| parse_id_value::<SpaceId>(value, "related_space_ids"))
             .collect::<Result<Vec<_>>>()?;
@@ -1860,7 +3464,47 @@ impl Runtime {
             .get(&candidate_id)
             .map(|projection| &projection.candidate)
             .ok_or_else(|| invalid("Candidate Confirmation payload is unavailable"))?;
-        let final_draft = input.edits.apply(&persisted.content)?;
+        // Derived, overridable `problem_view`: Candidate Build already attaches the question the
+        // source Task was answering, so this only fills the field for a Candidate built before it
+        // did, and never derives a second answer over the first. An explicit `edits.problem_view`
+        // always wins, `clear` included.
+        let mut edits = edits.clone();
+        if edits.problem_view.is_none()
+            && persisted.content.problem_view.is_none()
+            && let Some(value) = self.derived_problem_view(review_record.source_episode)?
+        {
+            edits.problem_view = Some(ProblemViewEdit::Set { value });
+        }
+        let edits = &edits;
+        let final_draft = edits.apply(&persisted.content)?;
+        validate_context_relation_targets(snapshot, &final_draft.relations)?;
+        // A Candidate whose strongest assessment restates a Context the knowledge base already
+        // accepted stays confirmable — only an explicit disposition (human, or agent_policy inside
+        // the server-verified surface; ADR-0005) ever produces an accepted fact, and that does not
+        // change here. What it may no longer do is land as a fresh, unrelated
+        // fact: confirming restatements that way is what left five of this repository's own nine
+        // accepted Contexts saying the same thing two or three times over. The confirmation now
+        // has to carry the decision the reviewer made — this revision replaces the Context it
+        // repeats, or it disagrees with it — and discarding the Candidate remains the third way
+        // out. An already Confirmed Review is exempt: that call is a replay finishing a
+        // confirmation Git already wrote, it admits no new fact, and refusing it would strand the
+        // Review as Pending forever behind a decision the reviewer already made.
+        if review_record.status == CandidateReviewStatus::Pending
+            && let Some(duplicate) = accepted_duplicate_target(snapshot, &review.analysis)
+            && !final_draft.relations.iter().any(|relation| {
+                relation.target_context_id == duplicate
+                    && matches!(
+                        relation.kind,
+                        ContextRelationKind::Supersedes | ContextRelationKind::Contradicts
+                    )
+            })
+        {
+            return Err(invalid(format!(
+                "{EXACT_DUPLICATE_REQUIRES_DECISION} {duplicate}. Confirm again with an \
+                 edits.relations entry of kind supersedes or contradicts whose target_context_id \
+                 is {duplicate}, or discard this Candidate through candidate_discard"
+            )));
+        }
         let final_json = serde_json::to_string(&final_draft).map_err(|error| {
             Error::new(ErrorKind::Io, format!("serialize final draft: {error}"))
         })?;
@@ -1873,52 +3517,280 @@ impl Runtime {
         }
         let operation = CandidateConfirmationOperation {
             candidate_id,
-            review_parent_version: input.expected_review_version,
+            review_parent_version: expected_review_version,
             analysis_generation: review.analysis_generation.unwrap_or_default(),
             primary: primary_reference,
             related_space_ids,
-            edits: input.edits.clone(),
+            edits: edits.clone(),
         };
-        let proposed_plan =
-            CandidateConfirmationPlan::reserve(persisted, operation, resolved_primary)?;
-        let reservation = self.tasks.reserve_candidate_confirmation(
-            &locator,
+        let final_content_hash = context_revision_content_hash(&final_draft);
+        let conflict_openings = contradiction_conflict_openings(
+            snapshot,
+            &final_draft,
+            primary_space_id,
+            &final_content_hash,
+        );
+        let proposed_plan = CandidateConfirmationPlan::reserve(
+            persisted,
+            operation,
+            resolved_primary,
+            review.engineering_references.clone(),
+            conflict_openings,
+        )?;
+        Ok(PreparedCandidateConfirmation {
+            candidate_id,
+            proposed_plan,
+            proposed_space_group_key,
+            assessments: review.analysis.assessments,
+        })
+    }
+
+    /// Assembles the provenance one Candidate Confirmation is written with.
+    ///
+    /// Nothing here can fail the confirmation: an author this installation cannot resolve and an
+    /// `ExternalSession` identifier this Runtime cannot look up are both simply omitted. Recording
+    /// who confirmed is worth having, and it is never worth refusing a decision over.
+    fn confirmation_provenance(
+        &self,
+        locator: &ExternalSessionLocator,
+        decision_source: DecisionSource,
+    ) -> ConfirmationProvenance {
+        ConfirmationProvenance {
+            decision_source,
+            author: resolve_author(&self.root),
+            external_session_id: self
+                .tasks
+                .resolve_external_session_id(locator)
+                .ok()
+                .flatten()
+                .map(|value| value.to_string()),
+        }
+    }
+
+    /// Counts one refused automatic confirmation, and only that.
+    ///
+    /// A human confirmation that fails validation is an ordinary rejected request and is not
+    /// counted here; neither is an automatic confirmation refused for some other reason. Failing
+    /// to write the counter is deliberately silent: the caller is already returning a refusal, and
+    /// replacing it with a storage error would hide the reason it was refused.
+    fn record_auto_confirm_rejection(
+        &self,
+        provenance: &ConfirmationProvenance,
+        candidate_id: sctx_domain::CandidateId,
+        error: &Error,
+    ) {
+        if provenance.decision_source != DecisionSource::AgentPolicy
+            || !error.message().starts_with(AUTO_CONFIRM_NOT_PERMITTED)
+        {
+            return;
+        }
+        let external_session_id = provenance
+            .external_session_id
+            .as_deref()
+            .and_then(|value| value.parse().ok());
+        let _ = self.tasks.record_auto_confirm_rejection(
+            candidate_id,
+            external_session_id,
+            "auto_confirm_not_permitted",
+            error.message(),
+        );
+    }
+
+    /// Reserves, writes and finalizes one already validated Candidate Confirmation.
+    fn commit_candidate_confirmation(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+        prepared: PreparedCandidateConfirmation,
+        provenance: &ConfirmationProvenance,
+    ) -> Result<CandidateConfirmResponse> {
+        let reserved = self.reserve_candidate_confirmation(
+            locator,
             expected_task_id,
             expected_intent_revision_id,
-            &proposed_plan,
+            prepared,
         )?;
-        let plan = reservation.operation.plan;
-        let write = self.store.confirm_candidate(&plan)?;
+        let write = self
+            .store()?
+            .confirm_candidate_with_provenance(&reserved.plan, provenance)?;
         let finalized = self.tasks.finalize_candidate_confirmation(
-            candidate_id,
-            &plan.operation_hash,
+            reserved.candidate_id,
+            &reserved.plan.operation_hash,
             write.record.confirmation_id,
             write.record.result_context_id,
+            provenance.decision_source,
         )?;
-        let snapshot = self.snapshot()?;
-        let status = if finalized.already_confirmed
-            || write.status == CandidateConfirmationWriteStatus::AlreadyExists
-        {
-            CandidateConfirmResponseStatus::AlreadyConfirmed
-        } else {
-            CandidateConfirmResponseStatus::Confirmed
-        };
-        Ok(CandidateConfirmResponse {
-            status,
-            created: status == CandidateConfirmResponseStatus::Confirmed,
-            candidate_id,
-            confirmation_id: plan.confirmation.confirmation_id,
-            context_id: plan.result_context_id,
-            revision_id: plan.result_revision.revision_id,
-            primary_space_id: plan.confirmation.primary_space_id,
-            related_space_ids: plan.confirmation.related_space_ids,
-            batch_id: write.append.batch_id,
-            commit_oid: write.append.commit_oid,
-            event_ids: write.append.event_ids,
-            indexed_tree_oid: snapshot.metadata.indexed_tree_oid,
-            projection_generation: snapshot.metadata.projection_generation,
-            assessment_acknowledgments: review.analysis.assessments,
+        let written = vec![WrittenCandidateConfirmation {
+            append: write.append,
+            already_confirmed: finalized.already_confirmed
+                || write.status == CandidateConfirmationWriteStatus::AlreadyExists,
+        }];
+        self.finish_candidate_confirmations(expected_task_id, vec![reserved], written)?
+            .pop()
+            .ok_or_else(|| invariant("Candidate Confirmation produced no response"))
+    }
+
+    /// Reserves one server-owned plan without writing any Git fact.
+    fn reserve_candidate_confirmation(
+        &self,
+        locator: &ExternalSessionLocator,
+        expected_task_id: TaskId,
+        expected_intent_revision_id: TaskIntentRevisionId,
+        prepared: PreparedCandidateConfirmation,
+    ) -> Result<ReservedCandidateConfirmation> {
+        let reservation = self.tasks.reserve_candidate_confirmation(
+            locator,
+            expected_task_id,
+            expected_intent_revision_id,
+            &prepared.proposed_plan,
+            prepared.proposed_space_group_key,
+        )?;
+        Ok(ReservedCandidateConfirmation {
+            candidate_id: prepared.candidate_id,
+            plan: reservation.operation.plan,
+            assessments: prepared.assessments,
         })
+    }
+
+    /// Records usage, refreshes derived state once, and answers for every written Confirmation.
+    fn finish_candidate_confirmations(
+        &self,
+        expected_task_id: TaskId,
+        reserved: Vec<ReservedCandidateConfirmation>,
+        written: Vec<WrittenCandidateConfirmation>,
+    ) -> Result<Vec<CandidateConfirmResponse>> {
+        if reserved.len() != written.len() {
+            return Err(invariant(
+                "Candidate Confirmation results do not match their reserved plans",
+            ));
+        }
+        // Late usage signal: a Context this Task was given and then explicitly contradicted is
+        // `refuted`, which no later Checkpoint may downgrade. Best effort, like every other
+        // usage record.
+        for reserved in &reserved {
+            let _ = self.record_confirmation_context_usage(
+                expected_task_id,
+                &reserved.plan.result_revision,
+            );
+        }
+        let graph_rebuild_pending = if reserved
+            .iter()
+            .all(|reserved| reserved.plan.engineering_references.is_empty())
+        {
+            false
+        } else {
+            self.auto_scan_engineering_graph()
+        };
+        let snapshot = self.snapshot()?;
+        // The revision this Confirmation just accepted has no vector, and until now nothing would
+        // ever have given it one: the corpus backfill runs once, at model-load time, so every
+        // Context a session produces was invisible to Lane B for the rest of that process. Asked
+        // after the Snapshot on purpose -- the Snapshot is what synchronizes the projection, so
+        // the filler reading `embeddable_revisions` now sees what was just accepted.
+        if let Some(semantic) = self.semantic.as_ref() {
+            semantic.request_backfill(
+                reserved
+                    .iter()
+                    .map(|reserved| reserved.plan.result_revision.revision_id),
+            );
+        }
+        Ok(reserved
+            .into_iter()
+            .zip(written)
+            .map(|(reserved, written)| {
+                let plan = reserved.plan;
+                let status = if written.already_confirmed {
+                    CandidateConfirmResponseStatus::AlreadyConfirmed
+                } else {
+                    CandidateConfirmResponseStatus::Confirmed
+                };
+                CandidateConfirmResponse {
+                    status,
+                    created: status == CandidateConfirmResponseStatus::Confirmed,
+                    candidate_id: reserved.candidate_id,
+                    confirmation_id: plan.confirmation.confirmation_id,
+                    context_id: plan.result_context_id,
+                    revision_id: plan.result_revision.revision_id,
+                    primary_space_id: plan.confirmation.primary_space_id,
+                    related_space_ids: plan.confirmation.related_space_ids,
+                    batch_id: written.append.batch_id,
+                    commit_oid: written.append.commit_oid,
+                    event_ids: written.append.event_ids,
+                    indexed_tree_oid: snapshot.metadata.indexed_tree_oid.clone(),
+                    projection_generation: snapshot.metadata.projection_generation,
+                    assessment_acknowledgments: reserved.assessments,
+                    graph_rebuild_pending,
+                    advice: graph_rebuild_pending.then(|| GRAPH_REBUILD_ADVICE.to_owned()),
+                }
+            })
+            .collect())
+    }
+
+    /// Records the Contexts this Confirmation explicitly contradicted as `refuted`.
+    ///
+    /// Only Contexts that were actually injected into the confirming Task are recorded: the table
+    /// answers "what happened to what we injected", and a contradiction of a Context this Task
+    /// never received is a graph fact the Relation and its conflict already carry.
+    fn record_confirmation_context_usage(
+        &self,
+        task_id: TaskId,
+        revision: &sctx_domain::ContextRevision,
+    ) -> Result<()> {
+        let contradicted = revision
+            .relations
+            .iter()
+            .filter(|relation| relation.kind == ContextRelationKind::Contradicts)
+            .map(|relation| relation.target_context_id)
+            .collect::<BTreeSet<_>>();
+        if contradicted.is_empty() {
+            return Ok(());
+        }
+        let injected = self
+            .tasks
+            .read_task_injections(task_id)?
+            .into_iter()
+            .map(|injection| injection.context_id)
+            .collect::<BTreeSet<_>>();
+        let records = contradicted
+            .intersection(&injected)
+            .map(|context_id| ContextUsageRecord {
+                context_id: *context_id,
+                task_id,
+                outcome: ContextUsageOutcome::Refuted,
+            })
+            .collect::<Vec<_>>();
+        self.tasks.record_context_usage(&records)?;
+        Ok(())
+    }
+
+    /// The question the Candidate's source Task was working on, condensed for `problem_view`.
+    ///
+    /// It reads the Working Intent revision the source Episode closed under: the goal, what the
+    /// Task declared in scope, and the questions it left open. `None` whenever the Episode or its
+    /// Intent revision is no longer resolvable, which only leaves the field absent.
+    fn derived_problem_view(&self, source_episode: WorkEpisodeRef) -> Result<Option<String>> {
+        let Some(episode) = self.tasks.read_work_episode(source_episode.episode_id)? else {
+            return Ok(None);
+        };
+        self.episode_problem_view(&episode)
+    }
+
+    /// The same `problem_view` for an Episode the caller already holds.
+    ///
+    /// Candidate Build reads it once per Episode and writes it onto every draft that Build
+    /// produces; every later reconstruction of one of those Candidates reads it again from the
+    /// same immutable Intent revision, so the reconstruction reproduces the persisted draft.
+    fn episode_problem_view(&self, episode: &WorkEpisodeView) -> Result<Option<String>> {
+        let intent_revision_id = episode.episode.intent_revisions.last();
+        let Some(task) = self.tasks.read_snapshot(episode.episode.task_session_id)? else {
+            return Ok(None);
+        };
+        Ok(task
+            .intent_revisions
+            .iter()
+            .find(|revision| revision.revision_id == intent_revision_id)
+            .and_then(|revision| compose_problem_view(&revision.working_intent)))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1962,21 +3834,44 @@ impl Runtime {
         let signals = self
             .tasks
             .read_signal_history(record.source_episode.task_session_id)?;
-        let material = build_claim_material(
+        let problem_view = self.episode_problem_view(&episode)?;
+        let mut material = build_claim_material(
             &episode,
             final_checkpoint,
             checkpoint,
             claim,
             &signals,
             snapshot,
+            problem_view.as_deref(),
         );
+        // A Candidate built before Build derived `problem_view` and `topic_key` carries neither,
+        // and the derivation must not retroactively invalidate it: where the persisted draft left
+        // a derived field absent, the reconstruction leaves it absent too. Everything the Claim
+        // itself authored is still compared exactly.
+        if material.draft.as_ref() != Some(&persisted.content)
+            && let Some(draft) = material.draft.as_mut()
+        {
+            if persisted.content.problem_view.is_none() {
+                draft.problem_view = None;
+            }
+            if persisted.content.topic_key.is_none() {
+                draft.topic_key = None;
+            }
+        }
         if material.draft.as_ref() != Some(&persisted.content) {
             return Err(invariant(
                 "Candidate Review source Claim no longer reconstructs the persisted draft",
             ));
         }
         let analysis_view = self.tasks.read_candidate_analysis(record.candidate_id)?;
-        let (analysis, recommendations, confidence, unknowns, candidate_status, generation) =
+        if analysis_view.as_ref().is_some_and(|view| {
+            view.candidate.builder_provenance.engineering_references != claim.engineering_references
+        }) {
+            return Err(invariant(
+                "Candidate Review Engineering Reference provenance changed",
+            ));
+        }
+        let (analysis, mut recommendations, confidence, unknowns, candidate_status, generation) =
             analysis_view.map_or_else(
                 || {
                     (
@@ -1999,6 +3894,53 @@ impl Runtime {
                     )
                 },
             );
+        let proposed_space_group_key =
+            recommendations
+                .iter()
+                .find_map(|recommendation| match recommendation {
+                    CandidateSpaceRecommendation::ProposedNewSpaceIntent {
+                        proposed_space_group_key,
+                        ..
+                    } => *proposed_space_group_key,
+                    CandidateSpaceRecommendation::Existing { .. } => None,
+                });
+        if let Some(proposed_space_group_key) = proposed_space_group_key {
+            if let Some(mapping) = self
+                .tasks
+                .read_proposed_space_group(proposed_space_group_key)?
+                .filter(|mapping| {
+                    mapping.status == ProposedSpaceGroupMappingStatus::Committed
+                        && mapping.candidate_id != record.candidate_id
+                })
+            {
+                if !snapshot.projection.spaces.contains_key(&mapping.space_id) {
+                    return Err(invariant(
+                        "committed proposed Space group points to a missing Space",
+                    ));
+                }
+                recommendations.retain(|recommendation| match recommendation {
+                    CandidateSpaceRecommendation::ProposedNewSpaceIntent { .. } => false,
+                    CandidateSpaceRecommendation::Existing { space_id, .. } => {
+                        *space_id != mapping.space_id
+                    }
+                });
+                recommendations.insert(
+                    0,
+                    CandidateSpaceRecommendation::existing_with_paths(
+                        mapping.space_id,
+                        sctx_domain::RecommendedSpaceRole::Primary,
+                        "The first confirmed Candidate for this Task Intent revision created this Space",
+                        CandidateConfidence {
+                            basis_points: 10_000,
+                            rationale: "Exact proposed Space group mapping".to_owned(),
+                        },
+                        vec![CandidateSpaceRecommendationPath::ProposedSpaceGroupResolved {
+                            proposed_space_group_key,
+                        }],
+                    ),
+                );
+            }
+        }
         let diagnostics = if record.status == CandidateReviewStatus::Expired {
             vec![CandidateReviewDiagnostic::ReviewExpired]
         } else {
@@ -2032,6 +3974,7 @@ impl Runtime {
             checkpoint_id: record.checkpoint_id,
             claim_id: record.claim_id,
             content: persisted.content.clone(),
+            engineering_references: claim.engineering_references.clone(),
             analysis,
             space_recommendations: recommendations,
             confidence,
@@ -2086,7 +4029,7 @@ impl Runtime {
                     && locator.checkout_path.exists()
             })
             .ok_or_else(|| invalid("configured Repository has no available local checkout"))?;
-        let plan = RepositoryScanPlan::new(registered.identity.repository_id, paths)?;
+        let plan = RepositoryScanPlan::new(registered.identity.repository_id.clone(), paths)?;
         let outcome = RepositoryScanner::default().scan(
             &registered.identity,
             &locator.checkout_path,
@@ -2103,6 +4046,38 @@ impl Runtime {
         ))
     }
 
+    /// Creates one explicitly named Space through the exact `sctx space create` path.
+    ///
+    /// The Intent is validated by [`IntentSnapshot::validate`] and appended as one
+    /// `SpaceCreated` Event, so an Agent no longer needs an escalated shell to seed a Space.
+    fn space_create(&self, input: &SpaceCreateInput) -> Result<SpaceCreateResponse> {
+        let event = Event::space_created(input.intent.clone(), None)?;
+        let (space_id, intent_revision_id, provisional) = match event.payload() {
+            EventPayload::SpaceCreated {
+                space_id,
+                intent_revision,
+            } => (
+                *space_id,
+                intent_revision.revision_id,
+                intent_revision.provisional,
+            ),
+            _ => unreachable!("space_created builds exactly one SpaceCreated payload"),
+        };
+        let event_id = event.event_id();
+        let append = self.store()?.append_event(AppendRequest::event(event))?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok(SpaceCreateResponse {
+            space_id,
+            intent_revision_id,
+            provisional,
+            event_id,
+            batch_id: append.batch_id.to_string(),
+            commit_oid: append.commit_oid,
+            tree: metadata.indexed_tree_oid,
+            generation: metadata.projection_generation,
+        })
+    }
+
     fn engineering_reference_record(
         &self,
         input: &EngineeringReferenceRecordInput,
@@ -2116,7 +4091,7 @@ impl Runtime {
                 "revision {revision_id} does not belong to Context {context_id}"
             )));
         }
-        if self.repositories.resolve_by_id(repository_id)?.is_none() {
+        if self.repositories.resolve_by_id(&repository_id)?.is_none() {
             return Err(invalid(format!(
                 "Repository does not exist: {repository_id}"
             )));
@@ -2124,7 +4099,7 @@ impl Runtime {
         let event = Event::engineering_reference_recorded(
             context_id,
             revision_id,
-            input.draft(repository_id)?,
+            input.draft(repository_id.clone())?,
             None,
         )?;
         let reference_id = match event.payload() {
@@ -2132,9 +4107,13 @@ impl Runtime {
             _ => unreachable!(),
         };
         let event_id = event.event_id();
-        let append = self.store.append_event(AppendRequest::event(event))?;
+        let append = self.store()?.append_event(AppendRequest::event(event))?;
         let metadata = self.index.synchronize()?.metadata;
         debug_assert!(snapshot.projection.spaces.contains_key(&space_id));
+        // The other half of the same gap a Confirmation closes: a Reference recorded after the
+        // fact is the common way an installation acquires one, and until something scans the
+        // Repository it names, the Reference resolves against nothing.
+        let _ = self.auto_scan_engineering_graph();
         Ok(EngineeringReferenceRecordResponse {
             context_id,
             revision_id,
@@ -2148,10 +4127,113 @@ impl Runtime {
         })
     }
 
+    /// Evaluates every accepted Context's structured `recheck_when` entries against the local
+    /// checkouts and records the outcome in the local `context_item.stale_reason` column.
+    ///
+    /// Nothing here becomes an Event. A Context whose entries all still hold has its previous
+    /// stale marking cleared; a Context with no structured entry is left exactly as it was, since
+    /// this pass has nothing to say about it. Every Git read is bounded and read-only, and any
+    /// failure — no checkout, no `git`, unknown commit, timeout — is reported as "unevaluated"
+    /// rather than as staleness or an error.
+    fn context_recheck(&self) -> Result<ContextRecheckResponse> {
+        let snapshot = self.snapshot()?;
+        let checkouts = self.recheck_checkouts()?;
+        let mut results = Vec::new();
+        let mut rows = Vec::new();
+        let mut unevaluated_entries = 0;
+        for space in snapshot.projection.spaces.values() {
+            for (context_id, context) in &space.contexts {
+                let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance
+                else {
+                    continue;
+                };
+                let Some(revision) = context.revisions.get(&revision_id) else {
+                    continue;
+                };
+                let conditions = revision
+                    .revision
+                    .recheck_when
+                    .iter()
+                    .filter_map(|entry| {
+                        RecheckCondition::parse(entry).map(|condition| (entry.clone(), condition))
+                    })
+                    .collect::<Vec<_>>();
+                if conditions.is_empty() {
+                    continue;
+                }
+                let mut stale_reason = None;
+                let mut unevaluated = Vec::new();
+                for (entry, condition) in conditions {
+                    match evaluate_recheck_condition(&condition, &checkouts) {
+                        RecheckAnswer::Stale(reason) => {
+                            stale_reason.get_or_insert(reason);
+                        }
+                        RecheckAnswer::Current => {}
+                        RecheckAnswer::Unevaluated => unevaluated.push(entry),
+                    }
+                }
+                unevaluated_entries += unevaluated.len();
+                rows.push((context_id.to_string(), stale_reason.clone()));
+                results.push(ContextRecheckResult {
+                    context_id: *context_id,
+                    revision_id,
+                    stale_reason,
+                    unevaluated,
+                });
+            }
+        }
+        self.index.record_stale_reasons(&rows)?;
+        let metadata = self.index.synchronize()?.metadata;
+        Ok(ContextRecheckResponse {
+            evaluated_contexts: results.len(),
+            stale_contexts: results
+                .iter()
+                .filter(|result| result.stale_reason.is_some())
+                .count(),
+            unevaluated_entries,
+            results,
+            tree: metadata.indexed_tree_oid,
+            generation: metadata.projection_generation,
+        })
+    }
+
+    /// Every available local checkout in the Catalog, in Repository order.
+    ///
+    /// A `recheck_when` entry names a commit and a Repository-relative path but not a Repository,
+    /// so evaluation asks each configured checkout in turn and uses the first that knows the
+    /// commit. Deterministic because the Catalog order is.
+    fn recheck_checkouts(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .repositories
+            .list()?
+            .into_iter()
+            .flat_map(|repository| repository.locators)
+            .filter(|locator| {
+                locator.availability == RepositoryAvailability::Available
+                    && locator.checkout_path.is_dir()
+            })
+            .map(|locator| locator.checkout_path)
+            .collect())
+    }
+
     fn association_rebuild(
         &self,
         input: &AssociationRebuildInput,
     ) -> Result<AssociationRebuildResponse> {
+        self.association_rebuild_before(input, None)?
+            .ok_or_else(|| invariant("an unbudgeted Graph rebuild cannot be abandoned"))
+    }
+
+    /// Rebuilds the Engineering projection under an optional wall-clock budget.
+    ///
+    /// `Ok(None)` means the budget ran out during the Repository scan and nothing was written.
+    /// The previous projection stays exactly as it was: an abandoned rebuild is never a smaller
+    /// Graph, only an older one.
+    fn association_rebuild_before(
+        &self,
+        input: &AssociationRebuildInput,
+        deadline: Option<Instant>,
+    ) -> Result<Option<AssociationRebuildResponse>> {
         let engineering_graph = self
             .engineering_graph
             .as_ref()
@@ -2168,8 +4250,11 @@ impl Runtime {
             })
             .collect::<Vec<_>>();
         let repositories = self.repositories.list()?;
-        let (scan_outcomes, repository_summaries) =
-            scan_registered_repositories(&repositories, &references)?;
+        let Some((scan_outcomes, repository_summaries)) =
+            scan_registered_repositories_before(&repositories, &references, deadline)?
+        else {
+            return Ok(None);
+        };
         let context_snapshots = build_graph_context_snapshots(&snapshot.projection, &references)?;
         let previous = engineering_graph.read_projection()?;
         let projection = previous.as_ref().map_or_else(
@@ -2194,7 +4279,26 @@ impl Runtime {
                 .rebuild_for_context_tree(&projection, Some(&snapshot.metadata.indexed_tree_oid))?;
         }
         let status_counts = resolution_status_counts(&projection.references);
-        Ok(AssociationRebuildResponse {
+        // Only an explicitly requested rebuild reads history. A budgeted automatic rescan carries
+        // a deadline, and spending it on `git log` would trade the scan that repairs the Graph for
+        // an explanation of why it is broken.
+        let relocation_candidates = if deadline.is_none() {
+            relocation_candidates(&projection.references, &repository_summaries)
+        } else {
+            Vec::new()
+        };
+        // An explicit rebuild is the operator saying "look at the Repositories again". A Claim
+        // spelling that several files answered to is the one derivation result that a changed
+        // checkout can settle, so this is where the door is reopened for it. It does not re-derive
+        // anything here — derivation is Candidate Build work — it only removes the suppression, so
+        // the next Build for that Episode asks even if the file count happens to be unchanged.
+        // A budgeted automatic rescan and a diagnose-only run change nothing.
+        let reopened_reference_derivations = if input.diagnose_only || deadline.is_some() {
+            0
+        } else {
+            self.tasks.reopen_ambiguous_reference_derivations()?
+        };
+        Ok(Some(AssociationRebuildResponse {
             diagnose_only: input.diagnose_only,
             stored: !input.diagnose_only,
             artifact_generation: projection.artifact_generation,
@@ -2202,8 +4306,82 @@ impl Runtime {
             reference_count: projection.references.len(),
             repositories: repository_summaries,
             status_counts,
-            tree: snapshot.metadata.indexed_tree_oid,
+            relocation_candidates,
+            reopened_reference_derivations,
+            tree: snapshot.metadata.indexed_tree_oid.clone(),
             generation: snapshot.metadata.projection_generation,
+        }))
+    }
+
+    /// Bounded, best-effort Graph rescan for one interactive write that named Engineering
+    /// References. Returns whether the Graph is still behind the Store afterwards.
+    ///
+    /// This is the only automatic scan in the product and it is deliberately synchronous: the
+    /// caller is an MCP tool call an Agent is waiting on, so the rescan gets one explicit budget
+    /// and the answer to "did it finish" rather than a background job nobody observes. It never
+    /// runs on a Hook path. Everything it can fail at -- unreadable configuration, an unavailable
+    /// checkout, an exhausted budget -- leaves the Confirmation that triggered it untouched and
+    /// is reported as `graph_rebuild_pending`, which names `sctx association rebuild` as the fix.
+    fn auto_scan_engineering_graph(&self) -> bool {
+        if !self.engineering_auto_scan() {
+            return true;
+        }
+        let deadline = Instant::now().checked_add(AUTO_SCAN_BUDGET);
+        match self.association_rebuild_before(
+            &AssociationRebuildInput {
+                diagnose_only: false,
+            },
+            deadline,
+        ) {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                eprintln!(
+                    "sctx: Engineering Graph rescan exceeded its {}s budget; run `sctx association rebuild`",
+                    AUTO_SCAN_BUDGET.as_secs()
+                );
+                true
+            }
+            Err(error) => {
+                eprintln!(
+                    "sctx: Engineering Graph rescan failed ({error}); run `sctx association rebuild`"
+                );
+                true
+            }
+        }
+    }
+
+    /// Reads the `[engineering] auto_scan` switch, defaulting to on for an unreadable config.
+    fn engineering_auto_scan(&self) -> bool {
+        UserConfigStore::open_existing(&self.root)
+            .and_then(|config| config.engineering_settings())
+            .is_ok_and(|settings| settings.auto_scan)
+    }
+
+    /// Scans the registered checkouts once after an explicit Repository registration.
+    ///
+    /// A newly registered Repository was never scanned by anything: every Reference naming it
+    /// resolved against "Repository is not registered" and stayed that way until somebody
+    /// happened to run a rebuild, so a freshly added checkout looked like a broken one. Adding a
+    /// Repository is an explicit operation, so it pays for the first read itself.
+    fn repository_first_scan(&self) -> Result<RepositoryFirstScanReport> {
+        if !self.engineering_auto_scan() {
+            return Ok(RepositoryFirstScanReport {
+                attempted: false,
+                completed: false,
+                rebuild: None,
+            });
+        }
+        let deadline = Instant::now().checked_add(REPOSITORY_FIRST_SCAN_BUDGET);
+        let rebuild = self.association_rebuild_before(
+            &AssociationRebuildInput {
+                diagnose_only: false,
+            },
+            deadline,
+        )?;
+        Ok(RepositoryFirstScanReport {
+            attempted: true,
+            completed: rebuild.is_some(),
+            rebuild,
         })
     }
 
@@ -2227,9 +4405,21 @@ impl Runtime {
             .find(|reference| reference.reference_id == reference_id)
             .ok_or_else(|| invalid(format!("Reference is not projected: {reference_id}")))?;
         let metadata = self.index.synchronize()?.metadata;
+        let relocation_candidate = self
+            .repositories
+            .list()?
+            .iter()
+            .find(|repository| {
+                repository.identity.repository_id == projected.resolution.repository_id
+            })
+            .and_then(available_checkout)
+            .and_then(|checkout| {
+                relocation_candidate(projected, checkout, RELOCATION_REFERENCE_BUDGET)
+            });
         Ok(association_explain_response(
             projected,
             graph.context_tree_oid,
+            relocation_candidate,
             metadata.indexed_tree_oid,
             metadata.projection_generation,
         ))
@@ -2254,7 +4444,7 @@ fn repository_scan_response(
                 .map(artifact_summary)
                 .collect::<Vec<_>>();
             RepositoryScanResponse {
-                repository_id: repository.identity.repository_id,
+                repository_id: repository.identity.repository_id.clone(),
                 canonical_name: repository.identity.canonical_name.clone(),
                 checkout_path: checkout_path.to_path_buf(),
                 status: "available".to_owned(),
@@ -2316,30 +4506,147 @@ fn artifact_summary(artifact: &sctx_engineering_graph::SnapshotArtifact) -> Arti
     }
 }
 
-fn scan_registered_repositories(
+/// What one local checkout could say about a structured `recheck_when` entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RecheckAnswer {
+    /// The condition fired; the payload explains it in one sentence.
+    Stale(String),
+    /// The condition was answered and still holds.
+    Current,
+    /// No configured checkout could answer it: unknown commit, missing `git`, or a timeout.
+    Unevaluated,
+}
+
+/// Answers one structured condition against the first checkout that knows its commit.
+fn evaluate_recheck_condition(
+    condition: &RecheckCondition,
+    checkouts: &[PathBuf],
+) -> RecheckAnswer {
+    for checkout in checkouts {
+        let answer = match condition {
+            RecheckCondition::BranchAdvanced { branch, commit } => {
+                let Some(head) = bounded_git(checkout, &["rev-parse", "--verify", branch]) else {
+                    continue;
+                };
+                let head = head.trim();
+                if head.is_empty() {
+                    continue;
+                }
+                if head.starts_with(commit.as_str()) {
+                    RecheckAnswer::Current
+                } else {
+                    RecheckAnswer::Stale(format!(
+                        "branch_advanced: {branch} moved from {commit} to {head}"
+                    ))
+                }
+            }
+            RecheckCondition::FileChangedSince { commit, path } => {
+                if bounded_git(
+                    checkout,
+                    &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+                )
+                .is_none()
+                {
+                    continue;
+                }
+                let Some(changed) = bounded_git(
+                    checkout,
+                    &[
+                        "log",
+                        "--format=%H",
+                        "-1",
+                        &format!("{commit}..HEAD"),
+                        "--",
+                        path,
+                    ],
+                ) else {
+                    continue;
+                };
+                let changed = changed.trim().to_owned();
+                if changed.is_empty() {
+                    RecheckAnswer::Current
+                } else {
+                    RecheckAnswer::Stale(format!(
+                        "file_changed_since: {path} changed after {commit} in {changed}"
+                    ))
+                }
+            }
+        };
+        return answer;
+    }
+    RecheckAnswer::Unevaluated
+}
+
+/// Runs one read-only `git` query under the same bounded timeout Reference derivation uses.
+///
+/// Returns `None` for a missing `git`, a non-zero exit, non-UTF-8 output, or a timeout, so a
+/// broken or slow checkout can never fail or hang the caller.
+fn bounded_git(checkout: &Path, arguments: &[&str]) -> Option<String> {
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(checkout)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut stdout, &mut buffer)
+            .ok()
+            .map(|_| buffer)
+    });
+    let deadline = std::time::Instant::now() + reference_derivation::GIT_QUERY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let output = reader.join().ok().flatten()?;
+    status?.success().then_some(())?;
+    String::from_utf8(output).ok()
+}
+
+/// Scans every Repository named by `references`, optionally under one shared wall-clock budget.
+///
+/// `Ok(None)` means the budget ran out and no Repository set was produced. The whole rebuild is
+/// abandoned rather than resolved against a half-scanned set, because a Repository that was not
+/// reached would resolve as `Missing` and that is a claim about the checkout, not about the clock.
+fn scan_registered_repositories_before(
     repositories: &[RegisteredRepository],
     references: &[ProjectedEngineeringReference],
-) -> Result<(Vec<RepositoryScanOutcome>, Vec<RepositoryRebuildSummary>)> {
+    deadline: Option<Instant>,
+) -> Result<Option<(Vec<RepositoryScanOutcome>, Vec<RepositoryRebuildSummary>)>> {
     let scanner = RepositoryScanner::default();
     let repositories = repositories
         .iter()
-        .map(|repository| (repository.identity.repository_id, repository))
+        .map(|repository| (repository.identity.repository_id.clone(), repository))
         .collect::<BTreeMap<_, _>>();
     let mut paths_by_repository = BTreeMap::<RepositoryId, Vec<RepoRelativePath>>::new();
     for reference in references {
         paths_by_repository
-            .entry(reference.reference.repository_id)
+            .entry(reference.reference.repository_id.clone())
             .or_default()
             .push(reference.reference.locator.path().clone());
     }
     let mut outcomes = Vec::with_capacity(paths_by_repository.len());
     let mut summaries = Vec::with_capacity(paths_by_repository.len());
     for (repository_id, paths) in paths_by_repository {
-        let plan = RepositoryScanPlan::new(repository_id, paths)?;
+        let plan = RepositoryScanPlan::new(repository_id.clone(), paths)?;
         let Some(repository) = repositories.get(&repository_id).copied() else {
             let reason = "Repository is not registered".to_owned();
             outcomes.push(RepositoryScanOutcome::Unavailable {
-                repository_id,
+                repository_id: repository_id.clone(),
                 reason: reason.clone(),
             });
             summaries.push(RepositoryRebuildSummary {
@@ -2358,16 +4665,25 @@ fn scan_registered_repositories(
                 && locator.checkout_path.exists()
         });
         let outcome = if let Some(locator) = locator {
-            scanner.scan(&repository.identity, &locator.checkout_path, &plan)?
+            let Some(outcome) = scanner.scan_before(
+                &repository.identity,
+                &locator.checkout_path,
+                &plan,
+                deadline,
+            )?
+            else {
+                return Ok(None);
+            };
+            outcome
         } else {
             RepositoryScanOutcome::Unavailable {
-                repository_id: repository.identity.repository_id,
+                repository_id: repository.identity.repository_id.clone(),
                 reason: "Repository has no available registered checkout".to_owned(),
             }
         };
         let summary = match &outcome {
             RepositoryScanOutcome::Available(snapshot) => RepositoryRebuildSummary {
-                repository_id: snapshot.repository_id,
+                repository_id: snapshot.repository_id.clone(),
                 status: "available".to_owned(),
                 checkout_path: locator.map(|locator| locator.checkout_path.clone()),
                 planned_path_count: plan.paths().len(),
@@ -2379,7 +4695,7 @@ fn scan_registered_repositories(
                 repository_id,
                 reason,
             } => RepositoryRebuildSummary {
-                repository_id: *repository_id,
+                repository_id: repository_id.clone(),
                 status: "unavailable".to_owned(),
                 checkout_path: None,
                 planned_path_count: plan.paths().len(),
@@ -2391,7 +4707,86 @@ fn scan_registered_repositories(
         outcomes.push(outcome);
         summaries.push(summary);
     }
-    Ok((outcomes, summaries))
+    Ok(Some((outcomes, summaries)))
+}
+
+/// The first registered checkout of one Repository that is actually on this machine.
+fn available_checkout(repository: &RegisteredRepository) -> Option<&Path> {
+    repository
+        .locators
+        .iter()
+        .find(|locator| {
+            locator.availability == RepositoryAvailability::Available
+                && locator.checkout_path.is_dir()
+        })
+        .map(|locator| locator.checkout_path.as_path())
+}
+
+/// Reads local history for every `Missing` File or Module Reference, under one shared budget.
+///
+/// The per-Reference budget bounds one unresponsive checkout; the total bounds a Repository whose
+/// Artifacts all moved at once. Running out is silent: an unfinished diagnosis is not a finding,
+/// and the `Missing` statuses it would have annotated are reported either way.
+fn relocation_candidates(
+    references: &[ResolvedReferenceProjection],
+    repositories: &[RepositoryRebuildSummary],
+) -> Vec<ReferenceRelocationCandidate> {
+    let checkouts = repositories
+        .iter()
+        .filter_map(|summary| {
+            summary
+                .checkout_path
+                .as_deref()
+                .map(|checkout| (summary.repository_id.clone(), checkout))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let Some(overall) = Instant::now().checked_add(RELOCATION_TOTAL_BUDGET) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for reference in references {
+        if reference.resolution.status != ResolutionStatus::Missing {
+            continue;
+        }
+        let remaining = overall.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(checkout) = checkouts.get(&reference.resolution.repository_id).copied() else {
+            continue;
+        };
+        if let Some(candidate) = relocation_candidate(
+            reference,
+            checkout,
+            RELOCATION_REFERENCE_BUDGET.min(remaining),
+        ) {
+            found.push(candidate);
+        }
+    }
+    found
+}
+
+/// Reports the one rename history states for a `Missing` File or Module Reference.
+fn relocation_candidate(
+    reference: &ResolvedReferenceProjection,
+    checkout: &Path,
+    budget: Duration,
+) -> Option<ReferenceRelocationCandidate> {
+    if reference.resolution.status != ResolutionStatus::Missing {
+        return None;
+    }
+    let path = reference.locator.as_ref().and_then(relocatable_path)?;
+    let found = find_relocation_candidate(checkout, path, budget)?;
+    Some(ReferenceRelocationCandidate {
+        reference_id: reference.reference_id,
+        repository_id: reference.resolution.repository_id.clone(),
+        context_id: reference.context_id,
+        revision_id: reference.revision_id,
+        from: found.from,
+        to: found.to,
+        commit: found.commit,
+        advice: RELOCATION_ADVICE.to_owned(),
+    })
 }
 
 fn skipped_reason_name(reason: SkippedFileReason) -> &'static str {
@@ -2431,6 +4826,7 @@ fn resolution_status_counts(references: &[ResolvedReferenceProjection]) -> Resol
 fn association_explain_response(
     projected: &ResolvedReferenceProjection,
     context_tree_oid: Option<String>,
+    relocation_candidate: Option<ReferenceRelocationCandidate>,
     tree: String,
     generation: u64,
 ) -> AssociationExplainResponse {
@@ -2469,7 +4865,7 @@ fn association_explain_response(
         context_id: projected.context_id,
         revision_id: projected.revision_id,
         reference_id: projected.reference_id,
-        repository_id: projected.resolution.repository_id,
+        repository_id: projected.resolution.repository_id.clone(),
         status: projected.resolution.status,
         resolved_artifact: projected.resolution.resolved_artifact.clone(),
         ambiguity_candidates: projected.resolution.candidates.clone(),
@@ -2478,6 +4874,7 @@ fn association_explain_response(
         explanation: projected.resolution.explanation.clone(),
         artifact_generation: projected.artifact_generation.clone(),
         context_tree_oid,
+        relocation_candidate,
         tree,
         generation,
     }
@@ -2516,6 +4913,185 @@ fn active_signal_records(
         .collect())
 }
 
+/// Artifact coordinates one Claim can be compared on: its own refs plus the coordinates the
+/// server derived from its text. Deduplicated and ordered so analysis stays reproducible.
+fn serialize_candidate_reviews(value: &impl Serialize) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        Error::new(
+            ErrorKind::Io,
+            format!("serialize Candidate Review response: {error}"),
+        )
+    })
+}
+
+/// Adds the two response-only Candidate Review aids that no Git fact carries: whether the Claim's
+/// applicability was inherited from the Task Intent, and the `problem_view` that confirmation
+/// would write. Both exist so a reviewer can correct them before confirming.
+/// Marks each recommended Space in one serialized Full Review row with whether that Space is
+/// still the server's provisional proposal.
+///
+/// This is response-side only: the stored recommendation carries no such field, and a proposed
+/// new Space is provisional by construction because confirming it is what creates the Space.
+fn insert_space_recommendation_provisional(row: &mut Value, provisional: &BTreeSet<SpaceId>) {
+    let provisional = provisional
+        .iter()
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let Some(recommendations) = row
+        .get_mut("space_recommendations")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for recommendation in recommendations {
+        let Some(object) = recommendation.as_object_mut() else {
+            continue;
+        };
+        let is_provisional = match object.get("kind").and_then(Value::as_str) {
+            Some("proposed_new_space_intent") => true,
+            Some("existing") => object
+                .get("space_id")
+                .and_then(Value::as_str)
+                .is_some_and(|space_id| provisional.contains(space_id)),
+            _ => continue,
+        };
+        object.insert("provisional".to_owned(), Value::Bool(is_provisional));
+    }
+}
+
+fn insert_review_aids(
+    runtime: &Runtime,
+    row: &mut Value,
+    view: &CandidateReviewView,
+) -> Result<()> {
+    let derived = match view.content.problem_view.clone() {
+        Some(problem_view) => Some(problem_view),
+        None => runtime.derived_problem_view(view.source_episode)?,
+    };
+    let Some(object) = row.as_object_mut() else {
+        return Ok(());
+    };
+    object.insert(
+        "applicability_inherited".to_owned(),
+        Value::Bool(APPLICABILITY_INHERITED),
+    );
+    if let Some(problem_view) = derived {
+        object.insert(
+            "derived_problem_view".to_owned(),
+            Value::String(problem_view),
+        );
+    }
+    Ok(())
+}
+
+/// Adds the non-blocking Chinese-default advisory to one serialized full Review row.
+fn insert_language_hint(row: &mut Value, statement: &str) {
+    let Some(hint) = language_hint(statement) else {
+        return;
+    };
+    if let Some(object) = row.as_object_mut() {
+        object.insert("language_hint".to_owned(), Value::String(hint));
+    }
+}
+
+/// Upper bound on a derived `problem_view`. It is a retrieval and orientation aid, not a second
+/// copy of the Intent, so it is truncated rather than allowed to grow with the Task.
+const MAX_DERIVED_PROBLEM_VIEW_CHARS: usize = 400;
+
+/// Renders one Working Intent as the problem a Context answers: the goal first, then the declared
+/// scope, then what stayed open. Returns `None` when the Intent says nothing usable.
+fn compose_problem_view(intent: &WorkingIntentSnapshot) -> Option<String> {
+    let mut parts = Vec::new();
+    let goal = intent.goal.trim();
+    if !goal.is_empty() {
+        parts.push(goal.to_owned());
+    }
+    for (label, values) in [
+        ("In scope", &intent.in_scope),
+        ("Open questions", &intent.open_questions),
+    ] {
+        let joined = values
+            .iter()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !joined.is_empty() {
+            parts.push(format!("{label}: {joined}"));
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let composed = parts.join(" | ");
+    if composed.chars().count() <= MAX_DERIVED_PROBLEM_VIEW_CHARS {
+        return Some(composed);
+    }
+    let mut truncated = composed
+        .chars()
+        .take(MAX_DERIVED_PROBLEM_VIEW_CHARS - 1)
+        .collect::<String>();
+    truncated.push('…');
+    Some(truncated)
+}
+
+fn candidate_artifact_refs(claim: &CheckpointClaim) -> Vec<ArtifactRef> {
+    let mut refs = Vec::new();
+    for reference in &claim.engineering_references {
+        let derived = ArtifactRef {
+            repository_id: reference.repository_id.clone(),
+            locator: reference.locator.clone(),
+        };
+        if !refs.contains(&derived) {
+            refs.push(derived);
+        }
+    }
+    refs
+}
+
+/// The searchable hints and the topic key one persisted Claim derives from its own text.
+///
+/// Both are pure functions of the Claim and the Evidence it already carries, never of the checkout
+/// or the clock, so Candidate Build and every later reconstruction of the same Candidate agree.
+fn claim_retrieval_fields(
+    claim: &CheckpointClaim,
+    kind: ContextKind,
+    evidence: &[EvidenceSnapshotDraft],
+) -> (Vec<String>, Option<String>) {
+    // Path and identifier spellings the Checkpoint's own Evidence text carried but the checkout
+    // could not place. They are retrieval text only, never graph facts, and are recomputed from
+    // the persisted Claim so a rebuild reproduces the same searchable Candidate.
+    let summaries = evidence
+        .iter()
+        .filter_map(|snapshot| {
+            snapshot
+                .content
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let summaries = summaries.iter().map(String::as_str).collect::<Vec<_>>();
+    let hints = reference_derivation::claim_hints(
+        &claim.statement,
+        &claim.rationale,
+        &summaries,
+        &claim.engineering_references,
+    );
+    // The topic the Candidate is about, decided here rather than at confirmation: the Agent hint
+    // if the Claim carried one, else the coordinate the Checkpoint derivation placed, else the
+    // dominant file spelling of the Claim's own prose. Confirmation inherits this value unless a
+    // reviewer edits it, so both phases read one derivation.
+    let topic_key = reference_derivation::claim_topic_key(
+        kind,
+        claim.topic_key_hint.as_deref(),
+        &claim.statement,
+        &claim.rationale,
+        &summaries,
+    );
+    (hints, topic_key)
+}
+
 fn build_claim_material(
     episode: &WorkEpisodeView,
     final_checkpoint: &sctx_domain::AgentCheckpoint,
@@ -2523,6 +5099,7 @@ fn build_claim_material(
     claim: &CheckpointClaim,
     signals: &[TaskSignalRecord],
     snapshot: &DomainSnapshot,
+    problem_view: Option<&str>,
 ) -> ClaimBuildMaterial {
     let mut evidence = Vec::new();
     let mut observation_ids = Vec::new();
@@ -2545,10 +5122,11 @@ fn build_claim_material(
         unknowns.extend(final_checkpoint.unknowns.clone());
     }
     let kind = claim.context_kind_hint.unwrap_or(ContextKind::Discovery);
+    let (hints, topic_key) = claim_retrieval_fields(claim, kind, &evidence);
     let mut confidence = if claim.context_kind_hint.is_some() {
         8_000_u16
     } else {
-        unknowns.push(CaptureUnknown {
+        unknowns.push(CheckpointUnknown {
             statement: "Context kind was not explicitly classified; conservative Discovery fallback applied"
                 .to_owned(),
             blocking: false,
@@ -2556,10 +5134,8 @@ fn build_claim_material(
         });
         4_500
     };
-    if matches!(kind, ContextKind::Decision | ContextKind::Contract)
-        && claim.topic_key_hint.is_none()
-    {
-        unknowns.push(CaptureUnknown {
+    if matches!(kind, ContextKind::Decision | ContextKind::Contract) && topic_key.is_none() {
+        unknowns.push(CheckpointUnknown {
             statement: "Decision or Contract topic key remains unclassified".to_owned(),
             blocking: false,
             recheck_when: vec!["Before Candidate confirmation".to_owned()],
@@ -2576,13 +5152,15 @@ fn build_claim_material(
         }
     });
     let draft = error_code.is_none().then(|| ContextRevisionDraft {
+        problem_view: problem_view.map(ToOwned::to_owned),
+        hints,
         kind,
-        topic_key: claim.topic_key_hint.clone(),
+        topic_key,
         statement: claim.statement.clone(),
         rationale: claim.rationale.clone(),
         applicability: claim.applicability.clone(),
-        assumptions: claim.assumptions.clone(),
-        recheck_when: claim.recheck_when.clone(),
+        assumptions: Vec::new(),
+        recheck_when: Vec::new(),
         relations: Vec::new(),
         evidence,
     });
@@ -2607,7 +5185,7 @@ fn build_claim_material(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_candidate_evidence(
-    reference: &CaptureEvidenceRef,
+    reference: &CheckpointEvidenceRef,
     claim: &CheckpointClaim,
     episode: &WorkEpisodeView,
     signals: &[TaskSignalRecord],
@@ -2617,7 +5195,7 @@ fn collect_candidate_evidence(
     evidence: &mut Vec<EvidenceSnapshotDraft>,
 ) -> std::result::Result<(), &'static str> {
     match reference {
-        CaptureEvidenceRef::Observation { observation_id } => {
+        CheckpointEvidenceRef::Observation { observation_id } => {
             let observation = episode
                 .episode
                 .observations
@@ -2635,7 +5213,7 @@ fn collect_candidate_evidence(
                 evidence,
             )
         }
-        CaptureEvidenceRef::TaskSignal { signal_id } => {
+        CheckpointEvidenceRef::TaskSignal { signal_id } => {
             let signal = signals
                 .iter()
                 .find(|signal| signal.signal_id == *signal_id)
@@ -2669,7 +5247,7 @@ fn collect_candidate_evidence(
             });
             Ok(())
         }
-        CaptureEvidenceRef::ContextEvidence {
+        CheckpointEvidenceRef::ContextEvidence {
             context_id,
             revision_id,
             evidence_id,
@@ -2757,8 +5335,7 @@ fn collect_observation_evidence(
                 NormalizedWorkObservation::Diff { .. }
                 | NormalizedWorkObservation::Artifact { .. }
                 | NormalizedWorkObservation::Interface { .. } => EvidenceType::ArtifactSnapshot,
-                NormalizedWorkObservation::Breadcrumb { .. }
-                | NormalizedWorkObservation::ContextUse { .. } => EvidenceType::SourceSnapshot,
+                NormalizedWorkObservation::ContextUse { .. } => EvidenceType::SourceSnapshot,
                 NormalizedWorkObservation::Validation { .. }
                 | NormalizedWorkObservation::InlineValidation { .. }
                 | NormalizedWorkObservation::UnresolvedQuestion { .. } => {
@@ -2781,19 +5358,8 @@ fn collect_observation_evidence(
     }
 }
 
-fn normalized_observation_limitations(observation: &WorkObservation) -> Vec<String> {
-    if observation
-        .source_refs
-        .iter()
-        .any(|source| matches!(source, WorkSourceRef::Capture(_)))
-    {
-        vec![
-            "Only normalized engineering meaning is preserved; the raw Capture payload is excluded"
-                .to_owned(),
-        ]
-    } else {
-        vec!["The snapshot excludes raw transcript and tool output".to_owned()]
-    }
+fn normalized_observation_limitations(_observation: &WorkObservation) -> Vec<String> {
+    vec!["The snapshot excludes raw transcript and tool output".to_owned()]
 }
 
 fn deduplicate_candidate_evidence(evidence: &mut Vec<EvidenceSnapshotDraft>) {
@@ -2801,6 +5367,13 @@ fn deduplicate_candidate_evidence(evidence: &mut Vec<EvidenceSnapshotDraft>) {
     evidence.retain(|snapshot| {
         serde_json::to_string(snapshot).map_or(true, |encoded| seen.insert(encoded))
     });
+}
+
+/// Identity of one committed Candidate submission, as the Builder records it.
+struct CandidateSubmissionOutcomeRecord {
+    candidate_id: CandidateId,
+    event_id: EventId,
+    status: CandidateSubmissionStatus,
 }
 
 fn candidate_builder_error_code(error: &Error) -> &'static str {
@@ -2820,6 +5393,30 @@ fn candidate_builder_error_code(error: &Error) -> &'static str {
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         _ => "candidate_write_failed",
     }
+}
+
+/// Every line of prose one Working Intent revision carries, joined for identifier scanning.
+///
+/// It exists to answer one question - did this Task write a `ContextId` down anywhere in its own
+/// direction - so it takes the whole snapshot rather than the fields `problem_view` selects. No
+/// meaning is read out of the result and the joiner is never parsed back.
+fn working_intent_text(intent: &WorkingIntentSnapshot) -> String {
+    let mut lines = vec![intent.goal.clone()];
+    lines.extend(intent.current_direction.clone());
+    for group in [
+        &intent.in_scope,
+        &intent.out_of_scope,
+        &intent.domains,
+        &intent.platforms,
+        &intent.constraints,
+        &intent.acceptance_conditions,
+        &intent.artifact_hints,
+        &intent.interface_hints,
+        &intent.open_questions,
+    ] {
+        lines.extend(group.iter().cloned());
+    }
+    lines.join("\n")
 }
 
 fn candidate_analysis_error_code(error: &Error) -> &'static str {
@@ -2869,7 +5466,451 @@ fn candidate_build_response(
                 })
             })
             .collect::<Result<Vec<_>>>()?,
+        duplicates: view
+            .duplicates
+            .into_iter()
+            .map(|duplicate| CandidateBuildDuplicateSummary {
+                checkpoint_id: duplicate.checkpoint_id,
+                claim_id: duplicate.claim_id,
+                duplicate_of_candidate_id: duplicate.duplicate_of_candidate_id,
+                similarity_basis_points: duplicate.similarity_basis_points,
+            })
+            .collect(),
     })
+}
+
+/// Server-owned plan for one validated Candidate Confirmation that has not been written yet.
+struct PreparedCandidateConfirmation {
+    candidate_id: sctx_domain::CandidateId,
+    proposed_plan: CandidateConfirmationPlan,
+    proposed_space_group_key: Option<ProposedSpaceGroupKey>,
+    assessments: Vec<CandidateRelationAssessment>,
+}
+
+/// One reserved server-owned plan waiting for its shared Git batch.
+struct ReservedCandidateConfirmation {
+    candidate_id: sctx_domain::CandidateId,
+    plan: CandidateConfirmationPlan,
+    assessments: Vec<CandidateRelationAssessment>,
+}
+
+/// Git and Runtime result of writing one reserved plan.
+struct WrittenCandidateConfirmation {
+    append: AppendBatchOutcome,
+    already_confirmed: bool,
+}
+
+/// Maximum Candidates one batch Review decision may carry.
+const MAX_CANDIDATE_BATCH_ITEMS: usize = 32;
+
+/// Chooses the single or batch `candidate_discard` shape from the exact declared field.
+fn decode_candidate_discard_request(
+    arguments: Value,
+) -> std::result::Result<CandidateDiscardRequest, ToolFailure> {
+    if candidate_batch_requested(&arguments)? {
+        decode_arguments(arguments).map(|input| CandidateDiscardRequest::Batch(Box::new(input)))
+    } else {
+        decode_arguments(arguments).map(|input| CandidateDiscardRequest::Single(Box::new(input)))
+    }
+}
+
+/// Chooses the single or batch `candidate_confirm` shape from the exact declared field.
+fn decode_candidate_confirm_request(
+    arguments: Value,
+) -> std::result::Result<CandidateConfirmRequest, ToolFailure> {
+    if candidate_batch_requested(&arguments)? {
+        if arguments
+            .as_object()
+            .is_some_and(|object| object.contains_key("edits"))
+        {
+            return Err(invalid(
+                "batch candidate_confirm does not accept edits; confirm that Candidate with candidate_id instead",
+            )
+            .into());
+        }
+        validate_candidate_primary(&arguments)?;
+        decode_arguments(arguments).map(|input| CandidateConfirmRequest::Batch(Box::new(input)))
+    } else {
+        validate_candidate_primary(&arguments)?;
+        decode_arguments(arguments).map(|input| CandidateConfirmRequest::Single(Box::new(input)))
+    }
+}
+
+/// Resolves the exclusive `candidate_id` / `candidate_ids` selection the flat host view cannot state.
+///
+/// The host declaration lists both fields as optional properties, because a top-level union
+/// declaration degrades into an untyped map on at least one host; the exclusivity is therefore
+/// authoritative server validation.
+fn candidate_batch_requested(arguments: &Value) -> std::result::Result<bool, ToolFailure> {
+    let object = arguments.as_object();
+    let single = object.is_some_and(|object| object.contains_key("candidate_id"));
+    let batch = object.is_some_and(|object| object.contains_key("candidate_ids"));
+    match (single, batch) {
+        (true, true) => {
+            Err(invalid("send exactly one of candidate_id or candidate_ids, not both").into())
+        }
+        (false, false) => Err(invalid("send exactly one of candidate_id or candidate_ids").into()),
+        _ => Ok(batch),
+    }
+}
+
+/// Resolves the exclusive Primary Space selection the flat host view cannot state.
+fn validate_candidate_primary(arguments: &Value) -> std::result::Result<(), ToolFailure> {
+    let Some(primary) = arguments.get("primary").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let existing = primary.contains_key("existing_space_id");
+    let proposed = primary.contains_key("new_space_recommendation_id");
+    match (existing, proposed) {
+        (true, true) => Err(invalid(
+            "primary must send exactly one of existing_space_id or new_space_recommendation_id, not both",
+        )
+        .into()),
+        (false, false) => Err(invalid(
+            "primary must send exactly one of existing_space_id or new_space_recommendation_id",
+        )
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+fn parse_batch_candidate_ids(values: &[String]) -> Result<Vec<sctx_domain::CandidateId>> {
+    if values.is_empty() {
+        return Err(invalid("candidate_ids must not be empty"));
+    }
+    if values.len() > MAX_CANDIDATE_BATCH_ITEMS {
+        return Err(invalid(format!(
+            "candidate_ids must not exceed {MAX_CANDIDATE_BATCH_ITEMS} Candidates"
+        )));
+    }
+    let candidate_ids = values
+        .iter()
+        .map(|value| parse_id_value::<sctx_domain::CandidateId>(value, "candidate_ids"))
+        .collect::<Result<Vec<_>>>()?;
+    if candidate_ids.iter().collect::<BTreeSet<_>>().len() != candidate_ids.len() {
+        return Err(invalid("candidate_ids must be unique"));
+    }
+    Ok(candidate_ids)
+}
+
+/// Reports the exact batch member that failed before anything was written.
+/// Opening of the one `candidate_confirm` refusal that asks for a decision rather than a repair.
+///
+/// It is matched as a prefix to give the refusal its own error code: `candidate_review_invalid`
+/// would tell a client to fix its arguments, when nothing about the arguments is malformed and
+/// what is missing is a human choice between superseding the Context this Candidate repeats and
+/// discarding the restatement.
+const EXACT_DUPLICATE_REQUIRES_DECISION: &str =
+    "This Candidate restates the accepted Context it was assessed against,";
+
+/// Opening of every refusal of an automatic Candidate confirmation.
+///
+/// Matched as a prefix to give the refusal its own error code, the same way
+/// [`EXACT_DUPLICATE_REQUIRES_DECISION`] is: nothing about the arguments is malformed, so
+/// `candidate_review_invalid` would send a client to repair a request that has no defect. What
+/// the request lacks is permission, and the repair is a human.
+const AUTO_CONFIRM_NOT_PERMITTED: &str =
+    "Automatic confirmation is not permitted for this Candidate:";
+
+/// Closing of every automatic-confirmation refusal. It names the one way forward.
+const AUTO_CONFIRM_ESCALATION: &str = "Present this Candidate to the user for review instead, and \
+     confirm it without decision_source (or with decision_source human) once they have decided.";
+
+/// Clause 1 of the automatic-confirmation permission surface: the Review is still undecided.
+fn auto_confirm_replay_violation(review: &CandidateReviewView) -> Option<String> {
+    (review.review_status != CandidateReviewStatus::Pending).then(|| {
+        "its Review is no longer pending; automatic confirmation cannot replay a decision"
+            .to_owned()
+    })
+}
+
+/// Clause 2: the analysis itself found nothing that needs a human.
+///
+/// The refusal names the step that is actually missing rather than the generic three. A Candidate
+/// stuck on `needs_space_review` does not need "a judgement about Space organization, duplication
+/// or contradiction" — it needs a Primary Space and a re-analysis, and an Agent that is told the
+/// generic sentence has no way to know which of the three applies to it or what to do next.
+fn auto_confirm_status_violation(review: &CandidateReviewView) -> Option<String> {
+    if review.candidate_status == AutomaticCandidateStatus::ReadyForReview {
+        return None;
+    }
+    let missing_step = match review.candidate_status {
+        AutomaticCandidateStatus::NeedsSpaceReview => {
+            "the analysis elected no existing Primary Space for it, so it needs one: create or \
+             pick the Space (space_create, or confirm a sibling Candidate into the proposed Space \
+             so the whole Task's group resolves onto it) and run candidate_analyze again"
+        }
+        AutomaticCandidateStatus::ExactDuplicateReview => {
+            "the analysis found an exact duplicate of a still-accepted Context, and which record \
+             survives is a human decision"
+        }
+        AutomaticCandidateStatus::PotentialContradictionReview => {
+            "the analysis found a potential contradiction, and which record is right is a human \
+             decision"
+        }
+        AutomaticCandidateStatus::Draft | AutomaticCandidateStatus::NeedsEvidence => {
+            "its analysis is not finished, so there is nothing to confirm yet"
+        }
+        AutomaticCandidateStatus::ReadyForReview => unreachable!("returned above"),
+    };
+    Some(format!(
+        "its candidate_status is {} rather than ready_for_review -- {missing_step}",
+        snake_case_name(&review.candidate_status)
+    ))
+}
+
+/// Clause 4: only a Candidate that adds knowledge or agrees with knowledge may skip the human.
+fn auto_confirm_relation_violation(review: &CandidateReviewView) -> Option<String> {
+    match top_assessment_relation(review) {
+        Some(CandidateAssessmentRelation::Novel | CandidateAssessmentRelation::Supports) => None,
+        Some(relation) => Some(format!(
+            "its top assessment relation is {}, and only novel or supports may be confirmed \
+             automatically",
+            snake_case_name(&relation)
+        )),
+        None => {
+            Some("its analysis produced no assessment, so no relation could be verified".to_owned())
+        }
+    }
+}
+
+/// The same `top_assessment` selection `compact_candidate_review` makes.
+fn top_assessment_relation(review: &CandidateReviewView) -> Option<CandidateAssessmentRelation> {
+    review
+        .analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)
+        .map(|assessment| assessment.relation)
+}
+
+/// Whether every clause of the permission surface that does not depend on the request is satisfied.
+///
+/// This is what `candidate_list` reports as `auto_confirmable`, and
+/// [`require_auto_confirm_permitted`] evaluates the very same three functions, so the listing and
+/// the refusal cannot disagree. They used to: the compact row published only `ready_for_review`,
+/// which is a *triage-visibility* flag whose predicate deliberately includes `needs_space_review`,
+/// and an Agent reading `ready_for_review: true` was then refused with
+/// `auto_confirm_not_permitted … candidate_status is needs_space_review`. Two faces, opposite
+/// answers, about one state.
+///
+/// The one clause left out is `edits`, which belongs to the request rather than to the Review and
+/// so cannot be answered by a listing. That is stated in the field's own documentation rather than
+/// inferred.
+fn auto_confirmable(review: &CandidateReviewView) -> bool {
+    auto_confirm_replay_violation(review).is_none()
+        && auto_confirm_status_violation(review).is_none()
+        && auto_confirm_relation_violation(review).is_none()
+}
+
+/// The whole permission surface an automatic Candidate confirmation is allowed inside.
+///
+/// Every condition is read from a value the server itself derived for this exact Review — the same
+/// `candidate_status` and the same `top_assessment` selection a reviewer would have been shown —
+/// so an Agent can never widen the surface by asserting something about its own request. A
+/// Candidate outside it is not downgraded to a human confirmation silently: it is refused, and the
+/// refusal names the condition it failed and the step that would clear it.
+///
+/// Both Primary shapes are permitted. An existing Space and a Space recommendation the server
+/// produced are both server-owned choices; what stays a human decision is Space governance beyond
+/// them, and no `candidate_confirm` argument can express that.
+fn require_auto_confirm_permitted(
+    review: &CandidateReviewView,
+    edits: &OptionalCandidateEdits,
+) -> Result<()> {
+    // Order is the refusal's order, not an implementation detail: a Candidate that trips several
+    // clauses is told about the earliest one, and the earliest is the one whose resolution comes
+    // first in time.
+    let violation = auto_confirm_replay_violation(review)
+        .or_else(|| auto_confirm_status_violation(review))
+        .or_else(|| {
+            (!edits.is_empty()).then(|| {
+                "the request carries edits, and rewriting a Candidate's content is a human decision"
+                    .to_owned()
+            })
+        })
+        .or_else(|| auto_confirm_relation_violation(review));
+    match violation {
+        None => Ok(()),
+        Some(violation) => Err(invalid(format!(
+            "{AUTO_CONFIRM_NOT_PERMITTED} {violation}. {AUTO_CONFIRM_ESCALATION}"
+        ))),
+    }
+}
+
+/// Longest author this system will record. An author is a username, not prose.
+const MAX_AUTHOR_CHARS: usize = 64;
+
+/// How long the global Git identity lookup is allowed to take before it is abandoned.
+///
+/// `git config --global --get user.email` reads one file and returns, but a confirmation must
+/// never be held up by a Git invocation that misbehaves on somebody's machine, so the lookup is
+/// bounded and a timeout simply means no author.
+const GIT_AUTHOR_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Process-lifetime author cache, keyed by installation root.
+///
+/// Resolving the author costs a file read and possibly a child process. A confirmation is a hot
+/// enough path — and a batch confirmation runs it once for many Candidates — that paying either
+/// cost per call is not worth it, and the answer cannot change inside one process in any way that
+/// matters. It is keyed by root so two installations in one process do not borrow each other's.
+static AUTHOR_CACHE: OnceLock<Mutex<BTreeMap<PathBuf, Option<String>>>> = OnceLock::new();
+
+/// Resolves the author to record with this installation's confirmations, once per process.
+///
+/// The install manifest wins: `sctx setup` and `sctx upgrade` already resolved the identity and
+/// wrote it down, so the steady state costs one small file read. Falling back to the live global
+/// Git identity covers an installation that predates the manifest field.
+///
+/// The knowledge repository's own local Git config is deliberately never consulted. It is written
+/// as a fixed writer identity (`Shared Context Writer <shared-context@localhost>`), so reading it
+/// would record that literal string as every user's author.
+fn resolve_author(root: &Path) -> Option<String> {
+    let cache = AUTHOR_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(entries) = cache.lock()
+        && let Some(cached) = entries.get(root)
+    {
+        return cached.clone();
+    }
+    let resolved = manifest_author(root).or_else(global_git_author);
+    if let Ok(mut entries) = cache.lock() {
+        entries.insert(root.to_path_buf(), resolved.clone());
+    }
+    resolved
+}
+
+/// Reads the author the installer cached, without depending on the installer's manifest type.
+///
+/// The manifest is read as plain JSON on purpose: `sctx-installer` depends on this crate, so the
+/// dependency cannot point the other way, and one optional string needs no shared type.
+fn manifest_author(root: &Path) -> Option<String> {
+    let bytes = fs::read(root.join("state/install-manifest.json")).ok()?;
+    let manifest: Value = serde_json::from_slice(&bytes).ok()?;
+    sanitized_author(manifest.get("author")?.as_str()?)
+}
+
+/// Reads the username portion of the global Git identity, under a bounded wait.
+fn global_git_author() -> Option<String> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new("git")
+            .args(["config", "--global", "--get", "user.email"])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output();
+        let _ = sender.send(output);
+    });
+    let output = receiver.recv_timeout(GIT_AUTHOR_TIMEOUT).ok()?.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8(output.stdout).ok()?;
+    author_from_email(&email)
+}
+
+/// Takes the username portion of one email address.
+///
+/// The address itself is never recorded: a bare username is not personal contact information, and
+/// it is all the reversal-rate question needs to attribute a confirmation.
+fn author_from_email(email: &str) -> Option<String> {
+    let email = email.trim();
+    let username = email.split_once('@').map_or(email, |(name, _)| name);
+    sanitized_author(username)
+}
+
+/// Accepts one author value only if it is a plausible bounded username.
+fn sanitized_author(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.chars().count() <= MAX_AUTHOR_CHARS
+        && !value.chars().any(char::is_whitespace)
+        && !value.contains('@'))
+    .then(|| value.to_owned())
+}
+
+/// Renders one `snake_case`-serialized domain enum by its exact wire name.
+fn snake_case_name<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// The Context an `exact_duplicate` top assessment points at, when it is still accepted.
+///
+/// Only the strongest assessment is read, selected exactly as `compact_candidate_review` selects
+/// the `top_assessment` a reviewer was shown, so the refusal is never about a relation the
+/// reviewer never saw. A duplicate found further down is a weaker relation among several, and a
+/// target whose revision is no longer accepted is no longer a fact this Candidate could repeat.
+fn accepted_duplicate_target(
+    snapshot: &DomainSnapshot,
+    analysis: &CandidateAnalysis,
+) -> Option<ContextId> {
+    let assessment = analysis
+        .assessments
+        .iter()
+        .max_by_key(|assessment| assessment.confidence.basis_points)?;
+    if assessment.relation != CandidateAssessmentRelation::ExactDuplicate {
+        return None;
+    }
+    let target = assessment.target?;
+    snapshot
+        .projection
+        .spaces
+        .values()
+        .flat_map(|space| space.contexts.values())
+        .find(|context| context.context_id == target.context_id)
+        .filter(|context| {
+            context
+                .revisions
+                .get(&target.revision_id)
+                .is_some_and(|revision| {
+                    revision.lifecycle == sctx_domain::RevisionLifecycle::Accepted
+                })
+        })
+        .map(|context| context.context_id)
+}
+
+fn batch_preparation_error(
+    position: usize,
+    candidate_id: sctx_domain::CandidateId,
+    error: &Error,
+) -> Error {
+    Error::new(
+        error.kind(),
+        format!(
+            "{} (batch item {position}, candidate {candidate_id}); no Candidate in this batch was written",
+            error.message()
+        ),
+    )
+}
+
+/// The Repository-qualified locator spelling one Claim Reference draft resolves to.
+///
+/// It matches [`sctx_search::SearchEngine::context_reference_locators`] exactly, so a Claim's
+/// derived coordinates and an injected Context's recorded coordinates compare as plain strings.
+fn reference_draft_locator(draft: &EngineeringReferenceDraft) -> String {
+    format!("{}:{}", draft.repository_id, draft.locator.path().as_str())
+}
+
+/// Normalized statement tokens used only for Builder deduplication.
+fn statement_tokens(statement: &str) -> BTreeSet<String> {
+    sctx_index::normalize_search_text(statement)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Deterministic token Jaccard in basis points.
+fn jaccard_basis_points(left: &BTreeSet<String>, right: &BTreeSet<String>) -> u16 {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let intersection = left.intersection(right).count();
+    let union = left.len() + right.len() - intersection;
+    if union == 0 {
+        return 0;
+    }
+    u16::try_from(intersection.saturating_mul(10_000) / union).unwrap_or(10_000)
 }
 
 fn sync_repository_catalog(
@@ -2888,7 +5929,7 @@ fn sync_repository_catalog_snapshot(
         .repositories
         .iter()
         .map(|repository| CatalogRepositorySpec {
-            repository_id: repository.repository_id,
+            repository_id: repository.repository_id.clone(),
             checkout_paths: repository.checkout_paths.clone(),
         })
         .collect::<Vec<_>>();
@@ -2918,6 +5959,22 @@ pub fn task_context_readonly_at_root(
     input: &TaskContextReadInput,
 ) -> Result<TaskContextResponse> {
     Runtime::open(root.as_ref())?.task_context_readonly(input)
+}
+
+/// Reads a Context Pack for an already-authoritative `ActiveTask` without mutation, budgeting the
+/// item/association selection itself against the requested `detail_level` instead of only
+/// re-shaping a Full-selected result. Local operator tooling (for example the CLI `--compact`
+/// flag) uses this so a Compact request actually admits more items under one token budget.
+///
+/// # Errors
+///
+/// Returns an input error when no Working Intent update established the Task.
+pub fn task_context_readonly_with_detail_at_root(
+    root: impl AsRef<Path>,
+    input: &TaskContextReadInput,
+    detail_level: ContextPackDetailLevel,
+) -> Result<TaskContextResponse> {
+    Runtime::open(root.as_ref())?.task_context_readonly_with_detail(input, detail_level)
 }
 
 /// Resolves one request-local Artifact Focus under `ActiveTask` Intent CAS and returns its Pack.
@@ -2956,11 +6013,11 @@ pub fn task_signal_supersede_at_root(
     Runtime::open(root.as_ref())?.task_signal_supersede(input)
 }
 
-/// Persists one explicit Agent-authored Checkpoint and builds Candidates only at a close boundary.
+/// Finalizes one Agent-authored Checkpoint for the caller's current `ActiveTask` and Intent.
 ///
 /// # Errors
 ///
-/// Returns typed Session/Task/Intent/Episode CAS, reference, privacy or storage errors.
+/// Returns typed Session ownership, Evidence, privacy, Builder, or storage errors.
 pub fn task_checkpoint_at_root(
     root: impl AsRef<Path>,
     input: &TaskCheckpointInput,
@@ -3006,6 +6063,22 @@ pub fn candidate_list_at_root(
     Runtime::open(root.as_ref())?.candidate_list(input)
 }
 
+/// Lists bounded whole Candidate Review summaries for one exact `ActiveTask`, budgeting the
+/// per-review token estimate against the requested `detail_level` instead of only re-shaping a
+/// Full-selected page. Local operator tooling (for example the CLI `--compact` flag) uses this so
+/// a Compact request actually admits more triage rows under one token budget.
+///
+/// # Errors
+///
+/// Returns typed Session, cursor, budget, Runtime, index, or Review assembly errors.
+pub fn candidate_list_with_detail_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateListInput,
+    detail_level: ContextPackDetailLevel,
+) -> Result<CandidateListResponse> {
+    Runtime::open(root.as_ref())?.candidate_list_with_detail(input, detail_level)
+}
+
 /// Gets one complete untrusted Candidate Review for one exact `ActiveTask`.
 ///
 /// # Errors
@@ -3030,6 +6103,18 @@ pub fn candidate_discard_at_root(
     Runtime::open(root.as_ref())?.candidate_discard(input)
 }
 
+/// Atomically discards several owned Pending Candidate Reviews.
+///
+/// # Errors
+///
+/// Returns typed validation, CAS, conflict or storage errors naming the failing `CandidateId`.
+pub fn candidate_discard_batch_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateDiscardBatchInput,
+) -> Result<CandidateDiscardBatchResponse> {
+    Runtime::open(root.as_ref())?.candidate_discard_batch(input)
+}
+
 /// Confirms one owned Pending Candidate Review into an atomic knowledge fact closure.
 ///
 /// # Errors
@@ -3040,6 +6125,37 @@ pub fn candidate_confirm_at_root(
     input: &CandidateConfirmInput,
 ) -> Result<CandidateConfirmResponse> {
     Runtime::open(root.as_ref())?.candidate_confirm(input)
+}
+
+/// Confirms one Candidate against an already-built embedding channel handle.
+///
+/// Separate entry point for the same reason [`McpServer::set_semantic_channel`] exists: the handle
+/// is owned by a `serve` process, and a test that needs to observe what a Confirmation asks of it
+/// has no `serve` process and no ONNX model on disk.
+///
+/// # Errors
+///
+/// Identical to [`candidate_confirm_at_root`].
+#[doc(hidden)]
+pub fn candidate_confirm_at_root_with_semantic_channel(
+    root: impl AsRef<Path>,
+    input: &CandidateConfirmInput,
+    semantic: SemanticChannelHandle,
+) -> Result<CandidateConfirmResponse> {
+    Runtime::open_with_semantic(root.as_ref(), Some(semantic))?.candidate_confirm(input)
+}
+
+/// Confirms several owned Pending Candidates under one Space organization.
+///
+/// # Errors
+///
+/// Returns typed validation, CAS, conflict, privacy or storage errors naming the failing
+/// `CandidateId`; a rejected plan is reported before any Candidate is written.
+pub fn candidate_confirm_batch_at_root(
+    root: impl AsRef<Path>,
+    input: &CandidateConfirmBatchInput,
+) -> Result<CandidateConfirmBatchResponse> {
+    Runtime::open(root.as_ref())?.candidate_confirm_batch(input)
 }
 
 /// Registers and scans one canonical local Git Repository without returning source text.
@@ -3066,6 +6182,45 @@ pub fn engineering_reference_record_at_root(
     Runtime::open(root.as_ref())?.engineering_reference_record(input)
 }
 
+/// Creates one explicitly named Space from a complete Intent snapshot.
+///
+/// # Errors
+///
+/// Returns typed Intent validation, privacy, Writer, or projection errors.
+pub fn space_create_at_root(
+    root: impl AsRef<Path>,
+    input: &SpaceCreateInput,
+) -> Result<SpaceCreateResponse> {
+    Runtime::open(root.as_ref())?.space_create(input)
+}
+
+/// Outcome of the bounded first Graph scan that follows a Repository registration.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RepositoryFirstScanReport {
+    /// False only when `[engineering] auto_scan` is off; nothing was scanned.
+    pub attempted: bool,
+    /// False when the scan ran out of its budget; the previous projection is untouched.
+    pub completed: bool,
+    pub rebuild: Option<AssociationRebuildResponse>,
+}
+
+/// Scans the registered checkouts once, right after a Repository was registered.
+///
+/// Honors `[engineering] auto_scan`: with the switch off nothing is scanned and the report says so.
+///
+/// # Errors
+///
+/// Returns typed Registry, scanner, resolver, projection, or Context snapshot errors.
+pub fn repository_first_scan_at_root(root: impl AsRef<Path>) -> Result<RepositoryFirstScanReport> {
+    let runtime = Runtime::open(root.as_ref())?;
+    let report = runtime.repository_first_scan()?;
+    if report.completed {
+        // The checkouts were just read anyway, so the advisory `recheck_when` pass rides along.
+        let _ = runtime.context_recheck();
+    }
+    Ok(report)
+}
+
 /// Rebuilds or diagnoses the current Engineering projection from registered Repositories.
 ///
 /// # Errors
@@ -3075,7 +6230,27 @@ pub fn association_rebuild_at_root(
     root: impl AsRef<Path>,
     input: &AssociationRebuildInput,
 ) -> Result<AssociationRebuildResponse> {
-    Runtime::open(root.as_ref())?.association_rebuild(input)
+    let runtime = Runtime::open(root.as_ref())?;
+    let response = runtime.association_rebuild(input)?;
+    if !input.diagnose_only {
+        // A rebuild is the moment the local checkouts were just read anyway, so the structured
+        // `recheck_when` evaluation rides along. It is advisory local state: a failure here must
+        // not turn a successful Graph rebuild into an error.
+        let _ = runtime.context_recheck();
+    }
+    Ok(response)
+}
+
+/// Evaluates every accepted Context's structured `recheck_when` entries against local checkouts.
+///
+/// The outcome is recorded in this machine's `context_item.stale_reason` projection column and
+/// never written to Git. It is cleared by any projection rebuild, so re-run it after new Events.
+///
+/// # Errors
+///
+/// Returns typed storage errors. An unanswerable condition is reported, not raised.
+pub fn context_recheck_at_root(root: impl AsRef<Path>) -> Result<ContextRecheckResponse> {
+    Runtime::open(root.as_ref())?.context_recheck()
 }
 
 /// Explains one current Reference resolution without selecting ambiguous candidates.
@@ -3090,13 +6265,96 @@ pub fn association_explain_at_root(
     Runtime::open(root.as_ref())?.association_explain(input)
 }
 
+/// Translates the explicit local `[context_ttl]` policy into query-time retrieval settings.
+const fn context_ttl_settings(policy: &sctx_local_state::ContextTtlPolicy) -> ContextTtlSettings {
+    ContextTtlSettings {
+        validation_seconds: policy.validation_seconds,
+        progress_seconds: policy.progress_seconds,
+        now_unix_seconds: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Reads the installation-local Context usage prior out of Task Runtime state.
+///
+/// Every failure degrades to "no prior": the ranking signal is advisory local state, and a busy
+/// or unreadable Runtime database must never turn a retrieval into an error or a different Pack
+/// than the one an installation without recorded usage would return.
+#[derive(Clone, Debug)]
+struct RuntimeUsagePrior {
+    tasks: TaskRuntime,
+}
+
+impl UsagePriorSource for RuntimeUsagePrior {
+    fn usage_counts(&self, context_ids: &[ContextId]) -> BTreeMap<ContextId, ContextUsageCounts> {
+        self.tasks
+            .context_usage_totals(context_ids)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(context_id, totals)| {
+                (
+                    context_id,
+                    ContextUsageCounts {
+                        reused: totals.reused,
+                        ignored: totals.ignored,
+                        refuted: totals.refuted,
+                    },
+                )
+            })
+            .collect()
+    }
+}
+
+/// Records which Contexts one retrieval entry point just handed to the Agent.
+///
+/// The record is disposable local state and strictly best effort: it is written after the
+/// response is already built, and any storage failure is dropped so the Agent still receives the
+/// Pack it was going to receive.
+fn record_injected_contexts(
+    tasks: &TaskRuntime,
+    response: &TaskContextResponse,
+    source: ContextInjectionSource,
+) {
+    let injected = response
+        .items
+        .iter()
+        .map(|item| InjectedContext {
+            context_id: item.context.context_id,
+            revision_id: item.context.revision_id,
+        })
+        .chain(response.compact_items.iter().map(|item| InjectedContext {
+            context_id: item.context_id,
+            revision_id: item.revision_id,
+        }))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if injected.is_empty() {
+        return;
+    }
+    let _ = tasks.record_task_injections(
+        response.task_id,
+        response.intent_revision_id,
+        source,
+        &injected,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_task_context_response(
     index: &ProjectionIndex,
     engineering_graph: Option<&EngineeringProjectionStore>,
+    tasks: &TaskRuntime,
+    injection_source: ContextInjectionSource,
     snapshot: &TaskSessionSnapshot,
     resolved_focus: Option<ResolvedFocus>,
     token_budget: usize,
     max_spaces: usize,
+    detail_level: ContextPackDetailLevel,
+    context_ttl: ContextTtlSettings,
+    semantic: Option<&SemanticChannelHandle>,
+    hop2_admission_floor_basis_points: Option<u16>,
+    pack_wire_token_ceiling: Option<usize>,
 ) -> Result<TaskContextResponse> {
     let current = snapshot
         .current_intent_revision()
@@ -3107,31 +6365,45 @@ fn build_task_context_response(
         snapshot.task_signals.clone(),
         token_budget,
     );
+    // ADR-0007's first lane reads where the Session has been, not what it is looking at now, so it
+    // is handed the whole Signal history -- superseded rows included. A history this read cannot
+    // get is a smaller footprint, never a failed retrieval: the Pack degrades to the active window
+    // the snapshot already carries.
+    request.signal_history = tasks
+        .read_signal_history(snapshot.task_session_id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| record.signal)
+        .collect();
     request.resolved_focus = resolved_focus;
     request.max_spaces = max_spaces;
-    let pack = if let Some(engineering_graph) = engineering_graph {
+    let mut engine = if let Some(engineering_graph) = engineering_graph {
         SearchEngine::with_engineering_graph(index.clone(), engineering_graph.clone())
-            .task_context_pack(&request)?
     } else {
-        SearchEngine::new(index.clone()).task_context_pack(&request)?
+        SearchEngine::new(index.clone())
     };
-    let retrieval_paths = pack
-        .items
-        .iter()
-        .map(|item| TaskContextRetrievalPaths {
-            association_space_id: item.association_space_id,
-            context_id: item.context.context_id,
-            paths: item.retrieval_paths.clone(),
-        })
-        .collect();
-    Ok(TaskContextResponse {
+    if let Some(semantic) = semantic {
+        engine = engine.with_semantic_channel(Arc::new(semantic.clone()));
+    }
+    let pack = engine
+        .with_context_ttl(context_ttl)
+        .with_hop2_admission_floor(hop2_admission_floor_basis_points)
+        .with_pack_wire_token_ceiling(pack_wire_token_ceiling)
+        .with_usage_prior(Arc::new(RuntimeUsagePrior {
+            tasks: tasks.clone(),
+        }))
+        .task_context_pack_with_detail(&request, detail_level)?;
+    let response = TaskContextResponse {
         task_session_id: snapshot.task_session_id,
         task_id: snapshot.task_id,
         intent_revision_id: current.revision_id,
+        detail_level: pack.detail_level,
         candidate_spaces: pack.associations,
+        compact_candidate_spaces: pack.compact_associations,
         items: pack.items,
-        retrieval_paths,
+        compact_items: pack.compact_items,
         graph_diagnostics: pack.graph_diagnostics,
+        query_token_explanation: pack.query_token_explanation,
         task_fingerprint: pack.task_fingerprint,
         tree: pack.indexed_tree_oid,
         generation: pack.projection_generation,
@@ -3140,28 +6412,120 @@ fn build_task_context_response(
         token_budget: pack.token_budget,
         estimated_tokens: pack.estimated_tokens,
         omitted: pack.omitted,
-    })
+        // Only the compact shape reports it, so only the compact shape pays the count. A failure
+        // to count is not a failure to retrieve: the Pack is still the Pack, and the reminder is
+        // simply absent.
+        // The Pack's own shape, not the requested one: a Pack the wire ceiling handed back compact
+        // is a compact Pack, and this field is the compact shape's.
+        pending_candidates_in_other_tasks: (pack.detail_level == ContextPackDetailLevel::Compact)
+            .then(|| {
+                tasks
+                    .count_pending_candidates_in_other_tasks(
+                        snapshot.task_session_id,
+                        snapshot.task_id,
+                    )
+                    .ok()
+                    .filter(|count| *count > 0)
+            })
+            .flatten(),
+    };
+    record_injected_contexts(tasks, &response, injection_source);
+    Ok(response)
 }
+
+mod semantic;
+
+pub use semantic::{SemanticWarmReport, warm_semantic_cache_at_root};
 
 /// Stateful MCP request dispatcher for one stdio session.
 pub struct McpServer {
-    runtime: Runtime,
+    root: PathBuf,
+    telemetry_root: Option<PathBuf>,
+    runtime: Option<Runtime>,
     client: ClientKind,
     initialized: bool,
+    authorization_linearization_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// The optional embedding channel, loaded once per `serve` process rather than once per call.
+    ///
+    /// It lives here, not on [`Runtime`], because `Runtime` is rebuilt for every tool call and a
+    /// 9--12 second model load per call would be absurd. `None` is the ordinary state: no
+    /// `[retrieval]` table, no channel, no cost.
+    semantic: Option<SemanticChannelHandle>,
+    /// This installation's runtime team policy, resolved once per process.
+    ///
+    /// The tool surface is rendered on every `tools/list` and the ACK notice on every accepted
+    /// Checkpoint, so re-reading `policy.md` per call would put a file read on both. Resolution
+    /// never fails: an absent, unreadable, or oversize file yields the compiled-in default, and
+    /// `sctx doctor` is where the operator learns which of those happened.
+    policy: Policy,
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedCallSnapshot {
+    catalog: RepositoryCatalogSnapshot,
+    scope: AuthorizedSessionScope,
+    /// `[context_ttl]` read from the same `config.toml` read that froze `catalog`.
+    context_ttl: ContextTtlSettings,
 }
 
 impl McpServer {
-    /// Opens the unique store, rebuildable projection, and local Task Runtime.
+    /// Constructs a lazy server without opening Store, Index, Graph, or Task Runtime state.
     ///
     /// # Errors
     ///
-    /// Returns storage/configuration errors from the existing runtime boundaries.
+    /// Returns an I/O error only when the installation root cannot be made absolute.
     pub fn new(root: impl AsRef<Path>, client: ClientKind) -> Result<Self> {
+        let root = std::path::absolute(root.as_ref()).map_err(|error| {
+            Error::new(ErrorKind::Io, format!("make MCP root absolute: {error}"))
+        })?;
+        let policy = installation_policy(&root).policy;
         Ok(Self {
-            runtime: Runtime::open(root.as_ref())?,
+            root,
+            // Programmatic/in-process servers are common in tests and demos. Only the real stdio
+            // boundary opts into ambient per-user telemetry; injected callers may set a root.
+            telemetry_root: None,
+            runtime: None,
             client,
             initialized: false,
+            authorization_linearization_hook: None,
+            semantic: None,
+            policy,
         })
+    }
+
+    /// Starts the background embedding loader for this process, if `[retrieval]` configures one.
+    ///
+    /// Separate from [`Self::new`] on purpose: `new` is the constructor every test and in-process
+    /// caller uses, and none of them should start a thread that opens a two gigabyte model. Only
+    /// [`serve_stdio`], the long-lived process the ADR budgets the load against, calls this.
+    pub fn start_semantic_channel(&mut self) {
+        self.semantic = semantic::spawn_semantic_loader(&self.root);
+    }
+
+    /// Attaches an already-built embedding channel, for tests that must exercise the fused
+    /// channel without an ONNX model on disk.
+    #[doc(hidden)]
+    pub fn set_semantic_channel(&mut self, semantic: SemanticChannelHandle) {
+        self.semantic = Some(semantic);
+    }
+
+    /// Installs a controlled test seam immediately after authorization has
+    /// linearized and before any business Runtime is opened.
+    #[doc(hidden)]
+    pub fn set_authorization_linearization_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.authorization_linearization_hook = Some(hook);
+    }
+
+    /// Overrides the independent telemetry root without changing process environment.
+    #[doc(hidden)]
+    pub fn set_telemetry_root_for_test(&mut self, root: Option<PathBuf>) {
+        self.telemetry_root = root;
+    }
+
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("authorized MCP dispatch must open Runtime")
     }
 
     /// Runs requests until stdin reaches a clean EOF.
@@ -3178,7 +6542,19 @@ impl McpServer {
     ) -> std::result::Result<ServeOutcome, TransportError> {
         let mut requests_handled = 0_u64;
         loop {
-            let Some(frame) = read_frame(reader)? else {
+            let frame = match read_frame(reader) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    emit_mcp_protocol_failure(
+                        self.telemetry_root.as_deref(),
+                        "transport_read",
+                        transport_error_code(error.kind()),
+                        "transport",
+                    );
+                    return Err(error);
+                }
+            };
+            let Some(frame) = frame else {
                 return Ok(ServeOutcome {
                     disconnect: DisconnectReason::CleanEof,
                     requests_handled,
@@ -3187,23 +6563,45 @@ impl McpServer {
             requests_handled = requests_handled.saturating_add(1);
             let response = match serde_json::from_slice::<Value>(&frame.body) {
                 Ok(request) => self.dispatch(request),
-                Err(error) => Some(rpc_error(
-                    Value::Null,
-                    -32_700,
-                    "Parse error",
-                    "parse_error",
-                    Some(error.to_string()),
-                )),
+                Err(error) => {
+                    emit_mcp_protocol_failure(
+                        self.telemetry_root.as_deref(),
+                        "request_parse",
+                        "parse_error",
+                        "protocol",
+                    );
+                    Some(rpc_error(
+                        Value::Null,
+                        -32_700,
+                        "Parse error",
+                        "parse_error",
+                        Some(error.to_string()),
+                    ))
+                }
             };
             if let Some(response) = response {
-                write_frame(writer, &response, frame.style)?;
+                if let Err(error) = write_frame(writer, &response, frame.style) {
+                    emit_mcp_protocol_failure(
+                        self.telemetry_root.as_deref(),
+                        "transport_write",
+                        transport_error_code(error.kind()),
+                        "transport",
+                    );
+                    return Err(error);
+                }
             }
         }
     }
 
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn dispatch(&mut self, request: Value) -> Option<Value> {
         let Some(object) = request.as_object() else {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "invalid_request",
+                "protocol",
+            );
             return Some(rpc_error(
                 Value::Null,
                 -32_600,
@@ -3214,6 +6612,12 @@ impl McpServer {
         };
         let id = object.get("id").cloned();
         if object.get("jsonrpc") != Some(&Value::String("2.0".to_owned())) {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "invalid_request",
+                "protocol",
+            );
             return Some(rpc_error(
                 id.unwrap_or(Value::Null),
                 -32_600,
@@ -3223,6 +6627,12 @@ impl McpServer {
             ));
         }
         let Some(method) = object.get("method").and_then(Value::as_str) else {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "invalid_request",
+                "protocol",
+            );
             return Some(rpc_error(
                 id.unwrap_or(Value::Null),
                 -32_600,
@@ -3244,6 +6654,12 @@ impl McpServer {
         }
         let id = id.unwrap_or(Value::Null);
         if matches!(method, "tools/list" | "tools/call") && !self.initialized {
+            emit_mcp_protocol_failure(
+                self.telemetry_root.as_deref(),
+                "request_validation",
+                "server_not_initialized",
+                "protocol",
+            );
             return Some(rpc_error(
                 id,
                 -32_002,
@@ -3255,9 +6671,15 @@ impl McpServer {
         let result = match method {
             "initialize" => self.initialize(&params),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(tools_list()),
+            "tools/list" => Ok(tools_list(&self.policy)),
             "tools/call" => self.tools_call(params),
             _ => {
+                emit_mcp_protocol_failure(
+                    self.telemetry_root.as_deref(),
+                    "request_dispatch",
+                    "method_not_found",
+                    "protocol",
+                );
                 return Some(rpc_error(
                     id,
                     -32_601,
@@ -3269,13 +6691,21 @@ impl McpServer {
         };
         match result {
             Ok(result) => Some(json!({"jsonrpc": "2.0", "id": id, "result": result})),
-            Err(error) => Some(rpc_error(
-                id,
-                -32_602,
-                "Invalid params",
-                error_code(error.kind()),
-                Some(error.message().to_owned()),
-            )),
+            Err(error) => {
+                emit_mcp_protocol_failure(
+                    self.telemetry_root.as_deref(),
+                    "request_parameters",
+                    error_code(error.kind()),
+                    "protocol",
+                );
+                Some(rpc_error(
+                    id,
+                    -32_602,
+                    "Invalid params",
+                    error_code(error.kind()),
+                    Some(error.message().to_owned()),
+                ))
+            }
         }
     }
 
@@ -3305,36 +6735,121 @@ impl McpServer {
     fn tools_call(&mut self, params: Value) -> Result<Value> {
         let call: ToolCall = serde_json::from_value(params)
             .map_err(|error| invalid(format!("invalid tools/call params: {error}")))?;
-        let result = match call.name.as_str() {
-            "task_intent_update" => self.task_intent_update(call.arguments),
-            "task_artifact_focus" => self.task_artifact_focus(call.arguments),
-            "task_signal_supersede" => self.task_signal_supersede(call.arguments),
-            "task_checkpoint" => self.task_checkpoint(call.arguments),
-            "task_context" => self.task_context(call.arguments),
-            "repository_scan" => self.repository_scan(call.arguments),
-            "engineering_reference_record" => self.engineering_reference_record(call.arguments),
-            "association_explain" => self.association_explain(call.arguments),
-            "association_rebuild" => self.association_rebuild(call.arguments),
-            "context_search" => self.context_search(call.arguments),
-            "context_get" => self.context_get(call.arguments),
-            "candidate_list" => self.candidate_list(call.arguments),
-            "candidate_get" => self.candidate_get(call.arguments),
-            "candidate_discard" => self.candidate_discard(call.arguments),
-            "candidate_confirm" => self.candidate_confirm(call.arguments),
-            "space_list" => self.space_list(call.arguments),
-            _ => return Err(invalid(format!("unknown tool: {}", call.name))),
-        };
+        if !is_public_tool(&call.name) {
+            return Err(invalid(format!("unknown tool: {}", call.name)));
+        }
+        let telemetry = McpToolTelemetry::start(&call, self.client, self.telemetry_root.clone());
+        let is_checkpoint = call.name == "task_checkpoint";
+        self.runtime = None;
+        let result = MaintenanceLock::open_or_create(&self.root)
+            .and_then(|lock| lock.try_shared())
+            .map_err(ToolFailure::maintenance_failed)
+            .and_then(|_maintenance| self.authorize_and_call(&call));
+        // Observe the typed business result before it is converted into an always-Ok MCP
+        // envelope. `isError: true` failures must count as failures, not successful Rust Results.
+        telemetry.finish(&result);
         match result {
+            Ok(data) if is_checkpoint => tool_success_with_notice(data, |data| {
+                task_checkpoint_ack_notice(&self.policy, data)
+            }),
             Ok(data) => tool_success(data),
             Err(failure) => tool_failure(failure),
         }
     }
 
+    fn authorize_and_call(&mut self, call: &ToolCall) -> ToolResult {
+        validate_public_arguments(&call.name, &call.arguments)?;
+        let locator = locator_from_arguments(&call.arguments)?;
+        if locator.agent_kind
+            != match self.client {
+                ClientKind::Cursor => "cursor",
+                ClientKind::Codex => "codex",
+            }
+        {
+            return Err(ToolFailure::locator_invalid());
+        }
+        let authorization = authorize_public_call(&self.root, &locator)?;
+        if let Some(hook) = &self.authorization_linearization_hook {
+            hook();
+        }
+        let preflight_tasks = if requires_runtime_identity_preflight(&call.name) {
+            let runtime_database = self.root.join("state/runtime.sqlite");
+            if !runtime_database.is_file() {
+                return Err(identity_target_unavailable(&call.name));
+            }
+            let tasks = TaskRuntime::initialize(&self.root)
+                .map_err(|error| runtime_open_failure(&call.name, error))?;
+            authorize_runtime_identity_target(&call.name, &call.arguments, &tasks)?;
+            Some(tasks)
+        } else {
+            None
+        };
+        // A durable Checkpoint ACK is Runtime state only (ADR-0003), so it answers from the
+        // database the identity preflight already opened. Opening the Git store, the retrieval
+        // index and the Repository Registry here would be latency the receipt never spends.
+        if call.name == "task_checkpoint" {
+            let tasks = preflight_tasks.ok_or_else(|| identity_target_unavailable(&call.name))?;
+            let input: TaskCheckpointInput = decode_arguments(call.arguments.clone())?;
+            let response =
+                durable_checkpoint(&tasks, &input).map_err(ToolFailure::task_context_failed)?;
+            return serde_json::to_value(response).map_err(serialization_failure);
+        }
+        // Every remaining tool reuses exactly what authorization and the identity preflight
+        // already opened: the frozen Catalog, its `[context_ttl]` from the same read, and the
+        // Task Runtime the preflight resolved this call's identity target against.
+        let runtime = Runtime::open_with_catalog(
+            &self.root,
+            authorization.catalog.clone(),
+            RuntimeOpenParts {
+                session_scope: Some(authorization.scope.clone()),
+                context_ttl: Some(authorization.context_ttl),
+                tasks: preflight_tasks,
+                semantic: self.semantic.clone(),
+            },
+        )
+        .map_err(|error| runtime_open_failure(&call.name, error))?;
+        self.runtime = Some(runtime);
+        let arguments = call.arguments.clone();
+        match call.name.as_str() {
+            "task_intent_update" => self.task_intent_update(arguments),
+            "task_artifact_focus" => self.task_artifact_focus(arguments),
+            "task_signal_supersede" => self.task_signal_supersede(arguments),
+            "task_context" => self.task_context(arguments),
+            "repository_scan" => self.repository_scan(arguments),
+            "engineering_reference_record" => self.engineering_reference_record(arguments),
+            "association_explain" => self.association_explain(arguments),
+            "association_rebuild" => self.association_rebuild(arguments),
+            "context_search" => self.context_search(arguments),
+            "context_get" => self.context_get(arguments),
+            "candidate_list" => self.candidate_list(arguments),
+            "candidate_get" => self.candidate_get(arguments),
+            "candidate_discard" => self.candidate_discard(arguments),
+            "candidate_confirm" => self.candidate_confirm(arguments),
+            "space_list" => self.space_list(arguments),
+            "space_create" => self.space_create(arguments),
+            _ => unreachable!("public tool was validated before dispatch"),
+        }
+    }
+
     fn context_search(&self, arguments: Value) -> ToolResult {
         let input: SearchInput = decode_arguments(arguments)?;
-        let response =
-            SearchEngine::new(self.runtime.index.clone()).search(&input.into_request()?)?;
+        let request = input.into_request()?;
+        let match_mode = request.match_mode;
+        let response = SearchEngine::new(self.runtime().index.clone())
+            .with_context_ttl(self.runtime().context_ttl)
+            .search(&request)?;
         let conflicts = collect_conflicts(&response.results);
+        let coverage_basis_points = response
+            .results
+            .iter()
+            .map(|result| {
+                json!({
+                    "context_id": result.context_id,
+                    "revision_id": result.revision_id,
+                    "coverage_basis_points": result.match_reason.coverage_basis_points,
+                })
+            })
+            .collect::<Vec<_>>();
         let mut data = serde_json::to_value(response).map_err(serialization_failure)?;
         insert_fields(
             &mut data,
@@ -3343,6 +6858,11 @@ impl McpServer {
                     "conflicts",
                     serde_json::to_value(conflicts).map_err(serialization_failure)?,
                 ),
+                (
+                    "match_mode",
+                    serde_json::to_value(match_mode).map_err(serialization_failure)?,
+                ),
+                ("coverage_basis_points", Value::Array(coverage_basis_points)),
                 (
                     "match_reason",
                     json!("structured_filters_and_full_text_rank"),
@@ -3353,82 +6873,118 @@ impl McpServer {
     }
 
     fn task_context(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: TaskContextReadInput = decode_arguments(arguments)?;
         input.validate()?;
         let response = self
-            .runtime
-            .task_context_readonly(&input)
+            .runtime()
+            .task_context_readonly_with_detail(&input, detail_level)
             .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
+        match detail_level {
+            ContextPackDetailLevel::Compact => {
+                serde_json::to_value(response.compact()).map_err(serialization_failure)
+            }
+            ContextPackDetailLevel::Full => {
+                serde_json::to_value(response).map_err(serialization_failure)
+            }
+        }
     }
 
     fn task_intent_update(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: TaskIntentUpdateInput = decode_arguments(arguments)?;
         let response = self
-            .runtime
-            .task_intent_update(&input)
+            .runtime()
+            .task_intent_update_with_detail(&input, detail_level)
             .map_err(ToolFailure::intent_update_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
+        match detail_level {
+            ContextPackDetailLevel::Compact => {
+                serde_json::to_value(CompactTaskIntentUpdateResponse {
+                    context: response.context.compact(),
+                    revision_status: response.revision_status,
+                    active_signals: response.active_signals,
+                })
+                .map_err(serialization_failure)
+            }
+            ContextPackDetailLevel::Full => {
+                serde_json::to_value(response).map_err(serialization_failure)
+            }
+        }
     }
 
     fn task_artifact_focus(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: ArtifactFocusQuery = decode_arguments(arguments)?;
         let response = self
-            .runtime
-            .task_artifact_focus(&input)
+            .runtime()
+            .task_artifact_focus_with_detail(&input, detail_level)
             .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
+        match detail_level {
+            ContextPackDetailLevel::Compact => {
+                serde_json::to_value(CompactArtifactFocusQueryResponse {
+                    resolved_focus: response.resolved_focus,
+                    context: response.context.compact(),
+                })
+                .map_err(serialization_failure)
+            }
+            ContextPackDetailLevel::Full => {
+                serde_json::to_value(response).map_err(serialization_failure)
+            }
+        }
     }
 
     fn task_signal_supersede(&self, arguments: Value) -> ToolResult {
         let input: TaskSignalSupersedeInput = decode_arguments(arguments)?;
         let response = self
-            .runtime
+            .runtime()
             .task_signal_supersede(&input)
             .map_err(ToolFailure::task_context_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
-    fn task_checkpoint(&self, arguments: Value) -> ToolResult {
-        let input: TaskCheckpointInput = decode_arguments(arguments)?;
-        let response = self
-            .runtime
-            .task_checkpoint(&input)
-            .map_err(ToolFailure::task_context_failed)?;
-        serde_json::to_value(response).map_err(serialization_failure)
-    }
-
     fn repository_scan(&self, arguments: Value) -> ToolResult {
-        let input: RepositoryScanInput = decode_arguments(arguments)?;
+        let input = decode_arguments::<McpRepositoryScanInput>(arguments)?.into_inner();
         let response = self
-            .runtime
+            .runtime()
             .repository_scan(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
+    fn space_create(&self, arguments: Value) -> ToolResult {
+        let input = decode_arguments::<McpSpaceCreateInput>(arguments)?.into_inner();
+        let response = self.runtime().space_create(&input)?;
+        serde_json::to_value(response).map_err(serialization_failure)
+    }
+
     fn engineering_reference_record(&self, arguments: Value) -> ToolResult {
-        let input: EngineeringReferenceRecordInput = decode_arguments(arguments)?;
+        let input = decode_arguments::<McpEngineeringReferenceRecordInput>(arguments)?.into_inner();
         let response = self
-            .runtime
+            .runtime()
             .engineering_reference_record(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn association_explain(&self, arguments: Value) -> ToolResult {
-        let input: AssociationExplainInput = decode_arguments(arguments)?;
+        let input: McpAssociationExplainInput = decode_arguments(arguments)?;
+        let input = AssociationExplainInput {
+            reference_id: input.reference_id,
+        };
         let response = self
-            .runtime
+            .runtime()
             .association_explain(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
     }
 
     fn association_rebuild(&self, arguments: Value) -> ToolResult {
-        let input: AssociationRebuildInput = decode_arguments(arguments)?;
+        let input: McpAssociationRebuildInput = decode_arguments(arguments)?;
+        let input = AssociationRebuildInput {
+            diagnose_only: input.diagnose_only,
+        };
         let response = self
-            .runtime
+            .runtime()
             .association_rebuild(&input)
             .map_err(ToolFailure::engineering_graph_failed)?;
         serde_json::to_value(response).map_err(serialization_failure)
@@ -3447,7 +7003,7 @@ impl McpServer {
             .as_deref()
             .map(|value| parse_id::<SpaceId>(value, "space_id"))
             .transpose()?;
-        let snapshot = self.runtime.snapshot()?;
+        let snapshot = self.runtime().snapshot()?;
         let (found_space_id, context) = find_context(&snapshot, space_id, context_id)?;
         let value = if let Some(revision_id) = revision_id {
             let revision = context.revisions.get(&revision_id).ok_or_else(|| {
@@ -3471,8 +7027,8 @@ impl McpServer {
     }
 
     fn space_list(&self, arguments: Value) -> ToolResult {
-        let _: EmptyInput = decode_arguments(arguments)?;
-        let snapshot = self.runtime.snapshot()?;
+        let _: SessionInput = decode_arguments(arguments)?;
+        let snapshot = self.runtime().snapshot()?;
         let spaces = snapshot
             .projection
             .spaces
@@ -3490,6 +7046,8 @@ impl McpServer {
                     "intent_heads": space.intent.heads,
                     "titles": titles,
                     "context_count": space.contexts.len(),
+                    // A conflicted Space has no winning head, so it never reports provisional.
+                    "provisional": sctx_domain::space_is_provisional(space),
                     "conflicts": if space.intent.heads.len() > 1 {
                         vec![json!({"kind": "intent", "status": "open", "heads": space.intent.heads})]
                     } else { Vec::new() },
@@ -3507,63 +7065,88 @@ impl McpServer {
     }
 
     fn candidate_list(&self, arguments: Value) -> ToolResult {
+        let (arguments, detail_level) = split_detail_level(arguments)?;
         let input: CandidateListInput = decode_arguments(arguments)?;
-        self.runtime
-            .candidate_list(&input)
+        let runtime = self.runtime();
+        runtime
+            .candidate_list_with_detail(&input, detail_level)
             .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate Review list: {error}"),
-                    )
-                })
+                if detail_level == ContextPackDetailLevel::Compact {
+                    return serialize_candidate_reviews(&response.compact());
+                }
+                let mut value = serialize_candidate_reviews(&response)?;
+                if let Some(rows) = value.get_mut("reviews").and_then(Value::as_array_mut) {
+                    for (row, summary) in rows.iter_mut().zip(response.reviews.iter()) {
+                        insert_review_aids(runtime, row, &summary.0)?;
+                        insert_language_hint(row, &summary.0.content.statement);
+                        insert_space_recommendation_provisional(
+                            row,
+                            &response.provisional_space_ids,
+                        );
+                    }
+                }
+                Ok(value)
             })
             .map_err(ToolFailure::candidate_review_failed)
     }
 
     fn candidate_get(&self, arguments: Value) -> ToolResult {
         let input: CandidateGetInput = decode_arguments(arguments)?;
-        self.runtime
+        let runtime = self.runtime();
+        runtime
             .candidate_get(&input)
             .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate Review: {error}"),
-                    )
-                })
+                let mut value = serialize_candidate_reviews(&response)?;
+                insert_review_aids(runtime, &mut value, &response)?;
+                insert_space_recommendation_provisional(
+                    &mut value,
+                    &provisional_space_ids(runtime.snapshot()?.as_ref()),
+                );
+                Ok(value)
             })
             .map_err(ToolFailure::candidate_review_failed)
     }
 
     fn candidate_discard(&self, arguments: Value) -> ToolResult {
-        let input: CandidateDiscardInput = decode_arguments(arguments)?;
-        self.runtime
-            .candidate_discard(&input)
-            .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate discard response: {error}"),
-                    )
-                })
+        let runtime = self.runtime();
+        match decode_candidate_discard_request(arguments)? {
+            CandidateDiscardRequest::Single(input) => runtime
+                .candidate_discard(&input)
+                .map(|response| CandidateDiscardOutcome::Single(Box::new(response))),
+            CandidateDiscardRequest::Batch(input) => runtime
+                .candidate_discard_batch(&input)
+                .map(CandidateDiscardOutcome::Batch),
+        }
+        .and_then(|response| {
+            serde_json::to_value(response).map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("serialize Candidate discard response: {error}"),
+                )
             })
-            .map_err(ToolFailure::candidate_review_failed)
+        })
+        .map_err(ToolFailure::candidate_review_failed)
     }
 
     fn candidate_confirm(&self, arguments: Value) -> ToolResult {
-        let input: CandidateConfirmInput = decode_arguments(arguments)?;
-        self.runtime
-            .candidate_confirm(&input)
-            .and_then(|response| {
-                serde_json::to_value(response).map_err(|error| {
-                    Error::new(
-                        ErrorKind::Io,
-                        format!("serialize Candidate Confirmation response: {error}"),
-                    )
-                })
+        let runtime = self.runtime();
+        match decode_candidate_confirm_request(arguments)? {
+            CandidateConfirmRequest::Single(input) => runtime
+                .candidate_confirm(&input)
+                .map(|response| CandidateConfirmOutcome::Single(Box::new(response))),
+            CandidateConfirmRequest::Batch(input) => runtime
+                .candidate_confirm_batch(&input)
+                .map(CandidateConfirmOutcome::Batch),
+        }
+        .and_then(|response| {
+            serde_json::to_value(response).map_err(|error| {
+                Error::new(
+                    ErrorKind::Io,
+                    format!("serialize Candidate Confirmation response: {error}"),
+                )
             })
-            .map_err(ToolFailure::candidate_review_failed)
+        })
+        .map_err(ToolFailure::candidate_review_failed)
     }
 }
 
@@ -3575,6 +7158,8 @@ impl McpServer {
 /// external-error category for the CLI boundary.
 pub fn serve_stdio(root: impl AsRef<Path>, client: ClientKind) -> Result<ServeOutcome> {
     let mut server = McpServer::new(root, client)?;
+    server.telemetry_root = sctx_telemetry::default_logs_root();
+    server.start_semantic_channel();
     let stdin = io::stdin();
     let stdout = io::stdout();
     server
@@ -3589,12 +7174,247 @@ pub fn serve_stdio(root: impl AsRef<Path>, client: ClientKind) -> Result<ServeOu
 
 type ToolResult = std::result::Result<Value, ToolFailure>;
 
+struct McpToolTelemetry {
+    logs_root: Option<PathBuf>,
+    invocation_id: String,
+    operation: String,
+    session_digest: Option<String>,
+    started: Instant,
+}
+
+impl McpToolTelemetry {
+    fn start(call: &ToolCall, client: ClientKind, logs_root: Option<PathBuf>) -> Self {
+        // The caller has already checked `is_public_tool`, so this is a closed product enum and
+        // cannot carry an arbitrary tool name supplied by the peer.
+        let invocation_id = sctx_telemetry::new_invocation_id();
+        let operation = call.name.as_str();
+        let session_digest = mcp_session_digest(&call.arguments, client);
+        if let Some(root) = &logs_root {
+            let mut event = sctx_telemetry::Event::started(
+                sctx_telemetry::EntryPoint::Mcp,
+                sctx_telemetry::EventKind::ToolStarted,
+                invocation_id.clone(),
+                operation,
+            );
+            event.authorization = sctx_telemetry::Authorization::Unverified;
+            event.session_digest.clone_from(&session_digest);
+            let _ = sctx_telemetry::emit_to(root, &event);
+        }
+        Self {
+            logs_root,
+            invocation_id,
+            operation: operation.to_owned(),
+            session_digest,
+            started: Instant::now(),
+        }
+    }
+
+    fn finish(self, result: &ToolResult) {
+        let Some(root) = &self.logs_root else { return };
+        let mut event = sctx_telemetry::Event::finished(
+            sctx_telemetry::EntryPoint::Mcp,
+            sctx_telemetry::EventKind::ToolFinished,
+            self.invocation_id,
+            self.operation,
+            if result.is_ok() {
+                sctx_telemetry::Outcome::Success
+            } else {
+                sctx_telemetry::Outcome::Failure
+            },
+        );
+        event.sequence = 1;
+        event.duration_ms =
+            Some(u32::try_from(self.started.elapsed().as_millis()).unwrap_or(u32::MAX));
+        event.session_digest = self.session_digest;
+        match result {
+            Ok(data) => {
+                event.authorization = sctx_telemetry::Authorization::Authorized;
+                event.result_count = result_count(data);
+                populate_result_identifiers(&mut event, data);
+            }
+            Err(failure) => {
+                event.authorization = if failure.family == Some(ToolFailure::SESSION_NOT_AUTHORIZED)
+                {
+                    sctx_telemetry::Authorization::Unauthorized
+                } else {
+                    sctx_telemetry::Authorization::Unverified
+                };
+                event.error_code = Some(failure.code.to_owned());
+                event.error_family = Some(
+                    failure
+                        .family
+                        .unwrap_or_else(|| error_code(failure.error.kind()))
+                        .to_owned(),
+                );
+            }
+        }
+        let _ = sctx_telemetry::emit_to(root, &event);
+    }
+}
+
+fn result_count(data: &Value) -> Option<u32> {
+    [
+        "results",
+        "reviews",
+        "items",
+        "candidates",
+        "contexts",
+        "spaces",
+        "repositories",
+    ]
+    .into_iter()
+    .find_map(|field| data.get(field).and_then(Value::as_array))
+    .map(|items| u32::try_from(items.len()).unwrap_or(u32::MAX))
+}
+
+fn mcp_session_digest(arguments: &Value, client: ClientKind) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let agent = arguments.get("agent_kind")?.as_str()?;
+    let expected = match client {
+        ClientKind::Cursor => "cursor",
+        ClientKind::Codex => "codex",
+    };
+    if agent != expected {
+        return None;
+    }
+    let session = arguments.get("external_session_id")?.as_str()?;
+    if session.is_empty() || session.len() > 256 {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(agent.as_bytes());
+    digest.update([0]);
+    digest.update(session.as_bytes());
+    Some(format!("{:x}", digest.finalize()))
+}
+
+fn populate_result_identifiers(event: &mut sctx_telemetry::Event, data: &Value) {
+    event.task_id = telemetry_id(data, "task_id", 64);
+    event.task_session_id = telemetry_id(data, "task_session_id", 64);
+    event.episode_id = telemetry_id(data, "episode_id", 64);
+    event.checkpoint_id = telemetry_id(data, "checkpoint_id", 64);
+    event.operation_id = telemetry_id(data, "operation_id", 96);
+    if let Some(context) = data.get("context") {
+        event.task_id = event
+            .task_id
+            .take()
+            .or_else(|| telemetry_id(context, "task_id", 64));
+        event.task_session_id = event
+            .task_session_id
+            .take()
+            .or_else(|| telemetry_id(context, "task_session_id", 64));
+    }
+}
+
+fn telemetry_id(data: &Value, field: &str, max_len: usize) -> Option<String> {
+    let value = data.get(field)?.as_str()?;
+    if value.is_empty()
+        || value.len() > max_len
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
 struct ToolFailure {
     code: &'static str,
+    /// Error family reported as `kind` when the domain `ErrorKind` is not the useful
+    /// grouping. Only authorization uses it today: its four distinct causes must stay
+    /// distinguishable by `code` while remaining one family a client can branch on.
+    family: Option<&'static str>,
     error: Error,
 }
 
 impl ToolFailure {
+    /// One failure whose `kind` is derived from its domain `ErrorKind`.
+    fn coded(code: &'static str, error: Error) -> Self {
+        Self {
+            code,
+            family: None,
+            error,
+        }
+    }
+
+    fn maintenance_failed(error: Error) -> Self {
+        let busy = error.kind() == ErrorKind::MaintenanceBusy;
+        drop(error);
+        Self::coded(
+            if busy {
+                "maintenance_busy"
+            } else {
+                "maintenance_unavailable"
+            },
+            Error::new(
+                if busy {
+                    ErrorKind::MaintenanceBusy
+                } else {
+                    ErrorKind::External
+                },
+                if busy {
+                    "Shared Context installation is busy with maintenance"
+                } else {
+                    "Shared Context maintenance coordination is unavailable"
+                },
+            ),
+        )
+    }
+
+    /// The one error family every authorization refusal belongs to.
+    ///
+    /// It stays a single `kind` so a client can branch on "this call was not authorized"
+    /// exactly as before, while `code` names which of the four independent causes it was:
+    /// a locator the call itself got wrong, a Session no Hook ever leased, a directory
+    /// activation never covered, or a local failure that decided nothing at all. Merging
+    /// them made every one of them read as "you sent a bad id", which is the wrong repair
+    /// for three of the four.
+    const SESSION_NOT_AUTHORIZED: &'static str = "session_not_authorized";
+
+    fn authorization_failure(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            family: Some(Self::SESSION_NOT_AUTHORIZED),
+            error: Error::new(ErrorKind::External, message),
+        }
+    }
+
+    /// The call did not carry a usable Agent Session locator at all.
+    fn locator_invalid() -> Self {
+        Self::authorization_failure(
+            "locator_invalid",
+            "Shared Context MCP call carries no usable Agent Session locator: agent_kind and external_session_id are both required, non-empty, and must match this MCP client; external_session_id is the host session id shown in the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id)",
+        )
+    }
+
+    /// No Hook ever authorized this Agent Session.
+    fn lease_missing() -> Self {
+        Self::authorization_failure(
+            "lease_missing",
+            "Shared Context has no authorization lease for this Agent Session: copy external_session_id verbatim from the <shared-context-active> marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id) — never retype, derive, or invent one — and if no marker ever appeared run `sctx doctor --hooks`",
+        )
+    }
+
+    /// The Session is leased, but its directory is not under an activated Repository.
+    fn activation_disabled() -> Self {
+        Self::authorization_failure(
+            "activation_disabled",
+            "Shared Context is not activated for this Agent Session: the directory it started in is not covered by any registered Repository. Register it with `sctx repository add` and start a new Agent Session",
+        )
+    }
+
+    /// Authorization could not be decided locally, so nothing was decided.
+    fn authorization_internal(error: &Error) -> Self {
+        Self::authorization_failure(
+            "authorization_internal",
+            format!(
+                "Shared Context could not evaluate this Agent Session's authorization: {}",
+                error.message()
+            ),
+        )
+    }
+
     fn task_context_failed(error: Error) -> Self {
         let code = match error.kind() {
             ErrorKind::InvalidInput => "invalid_input",
@@ -3607,7 +7427,7 @@ impl ToolFailure {
             ErrorKind::Unsupported => "task_context_unsupported",
             _ => "task_context_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn intent_update_failed(error: Error) -> Self {
@@ -3619,7 +7439,7 @@ impl ToolFailure {
             ErrorKind::Io => "intent_storage_failed",
             _ => "intent_update_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn engineering_graph_failed(error: Error) -> Self {
@@ -3632,11 +7452,21 @@ impl ToolFailure {
             ErrorKind::RepositoryNotConfigured => "repository_not_configured",
             _ => "engineering_graph_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
     }
 
     fn candidate_review_failed(error: Error) -> Self {
         let code = match error.kind() {
+            ErrorKind::InvalidInput
+                if error
+                    .message()
+                    .starts_with(EXACT_DUPLICATE_REQUIRES_DECISION) =>
+            {
+                "exact_duplicate_requires_decision"
+            }
+            ErrorKind::InvalidInput if error.message().starts_with(AUTO_CONFIRM_NOT_PERMITTED) => {
+                "auto_confirm_not_permitted"
+            }
             ErrorKind::InvalidInput => "candidate_review_invalid",
             ErrorKind::InvariantViolation => "candidate_review_invariant",
             ErrorKind::Io => "candidate_review_storage_failed",
@@ -3645,16 +7475,38 @@ impl ToolFailure {
             ErrorKind::PrivacyRejected => "privacy_rejected",
             _ => "candidate_review_failed",
         };
-        Self { code, error }
+        Self::coded(code, error)
+    }
+
+    fn task_target_failed(error: Error) -> Self {
+        if error.kind() == ErrorKind::InvalidInput {
+            Self::coded(
+                "task_target_unavailable",
+                Error::new(ErrorKind::External, "Task target is unavailable"),
+            )
+        } else {
+            Self::task_context_failed(error)
+        }
+    }
+
+    fn candidate_target_failed(error: Error) -> Self {
+        if error.kind() == ErrorKind::InvalidInput {
+            Self::coded(
+                "candidate_review_unavailable",
+                Error::new(
+                    ErrorKind::External,
+                    "Candidate Review target is unavailable",
+                ),
+            )
+        } else {
+            Self::candidate_review_failed(error)
+        }
     }
 }
 
 impl From<Error> for ToolFailure {
     fn from(error: Error) -> Self {
-        Self {
-            code: error_code(error.kind()),
-            error,
-        }
+        Self::coded(error_code(error.kind()), error)
     }
 }
 
@@ -3668,14 +7520,141 @@ struct ToolCall {
     _meta: Option<Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct EmptyInput {}
+struct SessionInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+}
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpRepositoryScanInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    checkout_path: String,
+    paths: Vec<String>,
+    #[serde(default = "default_scan_artifact_limit")]
+    max_artifacts: usize,
+}
+
+impl McpRepositoryScanInput {
+    fn into_inner(self) -> RepositoryScanInput {
+        RepositoryScanInput {
+            checkout_path: self.checkout_path,
+            paths: self.paths,
+            max_artifacts: self.max_artifacts,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpSpaceCreateInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    intent: McpSpaceIntentInput,
+}
+
+/// Flat Intent object; `out_of_scope` and `domain_terms` are the only optional lists, exactly as
+/// on `sctx space create`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpSpaceIntentInput {
+    title: String,
+    problem: String,
+    desired_outcome: String,
+    in_scope: Vec<String>,
+    acceptance_conditions: Vec<String>,
+    #[serde(default)]
+    out_of_scope: Vec<String>,
+    #[serde(default)]
+    domain_terms: Vec<String>,
+}
+
+impl McpSpaceCreateInput {
+    fn into_inner(self) -> SpaceCreateInput {
+        SpaceCreateInput {
+            intent: IntentSnapshot {
+                title: self.intent.title,
+                problem: self.intent.problem,
+                desired_outcome: self.intent.desired_outcome,
+                in_scope: self.intent.in_scope,
+                out_of_scope: self.intent.out_of_scope,
+                acceptance_conditions: self.intent.acceptance_conditions,
+                domain_terms: self.intent.domain_terms,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpEngineeringReferenceRecordInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    context_id: String,
+    revision_id: String,
+    repository_id: String,
+    artifact_kind: ArtifactKind,
+    relation: ReferenceRelation,
+    locator: ArtifactLocator,
+    supports: String,
+    limitations: Vec<String>,
+}
+
+impl McpEngineeringReferenceRecordInput {
+    fn into_inner(self) -> EngineeringReferenceRecordInput {
+        EngineeringReferenceRecordInput {
+            context_id: self.context_id,
+            revision_id: self.revision_id,
+            repository_id: self.repository_id,
+            artifact_kind: self.artifact_kind,
+            relation: self.relation,
+            locator: self.locator,
+            supports: self.supports,
+            limitations: self.limitations,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpAssociationExplainInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    reference_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpAssociationRebuildInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
+    #[serde(default)]
+    diagnose_only: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[allow(clippy::struct_field_names)]
 struct GetInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
     context_id: String,
     #[serde(default)]
     space_id: Option<String>,
@@ -3683,9 +7662,13 @@ struct GetInput {
     revision_id: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SearchInput {
+    #[serde(rename = "agent_kind")]
+    _agent_kind: String,
+    #[serde(rename = "external_session_id")]
+    _external_session_id: String,
     #[serde(default)]
     query: String,
     #[serde(default)]
@@ -3704,6 +7687,9 @@ struct SearchInput {
     page_size: usize,
     #[serde(default)]
     cursor: Option<String>,
+    /// Defaults to `ranked`; `exact` keeps the strict all-tokens lookup.
+    #[serde(default)]
+    match_mode: SearchMatchMode,
 }
 
 impl SearchInput {
@@ -3726,23 +7712,467 @@ impl SearchInput {
             },
             page_size: self.page_size,
             cursor: self.cursor,
+            match_mode: self.match_mode,
         })
     }
 }
 
 type ToolResultSearch = std::result::Result<SearchRequest, ToolFailure>;
 
+fn is_public_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "task_intent_update"
+            | "task_artifact_focus"
+            | "task_signal_supersede"
+            | "task_checkpoint"
+            | "task_context"
+            | "repository_scan"
+            | "engineering_reference_record"
+            | "association_explain"
+            | "association_rebuild"
+            | "context_search"
+            | "context_get"
+            | "candidate_list"
+            | "candidate_get"
+            | "candidate_discard"
+            | "candidate_confirm"
+            | "space_list"
+            | "space_create"
+    )
+}
+
+fn runtime_open_failure(name: &str, error: Error) -> ToolFailure {
+    match name {
+        "task_intent_update" => ToolFailure::intent_update_failed(error),
+        "task_artifact_focus" | "task_signal_supersede" | "task_checkpoint" | "task_context" => {
+            ToolFailure::task_context_failed(error)
+        }
+        "repository_scan"
+        | "engineering_reference_record"
+        | "association_explain"
+        | "association_rebuild" => ToolFailure::engineering_graph_failed(error),
+        "candidate_list" | "candidate_get" | "candidate_discard" | "candidate_confirm" => {
+            ToolFailure::candidate_review_failed(error)
+        }
+        _ => ToolFailure::from(error),
+    }
+}
+
+/// Splits the optional `detail_level` selector out of one tool call. Every strict input struct
+/// keeps `deny_unknown_fields`, so the selector is removed before the typed decode and defaults to
+/// [`ContextPackDetailLevel::Compact`] when absent.
+fn split_detail_level(
+    mut arguments: Value,
+) -> std::result::Result<(Value, ContextPackDetailLevel), ToolFailure> {
+    let selector = arguments
+        .as_object_mut()
+        .and_then(|object| object.remove("detail_level"));
+    let detail_level = match selector {
+        None => ContextPackDetailLevel::default(),
+        Some(value) => serde_json::from_value(value).map_err(|error| {
+            ToolFailure::from(invalid(format!(
+                "detail_level must be \"compact\" or \"full\": {error}"
+            )))
+        })?,
+    };
+    Ok((arguments, detail_level))
+}
+
+fn validate_public_arguments(
+    name: &str,
+    arguments: &Value,
+) -> std::result::Result<(), ToolFailure> {
+    macro_rules! decode {
+        ($input:ty) => {{
+            let _: $input = decode_arguments(arguments.clone())?;
+        }};
+    }
+    macro_rules! decode_detail_leveled {
+        ($input:ty) => {{
+            let (arguments, _) = split_detail_level(arguments.clone())?;
+            let _: $input = decode_arguments(arguments)?;
+        }};
+    }
+    match name {
+        "task_intent_update" => {
+            validate_intent_composition(
+                arguments.get("intent"),
+                "only goal is required, for example {\"goal\": \"...\"}",
+            )?;
+            decode_detail_leveled!(TaskIntentUpdateInput);
+        }
+        "task_artifact_focus" => {
+            validate_locator_composition(arguments.get("locator"), false)?;
+            decode_detail_leveled!(ArtifactFocusQuery);
+        }
+        "task_signal_supersede" => decode!(TaskSignalSupersedeInput),
+        "task_checkpoint" => decode!(TaskCheckpointInput),
+        "task_context" => decode_detail_leveled!(TaskContextReadInput),
+        "repository_scan" => decode!(McpRepositoryScanInput),
+        "engineering_reference_record" => {
+            validate_locator_composition(arguments.get("locator"), true)?;
+            decode!(McpEngineeringReferenceRecordInput);
+        }
+        "association_explain" => decode!(McpAssociationExplainInput),
+        "association_rebuild" => decode!(McpAssociationRebuildInput),
+        "context_search" => decode!(SearchInput),
+        "context_get" => decode!(GetInput),
+        "candidate_list" => decode_detail_leveled!(CandidateListInput),
+        "candidate_get" => decode!(CandidateGetInput),
+        "candidate_discard" => {
+            let _ = decode_candidate_discard_request(arguments.clone())?;
+        }
+        "candidate_confirm" => {
+            let _ = decode_candidate_confirm_request(arguments.clone())?;
+        }
+        "space_list" => decode!(SessionInput),
+        "space_create" => {
+            validate_intent_composition(
+                arguments.get("intent"),
+                "title, problem, desired_outcome, in_scope, and acceptance_conditions are required",
+            )?;
+            decode!(McpSpaceCreateInput);
+        }
+        _ => unreachable!("public tool name was checked"),
+    }
+    Ok(())
+}
+
+/// Exact coordinate fields each Artifact locator kind carries beyond `locator_kind`.
+const LOCATOR_KIND_COORDINATES: [(&str, &[&str]); 6] = [
+    ("file", &[]),
+    ("module", &[]),
+    ("api", &["protocol", "operation", "normalized_route"]),
+    ("schema", &["namespace", "version", "qualified_name"]),
+    (
+        "symbol",
+        &[
+            "language",
+            "module",
+            "enclosing_type",
+            "symbol_name",
+            "signature",
+        ],
+    ),
+    ("test", &["qualified_test_name"]),
+];
+
+/// Validates the kind-specific Artifact locator composition the flat host view cannot state.
+///
+/// The declared view lists every coordinate field as optional, because a host union declaration
+/// degrades into an untyped map; the exact per-kind field set therefore stays authoritative server
+/// validation and names the exact missing or foreign field.
+/// Rejects an `intent` that is not a JSON object, naming the shape the caller should send.
+///
+/// Serde's own rejection is `invalid type: string "...", expected struct WorkingIntentSnapshot`:
+/// it names a Rust type the caller cannot see and never says what to send instead. That matters
+/// more here than the message text usually does, because a Cursor client is offered no
+/// `inputSchema` until after a tool's first call, so this message is the whole of what a model
+/// has to correct itself from — a real Session spent a failed call and a schema fetch on it.
+/// `required` names this tool's own required intent fields; the two tools that take an `intent`
+/// do not agree on them.
+///
+/// Only the outermost shape is checked. Everything inside it — an unknown key, an empty string,
+/// a list over its bound — already fails with a message that names the offending field.
+fn validate_intent_composition(
+    intent: Option<&Value>,
+    required: &str,
+) -> std::result::Result<(), ToolFailure> {
+    match intent {
+        None | Some(Value::Object(_)) => Ok(()),
+        Some(other) => Err(invalid(format!(
+            "intent must be a JSON object, not {}; {required}",
+            json_shape(other)
+        ))
+        .into()),
+    }
+}
+
+/// The JSON shape name a caller would recognize, for a message that has to be self-explaining.
+fn json_shape(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn validate_locator_composition(
+    locator: Option<&Value>,
+    with_path: bool,
+) -> std::result::Result<(), ToolFailure> {
+    let Some(object) = locator.and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let Some(kind) = object.get("locator_kind").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some((_, coordinates)) = LOCATOR_KIND_COORDINATES
+        .iter()
+        .find(|(candidate, _)| *candidate == kind)
+    else {
+        return Ok(());
+    };
+    for field in *coordinates {
+        if !object.contains_key(*field) {
+            return Err(invalid(format!("locator_kind {kind} requires locator.{field}")).into());
+        }
+    }
+    for field in object.keys() {
+        if field == "locator_kind" || (with_path && field == "path") {
+            continue;
+        }
+        if !coordinates.contains(&field.as_str()) {
+            return Err(invalid(format!(
+                "locator_kind {kind} does not accept locator.{field}"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn locator_from_arguments(
+    arguments: &Value,
+) -> std::result::Result<ExternalSessionLocator, ToolFailure> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(ToolFailure::locator_invalid)?;
+    let agent_kind = object
+        .get("agent_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(ToolFailure::locator_invalid)?;
+    let external_session_id = object
+        .get("external_session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(ToolFailure::locator_invalid)?;
+    ExternalSessionLocator::new(agent_kind, external_session_id)
+        .map_err(|_| ToolFailure::locator_invalid())
+}
+
+fn authorize_public_call(
+    root: &Path,
+    locator: &ExternalSessionLocator,
+) -> std::result::Result<AuthorizedCallSnapshot, ToolFailure> {
+    // The successful nonblocking lease classification against this exact Catalog is the call's
+    // authorization linearization point. Later expiry, SessionEnd, or Catalog replacement affects
+    // the next call; this call carries the frozen Catalog and allowed Repository identities.
+    // The three outcomes stay apart: a decided refusal names its own cause, while a
+    // configuration, lock, or IO failure decided nothing and says so instead of blaming
+    // the id the Agent sent.
+    let authorization = || -> Result<std::result::Result<AuthorizedCallSnapshot, ToolFailure>> {
+        let (catalog, context_ttl) =
+            UserConfigStore::open_existing(root)?.repository_catalog_with_context_ttl()?;
+        let context_ttl = context_ttl_settings(&context_ttl);
+        Ok(
+            match read_reconciled_session_scope(root, locator, &catalog)? {
+                AuthorizedSessionScopeRead::Current(scope) if scope.decision.is_enabled() => {
+                    Ok(AuthorizedCallSnapshot {
+                        catalog,
+                        scope,
+                        context_ttl,
+                    })
+                }
+                AuthorizedSessionScopeRead::Current(_) => Err(ToolFailure::activation_disabled()),
+                AuthorizedSessionScopeRead::Missing => Err(ToolFailure::lease_missing()),
+            },
+        )
+    };
+    authorization().map_err(|error| ToolFailure::authorization_internal(&error))?
+}
+
+/// The single lease read every MCP path uses.
+///
+/// A lease is permanently bound to its Agent Session and never expires, so the
+/// only thing that can change under a running Session is the Catalog. This one
+/// non-blocking read therefore re-derives the decision from the lease's recorded
+/// canonical `startup_cwd` against the Catalog frozen for this call, which is
+/// pure: no filesystem stat, no Git, no Repository scan. A Repository registered
+/// or removed mid-Session takes effect on the very next call.
+fn read_reconciled_session_scope(
+    root: &Path,
+    locator: &ExternalSessionLocator,
+    catalog: &RepositoryCatalogSnapshot,
+) -> Result<AuthorizedSessionScopeRead> {
+    AuthorizedSessionScopeStore::initialize(root)?.try_read_reconciled(locator, catalog)
+}
+
+fn authorize_runtime_identity_target(
+    name: &str,
+    arguments: &Value,
+    tasks: &TaskRuntime,
+) -> std::result::Result<(), ToolFailure> {
+    match name {
+        "task_signal_supersede" => {
+            let input: TaskSignalSupersedeInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            let locator =
+                ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)
+                    .map_err(ToolFailure::from)?;
+            let expected_task_id =
+                parse_id_value(&input.task_id, "task_id").map_err(ToolFailure::from)?;
+            let active = tasks
+                .read_snapshot_by_locator(&locator)
+                .map_err(ToolFailure::task_context_failed)?;
+            if active.as_ref().map(|task| task.task_id) != Some(expected_task_id) {
+                return Err(ToolFailure::task_target_failed(invalid(
+                    "Task target is unavailable",
+                )));
+            }
+        }
+        "task_checkpoint" => {
+            let input: TaskCheckpointInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            let locator =
+                ExternalSessionLocator::new(&input.agent_kind, &input.external_session_id)
+                    .map_err(ToolFailure::from)?;
+            let active = tasks
+                .read_snapshot_by_locator(&locator)
+                .map_err(ToolFailure::task_context_failed)?;
+            if active.is_none() {
+                return Err(ToolFailure::task_target_failed(invalid(
+                    "Task target is unavailable",
+                )));
+            }
+        }
+        "candidate_get" => {
+            let input: CandidateGetInput = serde_json::from_value(arguments.clone())
+                .map_err(|error| ToolFailure::from(invalid(error.to_string())))?;
+            require_owned_candidate(
+                tasks,
+                &input.agent_kind,
+                &input.external_session_id,
+                &input.candidate_id,
+            )?;
+        }
+        "candidate_discard" => match decode_candidate_discard_request(arguments.clone())? {
+            CandidateDiscardRequest::Single(input) => require_owned_task_and_candidate(
+                tasks,
+                &input.agent_kind,
+                &input.external_session_id,
+                &input.expected_task_id,
+                &input.candidate_id,
+            )?,
+            CandidateDiscardRequest::Batch(input) => {
+                for candidate_id in &input.candidate_ids {
+                    require_owned_task_and_candidate(
+                        tasks,
+                        &input.agent_kind,
+                        &input.external_session_id,
+                        &input.expected_task_id,
+                        candidate_id,
+                    )?;
+                }
+            }
+        },
+        "candidate_confirm" => match decode_candidate_confirm_request(arguments.clone())? {
+            CandidateConfirmRequest::Single(input) => require_owned_task_and_candidate(
+                tasks,
+                &input.agent_kind,
+                &input.external_session_id,
+                &input.expected_task_id,
+                &input.candidate_id,
+            )?,
+            CandidateConfirmRequest::Batch(input) => {
+                for candidate_id in &input.candidate_ids {
+                    require_owned_task_and_candidate(
+                        tasks,
+                        &input.agent_kind,
+                        &input.external_session_id,
+                        &input.expected_task_id,
+                        candidate_id,
+                    )?;
+                }
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn require_owned_task_and_candidate(
+    tasks: &TaskRuntime,
+    agent_kind: &str,
+    external_session_id: &str,
+    expected_task_id: &str,
+    candidate_id: &str,
+) -> std::result::Result<(), ToolFailure> {
+    let locator =
+        ExternalSessionLocator::new(agent_kind, external_session_id).map_err(ToolFailure::from)?;
+    let expected_task_id =
+        parse_id_value(expected_task_id, "expected_task_id").map_err(ToolFailure::from)?;
+    let active = tasks
+        .read_snapshot_by_locator(&locator)
+        .map_err(ToolFailure::candidate_review_failed)?;
+    if active.as_ref().map(|task| task.task_id) != Some(expected_task_id) {
+        return Err(ToolFailure::candidate_target_failed(invalid(
+            "Candidate Review target is unavailable",
+        )));
+    }
+    require_owned_candidate(tasks, agent_kind, external_session_id, candidate_id)
+}
+
+fn require_owned_candidate(
+    tasks: &TaskRuntime,
+    agent_kind: &str,
+    external_session_id: &str,
+    candidate_id: &str,
+) -> std::result::Result<(), ToolFailure> {
+    let locator =
+        ExternalSessionLocator::new(agent_kind, external_session_id).map_err(ToolFailure::from)?;
+    let candidate_id = parse_id_value(candidate_id, "candidate_id").map_err(ToolFailure::from)?;
+    let owned = tasks
+        .read_candidate_review(&locator, candidate_id)
+        .map_err(ToolFailure::candidate_review_failed)?;
+    if owned.is_none() {
+        return Err(ToolFailure::candidate_target_failed(invalid(
+            "Candidate Review target is unavailable",
+        )));
+    }
+    Ok(())
+}
+
+fn requires_runtime_identity_preflight(name: &str) -> bool {
+    matches!(
+        name,
+        "task_signal_supersede"
+            | "task_checkpoint"
+            | "candidate_get"
+            | "candidate_discard"
+            | "candidate_confirm"
+    )
+}
+
+fn identity_target_unavailable(name: &str) -> ToolFailure {
+    if matches!(name, "task_signal_supersede" | "task_checkpoint") {
+        ToolFailure::task_target_failed(invalid("Task target is unavailable"))
+    } else {
+        ToolFailure::candidate_target_failed(invalid("Candidate Review target is unavailable"))
+    }
+}
+
+/// The protocol half of the `task_checkpoint` description: what the tool does, what the server
+/// guarantees, and what happens next. Byte-for-byte what shipped before team policy existed, so
+/// an installation whose `policy.md` has no `## checkpoint` section receives exactly today's text.
+const TASK_CHECKPOINT_PROTOCOL: &str = "Finalize one content-addressed Agent Checkpoint for the current ActiveTask and Intent. Submit focused Claims with self-contained Evidence summaries; the server durably queues untrusted Candidate drafts for bounded recovery by Candidate review reads. Empty Claims and Unknowns are a successful no-op. Checkpoint only what is worth keeping: decisions and their reasons, contracts, verified conclusions, counter-intuitive findings, and summaries of a newly understood mechanism. Process-level understanding of code you just read is not a Claim. Once the ACK reports a queued Candidate Build, call candidate_list next and dispose every Pending Review under its triage policy.";
+
 #[allow(clippy::too_many_lines)]
-fn tools_list() -> Value {
+fn tools_list(policy: &Policy) -> Value {
+    let checkpoint_description = join_policy(TASK_CHECKPOINT_PROTOCOL, policy.checkpoint());
+    let triage = candidate_triage_text(policy);
     json!({"tools": [
         tool_schema(
             "task_intent_update",
-            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack.",
+            "CAS-record a lightweight Working Intent snapshot, optionally start a new explicit Task, and return its TaskContextPack. detail_level defaults to compact, which returns only the inheritable Context fields; pass full for retrieval paths, match reasons, and the automatic query token explanation. Write goal, current_direction and in_scope in Chinese, the knowledge base language, keeping identifiers, paths, commands and error codes in their original spelling. current_direction and in_scope also feed the retrieval query, so fill them whenever you already know them; never invent either one.",
             task_intent_update_schema()
         ),
         tool_schema(
             "task_artifact_focus",
-            "Declare one current File/Module/Symbol/API/Schema/Test focus under ActiveTask CAS and immediately retrieve exact historical Graph context. Repository identity and relative path are resolved by the configured local Catalog.",
+            "Declare one current File/Module/Symbol/API/Schema/Test focus under ActiveTask CAS and immediately retrieve exact historical Graph context. Repository identity and relative path are resolved by the configured local Catalog. detail_level defaults to compact.",
             task_artifact_focus_schema()
         ),
         tool_schema(
@@ -3752,12 +8182,12 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "task_checkpoint",
-            "Persist one explicit Agent-authored Claim/Unknown checkpoint under Task, Intent and Episode CAS; close deterministically builds unassigned Candidate drafts, and an empty close reuses an existing current Checkpoint after Hook failure.",
+            &checkpoint_description,
             task_checkpoint_schema()
         ),
         tool_schema(
             "task_context",
-            "Read the Context Pack for an existing authoritative ActiveTask without changing runtime state.",
+            "Read the Context Pack for an existing authoritative ActiveTask without changing runtime state. detail_level defaults to compact; omitted Contexts are named by context_id and title so they can be read explicitly.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -3765,8 +8195,9 @@ fn tools_list() -> Value {
                 "properties": {
                     "agent_kind": {"type": "string", "minLength": 1},
                     "external_session_id": {"type": "string", "minLength": 1},
-                    "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
-                    "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
+                    "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 8000},
+                    "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES},
+                    "detail_level": detail_level_schema()
                 }
             })
         ),
@@ -3786,8 +8217,12 @@ fn tools_list() -> Value {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["reference_id"],
-                "properties": {"reference_id": id_schema("ref_")}
+                "required": ["agent_kind", "external_session_id", "reference_id"],
+                "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
+                    "reference_id": id_schema("ref_")
+                }
             })
         ),
         tool_schema(
@@ -3796,12 +8231,17 @@ fn tools_list() -> Value {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "properties": {"diagnose_only": {"type": "boolean", "default": false}}
+                "required": ["agent_kind", "external_session_id"],
+                "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
+                    "diagnose_only": {"type": "boolean", "default": false}
+                }
             })
         ),
         tool_schema(
             "context_search",
-            "Search Context revisions with stable filters, pagination, conflicts, and match reasons.",
+            "Search Context revisions with stable filters, pagination, conflicts, and match reasons. match_mode defaults to ranked (any token, ordered by BM25 and query token coverage); pass exact for the strict all-tokens lookup.",
             search_schema()
         ),
         tool_schema(
@@ -3810,8 +8250,10 @@ fn tools_list() -> Value {
             json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["context_id"],
+                "required": ["agent_kind", "external_session_id", "context_id"],
                 "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1},
                     "context_id": id_schema("ctx_"),
                     "space_id": id_schema("spc_"),
                     "revision_id": id_schema("rev_")
@@ -3820,7 +8262,7 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_list",
-            "List whole untrusted automatic Candidate Review summaries for the exact ActiveTask; Pending is the default lifecycle filter.",
+            &format!("List untrusted Reviews for the exact ActiveTask; status=pending and detail_level=compact are defaults. Use full or candidate_get for drafts. Candidates come only from task_checkpoint; before its ACK an empty list is normal. {triage}"),
             candidate_list_schema()
         ),
         tool_schema(
@@ -3830,28 +8272,80 @@ fn tools_list() -> Value {
         ),
         tool_schema(
             "candidate_discard",
-            "Explicitly discard one Pending automatic Candidate Review under Task, Intent, and Review-version CAS. This never confirms or publishes Context.",
+            "Explicitly discard one Pending automatic Candidate Review under Task, Intent, and Review-version CAS. This never confirms or publishes Context. Send decision_source agent_policy for a discard you made yourself under that triage, naming the ground in reason.",
             candidate_discard_schema()
         ),
         tool_schema(
             "candidate_confirm",
-            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned.",
+            "Explicitly confirm one owned Pending Candidate Review into one atomic Context/Space fact closure. All generated identities and any proposed new Space Intent are server-owned. Send decision_source agent_policy for a confirmation you made yourself under that triage; the server accepts it only for an auto_confirmable row confirmed without edits, and a refusal (auto_confirm_not_permitted) names the missing step and means present it to the user, not retry with different fields.",
             candidate_confirm_schema()
         ),
         tool_schema(
             "space_list",
             "List available ContextSpaces from a deterministic Git tree.",
-            json!({"type": "object", "additionalProperties": false, "properties": {}})
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["agent_kind", "external_session_id"],
+                "properties": {
+                    "agent_kind": {"type": "string", "minLength": 1},
+                    "external_session_id": {"type": "string", "minLength": 1}
+                }
+            })
+        ),
+        tool_schema(
+            "space_create",
+            "Create one explicitly named ContextSpace from a complete Space Intent. Use this once when a new requirement has no owning Space yet; the Space is never provisional because a human or Agent named it on purpose. Same validation as the operator CLI `sctx space create`.",
+            space_create_schema()
         )
     ]})
+}
+
+fn space_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id", "intent"],
+        "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
+            "intent": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Complete Space Intent; out_of_scope and domain_terms are the only optional lists.",
+                "required": [
+                    "title", "problem", "desired_outcome", "in_scope", "acceptance_conditions"
+                ],
+                "properties": {
+                    "title": {"type": "string", "minLength": 1},
+                    "problem": {"type": "string", "minLength": 1},
+                    "desired_outcome": {"type": "string", "minLength": 1},
+                    "in_scope": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "acceptance_conditions": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string", "minLength": 1}
+                    },
+                    "out_of_scope": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                    "domain_terms": {"type": "array", "items": {"type": "string", "minLength": 1}}
+                }
+            }
+        }
+    })
 }
 
 fn repository_scan_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["checkout_path", "paths"],
+        "required": ["agent_kind", "external_session_id", "checkout_path", "paths"],
         "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
             "checkout_path": {"type": "string", "minLength": 1},
             "paths": {
                 "type": "array",
@@ -3878,69 +8372,37 @@ fn task_artifact_focus_schema() -> Value {
             "expected_revision_id": id_schema("tir_"),
             "absolute_file_path": {"type": "string", "minLength": 1},
             "locator": task_artifact_focus_coordinates_schema(),
-            "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 2000},
-            "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES}
+            "token_budget": {"type": "integer", "minimum": MIN_TASK_CONTEXT_TOKEN_BUDGET, "default": 8000},
+            "max_spaces": {"type": "integer", "minimum": 1, "maximum": MAX_TASK_MAX_SPACES, "default": DEFAULT_TASK_MAX_SPACES},
+            "detail_level": detail_level_schema()
         }
     })
 }
 
 fn task_artifact_focus_coordinates_schema() -> Value {
     json!({
-        "oneOf": [
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind"],
-                "properties": {"locator_kind": {"const": "file"}}
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["locator_kind"],
+        "description": "Kind-specific Artifact coordinates. Send locator_kind plus exactly the fields that kind requires and no others: file and module require nothing else; api requires protocol, operation and normalized_route; schema requires namespace, version and qualified_name; symbol requires language, module, enclosing_type (string or null), symbol_name and signature; test requires qualified_test_name. The server names the missing or foreign coordinate field.",
+        "properties": {
+            "locator_kind": {
+                "type": "string",
+                "enum": ["file", "module", "api", "schema", "symbol", "test"]
             },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind"],
-                "properties": {"locator_kind": {"const": "module"}}
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "protocol", "operation", "normalized_route"],
-                "properties": {
-                    "locator_kind": {"const": "api"},
-                    "protocol": {"type": "string", "minLength": 1},
-                    "operation": {"type": "string", "minLength": 1},
-                    "normalized_route": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "namespace", "version", "qualified_name"],
-                "properties": {
-                    "locator_kind": {"const": "schema"},
-                    "namespace": {"type": "string", "minLength": 1},
-                    "version": {"type": "string", "minLength": 1},
-                    "qualified_name": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": [
-                    "locator_kind", "language", "module", "enclosing_type",
-                    "symbol_name", "signature"
-                ],
-                "properties": {
-                    "locator_kind": {"const": "symbol"},
-                    "language": {"type": "string", "minLength": 1},
-                    "module": {"type": "string", "minLength": 1},
-                    "enclosing_type": {"type": ["string", "null"], "minLength": 1},
-                    "symbol_name": {"type": "string", "minLength": 1},
-                    "signature": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "qualified_test_name"],
-                "properties": {
-                    "locator_kind": {"const": "test"},
-                    "qualified_test_name": {"type": "string", "minLength": 1}
-                }
-            }
-        ]
+            "protocol": {"type": "string", "minLength": 1},
+            "operation": {"type": "string", "minLength": 1},
+            "normalized_route": {"type": "string", "minLength": 1},
+            "namespace": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "qualified_name": {"type": "string", "minLength": 1},
+            "language": {"type": "string", "minLength": 1},
+            "module": {"type": "string", "minLength": 1},
+            "enclosing_type": {"type": ["string", "null"], "minLength": 1},
+            "symbol_name": {"type": "string", "minLength": 1},
+            "signature": {"type": "string", "minLength": 1},
+            "qualified_test_name": {"type": "string", "minLength": 1}
+        }
     })
 }
 
@@ -3948,13 +8410,22 @@ fn engineering_reference_record_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["context_id", "revision_id", "repository_id", "artifact_kind", "relation", "locator", "supports", "limitations"],
+        "required": ["agent_kind", "external_session_id", "context_id", "revision_id", "repository_id", "artifact_kind", "relation", "locator", "supports", "limitations"],
         "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
             "context_id": id_schema("ctx_"),
             "revision_id": id_schema("rev_"),
-            "repository_id": id_schema("rpo_"),
-            "artifact_kind": {"type": "string", "enum": ["module", "file", "symbol", "api", "schema", "test"]},
-            "relation": {"type": "string", "enum": ["implements", "defines", "consumes", "validates", "constrains", "depends_on"]},
+            "repository_id": repository_id_schema(),
+            "artifact_kind": enum_schema([
+                ArtifactKind::Module, ArtifactKind::File, ArtifactKind::Symbol,
+                ArtifactKind::Api, ArtifactKind::Schema, ArtifactKind::Test
+            ]),
+            "relation": enum_schema([
+                ReferenceRelation::Implements, ReferenceRelation::Defines,
+                ReferenceRelation::Consumes, ReferenceRelation::Validates,
+                ReferenceRelation::Constrains, ReferenceRelation::DependsOn
+            ]),
             "locator": artifact_locator_input_schema(),
             "supports": {"type": "string", "minLength": 1},
             "limitations": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
@@ -3964,54 +8435,29 @@ fn engineering_reference_record_schema() -> Value {
 
 fn artifact_locator_input_schema() -> Value {
     json!({
-        "oneOf": [
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path"],
-                "properties": {"locator_kind": {"const": "file"}, "path": {"type": "string", "minLength": 1}}
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["locator_kind", "path"],
+        "description": "Kind-specific Artifact coordinates plus the repository-relative path. Send locator_kind and path plus exactly the fields that kind requires and no others: file and module require nothing else; api requires protocol, operation and normalized_route; schema requires namespace, version and qualified_name; symbol requires language, module, enclosing_type (string or null), symbol_name and signature; test requires qualified_test_name. The server names the missing or foreign coordinate field.",
+        "properties": {
+            "locator_kind": {
+                "type": "string",
+                "enum": ["file", "module", "api", "schema", "symbol", "test"]
             },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path"],
-                "properties": {"locator_kind": {"const": "module"}, "path": {"type": "string", "minLength": 1}}
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "protocol", "operation", "normalized_route"],
-                "properties": {
-                    "locator_kind": {"const": "api"}, "path": {"type": "string", "minLength": 1},
-                    "protocol": {"type": "string", "minLength": 1}, "operation": {"type": "string", "minLength": 1},
-                    "normalized_route": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "namespace", "version", "qualified_name"],
-                "properties": {
-                    "locator_kind": {"const": "schema"}, "path": {"type": "string", "minLength": 1},
-                    "namespace": {"type": "string", "minLength": 1}, "version": {"type": "string", "minLength": 1},
-                    "qualified_name": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "language", "module", "enclosing_type", "symbol_name", "signature"],
-                "properties": {
-                    "locator_kind": {"const": "symbol"}, "path": {"type": "string", "minLength": 1},
-                    "language": {"type": "string", "minLength": 1}, "module": {"type": "string", "minLength": 1},
-                    "enclosing_type": {"type": ["string", "null"], "minLength": 1},
-                    "symbol_name": {"type": "string", "minLength": 1}, "signature": {"type": "string", "minLength": 1}
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["locator_kind", "path", "qualified_test_name"],
-                "properties": {
-                    "locator_kind": {"const": "test"}, "path": {"type": "string", "minLength": 1},
-                    "qualified_test_name": {"type": "string", "minLength": 1}
-                }
-            }
-        ]
+            "path": {"type": "string", "minLength": 1},
+            "protocol": {"type": "string", "minLength": 1},
+            "operation": {"type": "string", "minLength": 1},
+            "normalized_route": {"type": "string", "minLength": 1},
+            "namespace": {"type": "string", "minLength": 1},
+            "version": {"type": "string", "minLength": 1},
+            "qualified_name": {"type": "string", "minLength": 1},
+            "language": {"type": "string", "minLength": 1},
+            "module": {"type": "string", "minLength": 1},
+            "enclosing_type": {"type": ["string", "null"], "minLength": 1},
+            "symbol_name": {"type": "string", "minLength": 1},
+            "signature": {"type": "string", "minLength": 1},
+            "qualified_test_name": {"type": "string", "minLength": 1}
+        }
     })
 }
 
@@ -4035,9 +8481,11 @@ fn task_intent_update_schema() -> Value {
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
-            "task_boundary": {"type": "string", "enum": ["continue", "new"]},
+            "task_boundary": enum_schema([TaskBoundary::Continue, TaskBoundary::New]),
             "expected_revision_id": {
-                "anyOf": [id_schema("tir_"), {"type": "null"}]
+                "type": ["string", "null"],
+                "pattern": "^tir_[0-9a-fA-F-]+$",
+                "description": "The last returned intent_revision_id, or null only for the first new Task in a new external Session."
             },
             "intent": {
                 "type": "object",
@@ -4056,8 +8504,19 @@ fn task_intent_update_schema() -> Value {
                     "interface_hints": intent_list(),
                     "open_questions": intent_list()
                 }
-            }
+            },
+            "detail_level": detail_level_schema()
         }
+    })
+}
+
+/// Optional Task Context payload shape shared by every retrieval tool.
+fn detail_level_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["compact", "full"],
+        "default": "compact",
+        "description": "compact returns only the inheritable fact fields; full returns the explainable payload with retrieval paths and match reasons."
     })
 }
 
@@ -4076,128 +8535,142 @@ fn task_signal_supersede_schema() -> Value {
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn task_checkpoint_schema() -> Value {
-    let string_list = || json!({"type": "array", "items": {"type": "string", "minLength": 1}});
-    let context_revision = || {
+    let string_list = || {
         json!({
-            "type": "object", "additionalProperties": false,
-            "required": ["context_id", "revision_id"],
-            "properties": {"context_id": id_schema("ctx_"), "revision_id": id_schema("rev_")}
-        })
-    };
-    let evidence_snapshot = || {
-        json!({
-            "type": "object", "additionalProperties": false,
-            "required": ["kind", "supports", "content", "interpretation", "limitations"],
-            "properties": {
-                "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
-                "supports": {"type": "string", "minLength": 1},
-                "content": {"type": "object", "minProperties": 1},
-                "interpretation": {"type": "string", "minLength": 1},
-                "limitations": string_list()
+            "type": "array", "maxItems": MAX_TASK_CHECKPOINT_LIST_ITEMS,
+            "items": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
             }
         })
     };
     let evidence = json!({
-        "oneOf": [
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["kind", "observation_id"],
-                "properties": {"kind": {"const": "observation"}, "observation_id": id_schema("wob_")}
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["kind", "signal_id"],
-                "properties": {"kind": {"const": "task_signal"}, "signal_id": id_schema("sig_")}
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["kind", "context_id", "revision_id", "evidence_id"],
-                "properties": {
-                    "kind": {"const": "context_evidence"}, "context_id": id_schema("ctx_"),
-                    "revision_id": id_schema("rev_"), "evidence_id": id_schema("evd_")
-                }
-            },
-            {
-                "type": "object", "additionalProperties": false,
-                "required": ["kind", "evidence"],
-                "properties": {"kind": {"const": "inline_validation"}, "evidence": evidence_snapshot()}
-            }
-        ]
-    });
-    let artifact_ref = json!({
         "type": "object", "additionalProperties": false,
-        "required": ["repository_id", "locator"],
-        "properties": {"repository_id": id_schema("rpo_"), "locator": artifact_locator_input_schema()}
+        "required": ["evidence_type", "summary", "limitations"],
+        "properties": {
+            "evidence_type": enum_schema([
+                EvidenceType::SourceSnapshot, EvidenceType::ExperimentRecord,
+                EvidenceType::ArtifactSnapshot
+            ]),
+            "summary": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "limitations": string_list()
+        }
     });
     let claim = json!({
         "type": "object", "additionalProperties": false,
-        "required": ["statement", "rationale", "applicability", "assumptions", "recheck_when", "evidence", "artifact_refs", "related_contexts"],
+        "required": ["context_kind", "statement", "rationale", "conditions", "evidence"],
         "properties": {
-            "context_kind_hint": kind_schema(),
-            "topic_key_hint": {"type": "string", "minLength": 1},
-            "statement": {"type": "string", "minLength": 1},
-            "rationale": {"type": "string", "minLength": 1},
-            "applicability": {
-                "type": "object", "additionalProperties": false,
-                "required": ["domains", "platforms", "conditions"],
-                "properties": {"domains": string_list(), "platforms": string_list(), "conditions": string_list()}
+            "context_kind": kind_schema(),
+            "statement": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
             },
-            "assumptions": string_list(),
-            "recheck_when": string_list(),
-            "evidence": {"type": "array", "minItems": 1, "items": evidence},
-            "artifact_refs": {"type": "array", "items": artifact_ref},
-            "related_contexts": {"type": "array", "items": context_revision()}
+            "rationale": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "conditions": string_list(),
+            "evidence": {
+                "type": "array", "minItems": 1,
+                "maxItems": MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM, "items": evidence
+            },
         }
     });
     let unknown = json!({
         "type": "object", "additionalProperties": false,
-        "required": ["statement", "blocking", "recheck_when"],
+        "required": ["statement", "blocking"],
         "properties": {
-            "statement": {"type": "string", "minLength": 1},
-            "blocking": {"type": "boolean"},
-            "recheck_when": string_list()
+            "statement": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "blocking": {"type": "boolean"}
         }
     });
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["agent_kind", "external_session_id", "expected_task_id", "expected_intent_revision_id", "expected_episode_version", "boundary", "claims", "unknowns"],
-        "anyOf": [
-            {"properties": {"claims": {"minItems": 1}}},
-            {"properties": {"unknowns": {"minItems": 1}}},
-            {
-                "properties": {
-                    "boundary": {"const": "close"},
-                    "claims": {"maxItems": 0},
-                    "unknowns": {"maxItems": 0}
-                }
-            }
-        ],
+        "required": ["agent_kind", "external_session_id", "claims", "unknowns"],
         "properties": {
-            "agent_kind": {"type": "string", "minLength": 1},
-            "external_session_id": {"type": "string", "minLength": 1},
-            "expected_task_id": id_schema("tsk_"),
-            "expected_intent_revision_id": id_schema("tir_"),
-            "expected_episode_version": {"type": "integer", "minimum": 0},
-            "boundary": {"type": "string", "enum": ["continue", "close"]},
-            "claims": {"type": "array", "items": claim},
-            "unknowns": {"type": "array", "items": unknown}
+            "agent_kind": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "external_session_id": {
+                "type": "string", "minLength": 1, "maxLength": MAX_TASK_CHECKPOINT_TEXT_BYTES
+            },
+            "claims": {
+                "type": "array", "maxItems": MAX_TASK_CHECKPOINT_CLAIMS, "items": claim
+            },
+            "unknowns": {
+                "type": "array", "maxItems": MAX_TASK_CHECKPOINT_UNKNOWNS, "items": unknown
+            }
         }
     })
 }
 
 #[allow(clippy::needless_pass_by_value)]
+/// The one sentence appended to every public tool description.
+///
+/// `external_session_id` is the only argument no Model can derive: it is the host
+/// Session id the Hook stated in the activation marker. Real sessions showed models
+/// inventing it from a documentation example, and a tool description is the one text a
+/// host always renders next to the call it is about — so the rule is stated there as
+/// well as in the marker and the Skill gate.
+const EXTERNAL_SESSION_ID_DESCRIPTION: &str = "external_session_id: copy verbatim from the `<shared-context-active>` marker (Codex: also $CODEX_SESSION_ID; Cursor: the conversation id); never invent or derive one.";
+
+/// The one sentence appended to every tool that decides a Candidate Review's fate.
+///
+/// A Candidate is an untrusted draft, and ADR-0005 splits its disposition into three tiers:
+/// two the Agent may take itself and one that is always the user's. That rule already ships
+/// in the post-Checkpoint ACK notice, and a real Cursor session showed the ACK working while
+/// the Skill carrying the same rule was never delivered at all — so it is restated on the
+/// three tools that act on a Review, pointing at the one place the tiers are spelled out in
+/// full so a model never sees two versions of them.
+const CANDIDATE_REVIEW_DECISION_DESCRIPTION: &str = "Dispose each Review under candidate_list's three-tier triage; anything outside the two automatic tiers goes to the user as a table with your recommendation.";
+
+/// The tools whose call *is* the decision on one Candidate Review.
+///
+/// `candidate_list` is deliberately absent: listing is triage, not a decision, and it
+/// already carries its own ordering rule.
+fn decides_candidate_review(name: &str) -> bool {
+    matches!(
+        name,
+        "candidate_get" | "candidate_discard" | "candidate_confirm"
+    )
+}
+
+/// Declares one public tool, appending the `external_session_id` provenance sentence to
+/// every tool that takes one, and the Candidate Review decision rule to every tool that
+/// acts on a Review. Appending them here instead of in each literal is what keeps a newly
+/// added tool from silently shipping without them. The schema itself is untouched.
 fn tool_schema(name: &str, description: &str, input_schema: Value) -> Value {
-    json!({"name": name, "description": description, "inputSchema": input_schema})
+    let requires_external_session_id = input_schema["required"]
+        .as_array()
+        .is_some_and(|required| required.iter().any(|field| field == "external_session_id"));
+    let mut description = description.to_owned();
+    if decides_candidate_review(name) {
+        description.push(' ');
+        description.push_str(CANDIDATE_REVIEW_DECISION_DESCRIPTION);
+    }
+    let description = if requires_external_session_id {
+        format!("{description} {EXTERNAL_SESSION_ID_DESCRIPTION}")
+    } else {
+        description
+    };
+    let mut tool = Map::new();
+    tool.insert("name".to_owned(), Value::String(name.to_owned()));
+    tool.insert("description".to_owned(), Value::String(description));
+    tool.insert("inputSchema".to_owned(), input_schema);
+    Value::Object(tool)
 }
 
 fn search_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
+        "required": ["agent_kind", "external_session_id"],
         "properties": {
+            "agent_kind": {"type": "string", "minLength": 1},
+            "external_session_id": {"type": "string", "minLength": 1},
             "query": {"type": "string", "default": ""},
             "space_ids": {"type": "array", "items": id_schema("spc_")},
             "domains": string_array_schema(),
@@ -4206,7 +8679,13 @@ fn search_schema() -> Value {
             "kinds": kind_array_schema(),
             "statuses": {"type": "array", "items": {"type": "string", "enum": ["candidate", "accepted", "deprecated", "superseded", "governance_conflict"]}},
             "page_size": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20},
-            "cursor": {"type": "string"}
+            "cursor": {"type": "string"},
+            "match_mode": {
+                "type": "string",
+                "enum": ["ranked", "exact"],
+                "default": "ranked",
+                "description": "ranked matches any query token and orders by BM25 combined with query token coverage; exact requires every token."
+            }
         }
     })
 }
@@ -4224,6 +8703,12 @@ fn candidate_list_schema() -> Value {
                 "enum": ["pending", "discarded", "expired", "confirmed"],
                 "default": "pending"
             },
+            "scope": {
+                "type": "string",
+                "enum": ["task", "session"],
+                "default": "task",
+                "description": "task lists only this Task's Candidates; session additionally lists, read-only, the Candidates of every other Task in this Session and names each row's source_task_id."
+            },
             "limit": {
                 "type": "integer", "minimum": 1,
                 "maximum": sctx_task_runtime::MAX_CANDIDATE_REVIEW_LIST_LIMIT,
@@ -4234,7 +8719,8 @@ fn candidate_list_schema() -> Value {
                 "type": "integer", "minimum": MIN_CANDIDATE_REVIEW_TOKEN_BUDGET,
                 "maximum": MAX_CANDIDATE_REVIEW_TOKEN_BUDGET,
                 "default": DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET
-            }
+            },
+            "detail_level": detail_level_schema()
         }
     })
 }
@@ -4258,17 +8744,43 @@ fn candidate_discard_schema() -> Value {
         "additionalProperties": false,
         "required": [
             "agent_kind", "external_session_id", "expected_task_id",
-            "expected_intent_revision_id", "candidate_id", "expected_review_version", "reason"
+            "expected_intent_revision_id", "expected_review_version", "reason"
         ],
         "properties": {
             "agent_kind": {"type": "string", "minLength": 1},
             "external_session_id": {"type": "string", "minLength": 1},
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
-            "candidate_id": id_schema("cnd_"),
+            "candidate_id": {
+                "type": "string",
+                "pattern": "^cnd_[0-9a-fA-F-]+$",
+                "description": "Send exactly one of candidate_id or candidate_ids; sending both or neither is rejected."
+            },
+            "candidate_ids": {
+                "type": "array", "uniqueItems": true,
+                "minItems": 1, "maxItems": MAX_CANDIDATE_BATCH_ITEMS,
+                "items": id_schema("cnd_"),
+                "description": "Send exactly one of candidate_id or candidate_ids; the batch form discards every listed Candidate atomically under the same Review version and reason."
+            },
             "expected_review_version": {"type": "integer", "minimum": 1},
-            "reason": {"type": "string", "minLength": 1, "maxLength": 512}
+            "reason": {"type": "string", "minLength": 1, "maxLength": 512},
+            "decision_source": decision_source_schema(
+                "Who decided this discard. Defaults to human when omitted. Use agent_policy only \
+                 for a discard you made yourself without asking the user."
+            )
         }
+    })
+}
+
+/// Declares the optional provenance field shared by both Candidate disposition tools.
+///
+/// A plain string `enum` rather than a union: the public schema avoids `oneOf`/`anyOf` because at
+/// least one host renders those as an untyped map.
+fn decision_source_schema(description: &str) -> Value {
+    json!({
+        "type": "string",
+        "enum": ["human", "agent_policy"],
+        "description": description
     })
 }
 
@@ -4278,7 +8790,7 @@ fn candidate_confirm_schema() -> Value {
         "additionalProperties": false,
         "required": [
             "agent_kind", "external_session_id", "expected_task_id",
-            "expected_intent_revision_id", "candidate_id", "expected_review_version",
+            "expected_intent_revision_id", "expected_review_version",
             "primary", "related_space_ids"
         ],
         "properties": {
@@ -4286,29 +8798,42 @@ fn candidate_confirm_schema() -> Value {
             "external_session_id": {"type": "string", "minLength": 1},
             "expected_task_id": id_schema("tsk_"),
             "expected_intent_revision_id": id_schema("tir_"),
-            "candidate_id": id_schema("cnd_"),
+            "candidate_id": {
+                "type": "string",
+                "pattern": "^cnd_[0-9a-fA-F-]+$",
+                "description": "Send exactly one of candidate_id or candidate_ids; sending both or neither is rejected."
+            },
+            "candidate_ids": {
+                "type": "array", "uniqueItems": true,
+                "minItems": 1, "maxItems": MAX_CANDIDATE_BATCH_ITEMS,
+                "items": id_schema("cnd_"),
+                "description": "Send exactly one of candidate_id or candidate_ids; the batch form shares one Space organization and rejects edits, so per-Candidate edits stay single-Candidate calls."
+            },
             "expected_review_version": {"type": "integer", "minimum": 1},
             "primary": {
-                "oneOf": [
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["existing_space_id"],
-                        "properties": {"existing_space_id": id_schema("spc_")}
-                    },
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["new_space_recommendation_id"],
-                        "properties": {
-                            "new_space_recommendation_id": id_schema("rec_")
-                        }
-                    }
-                ]
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Send exactly one of existing_space_id or new_space_recommendation_id; sending both or neither is rejected, and a proposed new Space is single-Candidate only.",
+                "properties": {
+                    "existing_space_id": id_schema("spc_"),
+                    "new_space_recommendation_id": id_schema("rec_")
+                }
             },
             "related_space_ids": {
                 "type": "array", "uniqueItems": true,
                 "items": id_schema("spc_")
             },
-            "edits": candidate_edits_schema()
+            "edits": candidate_edits_schema(),
+            "decision_source": decision_source_schema(
+                "Who decided this confirmation. Defaults to human when omitted. agent_policy \
+                 declares that you confirmed it yourself without asking the user, and the server \
+                 accepts it only for a row whose auto_confirmable is true (Review pending, \
+                 candidate_status exactly ready_for_review, top assessment relation novel or \
+                 supports) and a request carrying no edits; anything else is refused as \
+                 auto_confirm_not_permitted, whose message names the step that is missing, and \
+                 belongs in front of the user. Note that ready_for_review on a compact row means \
+                 the row wants a reviewer, not that it may be confirmed automatically."
+            )
         }
     })
 }
@@ -4319,25 +8844,11 @@ fn candidate_edits_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "kind": kind_schema(),
-            "topic_key": {
-                "oneOf": [
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["action", "value"],
-                        "properties": {
-                            "action": {"const": "set"},
-                            "value": {"type": "string", "minLength": 1}
-                        }
-                    },
-                    {
-                        "type": "object", "additionalProperties": false,
-                        "required": ["action"],
-                        "properties": {"action": {"const": "clear"}}
-                    }
-                ]
-            },
+            "topic_key": nullable_field_edit_schema("topic key"),
+            "problem_view": nullable_field_edit_schema("problem view"),
             "statement": {"type": "string", "minLength": 1},
             "rationale": {"type": "string", "minLength": 1},
+            "hints": string_array_schema(),
             "applicability": {
                 "type": "object", "additionalProperties": false,
                 "properties": {
@@ -4348,26 +8859,17 @@ fn candidate_edits_schema() -> Value {
             },
             "assumptions": string_array_schema(),
             "recheck_when": string_array_schema(),
-            "relations": {
-                "type": "array",
-                "items": {
-                    "type": "object", "additionalProperties": false,
-                    "required": ["target_context_id", "kind", "rationale", "supports"],
-                    "properties": {
-                        "target_context_id": id_schema("ctx_"),
-                        "kind": {"type": "string", "enum": ["depends_on", "supersedes", "contradicts", "related_to"]},
-                        "rationale": {"type": "string", "minLength": 1},
-                        "supports": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
-                    }
-                }
-            },
+            "relations": {"type": "array", "items": context_relation_schema()},
             "evidence": {
                 "type": "array", "minItems": 1,
                 "items": {
                     "type": "object", "additionalProperties": false,
                     "required": ["kind", "supports", "content", "interpretation", "limitations"],
                     "properties": {
-                        "kind": {"type": "string", "enum": ["source_snapshot", "experiment_record", "artifact_snapshot"]},
+                        "kind": enum_schema([
+                            EvidenceType::SourceSnapshot, EvidenceType::ExperimentRecord,
+                            EvidenceType::ArtifactSnapshot
+                        ]),
                         "supports": {"type": "string", "minLength": 1},
                         "content": {"type": "object", "minProperties": 1},
                         "interpretation": {"type": "string", "minLength": 1},
@@ -4380,19 +8882,89 @@ fn candidate_edits_schema() -> Value {
 }
 
 fn kind_schema() -> Value {
-    json!({"type": "string", "enum": ["decision", "contract", "issue", "risk", "validation", "discovery", "progress"]})
+    enum_schema([
+        ContextKind::Decision,
+        ContextKind::Contract,
+        ContextKind::Issue,
+        ContextKind::Risk,
+        ContextKind::Validation,
+        ContextKind::Discovery,
+        ContextKind::Progress,
+    ])
+}
+
+fn context_relation_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["target_context_id", "kind", "rationale", "supports"],
+        "properties": {
+            "target_context_id": id_schema("ctx_"),
+            "kind": enum_schema([
+                sctx_domain::ContextRelationKind::DependsOn,
+                sctx_domain::ContextRelationKind::Constrains,
+                sctx_domain::ContextRelationKind::Implements,
+                sctx_domain::ContextRelationKind::ValidatedBy,
+                sctx_domain::ContextRelationKind::Contradicts,
+                sctx_domain::ContextRelationKind::Supersedes,
+                sctx_domain::ContextRelationKind::RelatedTo,
+            ]),
+            "rationale": {"type": "string", "minLength": 1},
+            "supports": {
+                "type": "array", "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+            }
+        }
+    })
 }
 
 fn kind_array_schema() -> Value {
     json!({"type": "array", "items": kind_schema()})
 }
 
+/// Flat replacement declaration for one nullable Candidate field.
+///
+/// The host view lists both `action` values and the optional `value`; the exclusive
+/// `set` requires `value` / `clear` forbids `value` composition stays authoritative Rust
+/// validation, because a host union declaration degrades into an untyped map.
+fn nullable_field_edit_schema(field: &str) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action"],
+        "description": format!(
+            "Replace the {field}: action set requires value; action clear removes it and must omit value."
+        ),
+        "properties": {
+            "action": {"type": "string", "enum": ["set", "clear"]},
+            "value": {"type": "string", "minLength": 1}
+        }
+    })
+}
+
 fn string_array_schema() -> Value {
     json!({"type": "array", "items": {"type": "string", "minLength": 1}})
 }
 
+fn enum_schema<T, const N: usize>(values: [T; N]) -> Value
+where
+    T: Serialize,
+{
+    let values = values.into_iter().collect::<Vec<_>>();
+    json!({"type": "string", "enum": values})
+}
+
 fn id_schema(prefix: &str) -> Value {
     json!({"type": "string", "pattern": format!("^{prefix}[0-9a-fA-F-]+$")})
+}
+
+fn repository_id_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": REPOSITORY_ID_MAX_BYTES,
+        "pattern": REPOSITORY_ID_PATTERN
+    })
 }
 
 fn read_frame<R: BufRead>(reader: &mut R) -> std::result::Result<Option<Frame>, TransportError> {
@@ -4538,9 +9110,14 @@ fn rpc_error(
     })
 }
 
+/// The `text` copy is compact JSON on purpose. MCP requires a text representation equivalent to
+/// `structuredContent`, so both travel on every result and the envelope already costs about twice
+/// the pack it carries; pretty-printing added a further ~18% in indentation alone. Hosts that wrap
+/// an MCP call in a script (Codex code-mode) cap that script's output at a fixed approximate token
+/// count, so the indentation was truncating the tail of a large Context Pack.
 #[allow(clippy::needless_pass_by_value)]
 fn tool_success(data: Value) -> Result<Value> {
-    let text = serde_json::to_string_pretty(&data)
+    let text = serde_json::to_string(&data)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool result: {error}")))?;
     Ok(json!({
         "content": [{"type": "text", "text": text}],
@@ -4549,16 +9126,92 @@ fn tool_success(data: Value) -> Result<Value> {
     }))
 }
 
+/// Same envelope as [`tool_success`], but appends a plain-text operator note after the
+/// compact JSON body. The note is presentation only: `structuredContent` (the public
+/// response schema) is unchanged, and no field here can be mistaken for an accepted Candidate —
+/// only `candidate_confirm` produces one.
+#[allow(clippy::needless_pass_by_value)]
+fn tool_success_with_notice(
+    data: Value,
+    notice: impl FnOnce(&Value) -> Option<String>,
+) -> Result<Value> {
+    let mut text = serde_json::to_string(&data)
+        .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool result: {error}")))?;
+    if let Some(notice) = notice(&data) {
+        text.push_str("\n\n");
+        text.push_str(&notice);
+    }
+    Ok(json!({
+        "content": [{"type": "text", "text": text}],
+        "structuredContent": data,
+        "isError": false,
+    }))
+}
+
+/// The Candidate disposition *mechanics*: which tool decides each tier, which `decision_source`
+/// it carries, and what must be escalated instead. This is protocol -- the server enforces every
+/// sentence of it (see [`require_auto_confirm_permitted`]) -- so it ships in the binary and is
+/// identical for every installation.
+///
+/// What it deliberately no longer states is *which drafts deserve which tier*. That is one team's
+/// judgement about its own knowledge base, it changes without a release, and it now arrives from
+/// `policy.md`'s `## triage` section through [`candidate_triage_text`].
+const CANDIDATE_TRIAGE_PROTOCOL: &str = "Triage each Pending Review by top_assessment.relation. Discard with candidate_discard, decision_source agent_policy, and a reason naming the ground. Confirm with candidate_confirm, decision_source agent_policy, and no edits, and only a row whose auto_confirmable is true: a pending Review at candidate_status ready_for_review whose top relation is novel or supports. ready_for_review means the row wants a reviewer, not that you may be one; it usually differs because candidate_status is needs_space_review, and the refusal names the missing step. On auto_confirm_not_permitted, escalate; do not change fields and retry. Escalate everything else: potential_contradiction, revises, duplicates needing a supersede decision, Space governance, incomplete analysis, and uncertainty. Present only these to the user in a compact table (topic, statement, relation) with your recommendation; do not wait to be asked.";
+
+/// The complete triage text one installation delivers: protocol, then its team's grounds.
+///
+/// Both channels that state the triage -- the `candidate_list` description and the
+/// `task_checkpoint` ACK notice -- render this one function, which is what
+/// `candidate_description_and_ack_share_all_three_triage_tiers` holds them to. A model that reads
+/// only the ACK (a real Cursor session never opened `workflow.md` at all) and a model that reads
+/// only the tool surface must be told the same thing.
+fn candidate_triage_text(policy: &Policy) -> String {
+    join_policy(CANDIDATE_TRIAGE_PROTOCOL, policy.triage())
+}
+
+/// Appends one policy section to a protocol sentence, on one line, with no trailing separator
+/// when the section is absent.
+fn join_policy(protocol: &str, section: &str) -> String {
+    let section = Policy::inline(section);
+    let section = section.trim();
+    if section.is_empty() {
+        return protocol.to_owned();
+    }
+    format!("{protocol} {section}")
+}
+
+/// Post-Checkpoint guidance appended to the ACK text whenever the Checkpoint was accepted (and
+/// therefore always queued a Candidate Build; ADR-0003).
+///
+/// Candidate drafts only ever come from `task_checkpoint`, and `candidate_list` itself drains
+/// any outstanding Build before it answers, so there is no reason for the agent to poll
+/// `candidate_list` before this ACK or to wait for the user to ask about it afterward.
+///
+/// The notice carries ADR-0005's three tiers in full because it is the one instruction channel
+/// a Skill-less host reliably delivers: a real Cursor session rendered this ACK while never
+/// reading `workflow.md` at all. The two automatic tiers are stated as the server enforces
+/// them, so a model following the notice literally is inside the permission surface
+/// [`require_auto_confirm_permitted`] checks rather than discovering it through a refusal.
+fn task_checkpoint_ack_notice(policy: &Policy, data: &Value) -> Option<String> {
+    data.get("candidate_build")?;
+    let triage = candidate_triage_text(policy);
+    Some(format!(
+        "This Checkpoint was accepted and queued a Candidate Build. Call candidate_list next. {triage}"
+    ))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn tool_failure(failure: ToolFailure) -> Result<Value> {
     let data = json!({
         "error": {
             "code": failure.code,
-            "kind": error_code(failure.error.kind()),
+            "kind": failure
+                .family
+                .unwrap_or_else(|| error_code(failure.error.kind())),
             "message": failure.error.message(),
         }
     });
-    let text = serde_json::to_string_pretty(&data)
+    let text = serde_json::to_string(&data)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize tool error: {error}")))?;
     Ok(json!({
         "content": [{"type": "text", "text": text}],
@@ -4689,8 +9342,46 @@ const fn default_page_size() -> usize {
     20
 }
 
+/// Token ceiling one automatic Task Context Pack may charge when the caller names none.
+///
+/// This is the budget every `task_intent_update` spends, so it decides how much of what
+/// retrieval found actually reaches the Agent. It was 2000, and 2000 was measured against
+/// probe fixtures whose queries are one short sentence: across all 84 probes in
+/// `probe-v1`/`probe-zh-v1`/`probe-ext-v1` the largest complete compact Pack is 1832 tokens, so
+/// no probe was ever truncated and the suites could not see the ceiling at all.
+///
+/// A real Working Intent is not one sentence. Replaying the 22 Intent revisions of Codex session
+/// 01a06b3e against that installation's own 21 accepted Contexts (compact detail, the automatic
+/// path's own shape), 19 retrieved something and **18 of those 19 were truncated**: the Pack kept
+/// 3 Contexts at the median and reported 17 more as `item_token_budget` omissions. The session's
+/// own `task_injection` rows agree -- never more than three Contexts injected per Intent update.
+///
+/// Measured cost of the whole compact Pack, same replay, by budget (19 retrieving Intents):
+///
+/// | budget | tokens p50 | tokens p95 | items p50 | items max | still truncated |
+/// |-------:|-----------:|-----------:|----------:|----------:|----------------:|
+/// |   2000 |       1959 |       1995 |         3 |         3 |           18/19 |
+/// |   4000 |       3798 |       3983 |         6 |         8 |           17/19 |
+/// |   6000 |       5770 |       5979 |        11 |        13 |           17/19 |
+/// |   8000 |       7522 |       7933 |        15 |        18 |           12/19 |
+/// |  12000 |       8769 |       9333 |        19 |        20 |            0/19 |
+///
+/// 8000 is not the value that ends truncation -- that is about 9400, and it is not a budget worth
+/// having. On this corpus the retrieval gate admits 20 of 21 accepted Contexts for a broad
+/// Working Intent, so "never truncate" means "return the whole installation on every Intent
+/// update", and the retrieval candidate limit lets that grow to a hundred items on a larger
+/// corpus. A budget that tracks corpus size is not a bound.
+///
+/// 8000 is the value that fixes what the 2000 ceiling actually broke. It carries 15 of the 19--20
+/// Contexts the gate admitted at the median, against 3 before, while staying a fixed cost the
+/// caller can reason about: under 8000 tokens per automatic Pack no matter how large the corpus
+/// gets. What it drops is still named -- the compact packer lists the first
+/// `COMPACT_NAMED_OMISSION_LIMIT` omissions by Context ID and collapses the rest -- so a truncated
+/// Pack remains one `context_get` away from anything it left out. Callers that want a different
+/// trade set `token_budget` explicitly; the floor stays
+/// [`MIN_TASK_CONTEXT_TOKEN_BUDGET`].
 const fn default_token_budget() -> usize {
-    2_000
+    8_000
 }
 
 const fn default_max_spaces() -> usize {
@@ -4721,10 +9412,108 @@ const fn default_candidate_review_token_budget() -> usize {
     DEFAULT_CANDIDATE_REVIEW_TOKEN_BUDGET
 }
 
-fn estimate_candidate_review_tokens(summary: &CandidateReviewSummary) -> Result<usize> {
+fn estimate_candidate_review_tokens(summary: &impl Serialize) -> Result<usize> {
     let bytes = serde_json::to_vec(summary)
         .map_err(|error| Error::new(ErrorKind::Io, format!("serialize Review summary: {error}")))?;
     Ok(bytes.len().div_ceil(4).max(1))
+}
+
+fn validate_task_checkpoint_input(
+    input: &TaskCheckpointInput,
+    serialized_bytes: usize,
+) -> Result<()> {
+    let mut violations = Vec::new();
+    if serialized_bytes > MAX_TASK_CHECKPOINT_BYTES {
+        violations.push(format!(
+            "serialized payload exceeds {MAX_TASK_CHECKPOINT_BYTES} bytes"
+        ));
+    }
+    validate_checkpoint_text(&input.agent_kind, "agent_kind", &mut violations);
+    validate_checkpoint_text(
+        &input.external_session_id,
+        "external_session_id",
+        &mut violations,
+    );
+    if input.claims.len() > MAX_TASK_CHECKPOINT_CLAIMS {
+        violations.push(format!("claims exceeds {MAX_TASK_CHECKPOINT_CLAIMS} items"));
+    }
+    if input.unknowns.len() > MAX_TASK_CHECKPOINT_UNKNOWNS {
+        violations.push(format!(
+            "unknowns exceeds {MAX_TASK_CHECKPOINT_UNKNOWNS} items"
+        ));
+    }
+    for (claim_index, claim) in input.claims.iter().enumerate() {
+        validate_checkpoint_text(
+            &claim.statement,
+            &format!("claims[{claim_index}].statement"),
+            &mut violations,
+        );
+        validate_checkpoint_text(
+            &claim.rationale,
+            &format!("claims[{claim_index}].rationale"),
+            &mut violations,
+        );
+        validate_checkpoint_string_list(
+            &claim.conditions,
+            &format!("claims[{claim_index}].conditions"),
+            &mut violations,
+        );
+        if claim.evidence.is_empty() {
+            violations.push(format!("claims[{claim_index}].evidence must not be empty"));
+        } else if claim.evidence.len() > MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM {
+            violations.push(format!(
+                "claims[{claim_index}].evidence exceeds {MAX_TASK_CHECKPOINT_EVIDENCE_PER_CLAIM} items"
+            ));
+        }
+        for (evidence_index, evidence) in claim.evidence.iter().enumerate() {
+            validate_checkpoint_text(
+                &evidence.summary,
+                &format!("claims[{claim_index}].evidence[{evidence_index}].summary"),
+                &mut violations,
+            );
+            validate_checkpoint_string_list(
+                &evidence.limitations,
+                &format!("claims[{claim_index}].evidence[{evidence_index}].limitations"),
+                &mut violations,
+            );
+        }
+    }
+    for (unknown_index, unknown) in input.unknowns.iter().enumerate() {
+        validate_checkpoint_text(
+            &unknown.statement,
+            &format!("unknowns[{unknown_index}].statement"),
+            &mut violations,
+        );
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "task_checkpoint validation failed: {}",
+            violations.join("; ")
+        )))
+    }
+}
+
+fn validate_checkpoint_string_list(values: &[String], field: &str, violations: &mut Vec<String>) {
+    if values.len() > MAX_TASK_CHECKPOINT_LIST_ITEMS {
+        violations.push(format!(
+            "{field} exceeds {MAX_TASK_CHECKPOINT_LIST_ITEMS} items"
+        ));
+    }
+    for (index, value) in values.iter().enumerate() {
+        validate_checkpoint_text(value, &format!("{field}[{index}]"), violations);
+    }
+}
+
+fn validate_checkpoint_text(value: &str, field: &str, violations: &mut Vec<String>) {
+    if value.trim().is_empty() {
+        violations.push(format!("{field} must not be empty"));
+    } else if value.len() > MAX_TASK_CHECKPOINT_TEXT_BYTES {
+        violations.push(format!(
+            "{field} exceeds {MAX_TASK_CHECKPOINT_TEXT_BYTES} bytes"
+        ));
+    }
 }
 
 const fn error_code(kind: ErrorKind) -> &'static str {
@@ -4739,55 +9528,149 @@ const fn error_code(kind: ErrorKind) -> &'static str {
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::RepositoryNotConfigured => "repository_not_configured",
         ErrorKind::IdempotencyKeyConflict => "idempotency_key_conflict",
+        ErrorKind::MaintenanceBusy => "maintenance_busy",
         _ => "unknown_error",
     }
 }
 
-fn validate_context_revision_ref(
+/// Turns every `contradicts` Relation on the confirming revision into a `SemanticConflictOpened`
+/// reservation, so confirming a contradiction is the same batch as declaring it.
+///
+/// A target that is not currently accepted has no publication head to name as the other side, so
+/// it is skipped instead of failing the Confirmation: the Relation itself is still recorded.
+/// A pair already covered by an open conflict is skipped too, which is what makes a same-content
+/// re-confirmation (a duplicate Candidate carrying the identical draft) idempotent rather than
+/// conflict-spamming.
+fn contradiction_conflict_openings(
     snapshot: &DomainSnapshot,
-    reference: ContextRevisionRef,
-) -> Result<()> {
-    let (_, context) =
-        find_context(snapshot, None, reference.context_id).map_err(|failure| failure.error)?;
-    if !context.revisions.contains_key(&reference.revision_id) {
-        return Err(invalid(format!(
-            "Revision {} does not belong to Context {} in the selected Index snapshot",
-            reference.revision_id, reference.context_id
-        )));
+    final_draft: &ContextRevisionDraft,
+    primary_space_id: Option<SpaceId>,
+    final_content_hash: &str,
+) -> Vec<SemanticConflictOpeningDraft> {
+    let mut openings = Vec::new();
+    for relation in final_draft
+        .relations
+        .iter()
+        .filter(|relation| relation.kind == ContextRelationKind::Contradicts)
+    {
+        let Some(target) =
+            projectable_conflict_participant(snapshot, final_draft, primary_space_id, relation)
+        else {
+            continue;
+        };
+        if conflict_already_open(snapshot, relation.target_context_id, final_content_hash) {
+            continue;
+        }
+        openings.push(SemanticConflictOpeningDraft {
+            target,
+            reason: relation.rationale.clone(),
+        });
     }
-    Ok(())
+    openings
 }
 
-fn validate_context_evidence_ref(
+/// The other conflict side, but only when the reducer would admit the resulting conflict.
+///
+/// A `SemanticConflictOpened` Event is only projected when both sides are accepted publish heads
+/// in one Space, both are `decision` or `contract`, both carry the same `topic_key`, and their
+/// applicabilities overlap. Emitting one that fails those rules would write a permanently
+/// diagnostic Event, so a contradiction that cannot be projected records only its Relation.
+fn projectable_conflict_participant(
     snapshot: &DomainSnapshot,
-    reference: &CaptureEvidenceRef,
-) -> Result<()> {
-    let CaptureEvidenceRef::ContextEvidence {
-        context_id,
+    final_draft: &ContextRevisionDraft,
+    primary_space_id: Option<SpaceId>,
+    relation: &ContextRelation,
+) -> Option<ConflictParticipant> {
+    if !conflictable_kind(final_draft.kind) {
+        return None;
+    }
+    let (space_id, context) = find_context(snapshot, None, relation.target_context_id).ok()?;
+    if primary_space_id != Some(space_id) {
+        return None;
+    }
+    let ContextGovernanceStatus::Accepted {
+        publication_id,
         revision_id,
-        evidence_id,
-    } = reference
+    } = context.governance
     else {
-        return Err(invariant(
-            "Context Evidence validator received a non-Context reference",
-        ));
+        return None;
     };
-    let (_, context) =
-        find_context(snapshot, None, *context_id).map_err(|failure| failure.error)?;
-    let revision = context.revisions.get(revision_id).ok_or_else(|| {
-        invalid(format!(
-            "Revision {revision_id} does not belong to Context {context_id} in the selected Index snapshot"
-        ))
-    })?;
-    if !revision
-        .revision
-        .evidence
-        .iter()
-        .any(|evidence| evidence.evidence_id == *evidence_id)
+    let target = &context.revisions.get(&revision_id)?.revision;
+    if !conflictable_kind(target.kind)
+        || target.topic_key != final_draft.topic_key
+        || !applicability_overlaps(&final_draft.applicability, &target.applicability)
     {
-        return Err(invalid(format!(
-            "Evidence {evidence_id} does not belong to Context {context_id} Revision {revision_id}"
-        )));
+        return None;
+    }
+    Some(ConflictParticipant {
+        context_id: relation.target_context_id,
+        revision_id,
+        publication_id,
+    })
+}
+
+/// Only settled `decision` and `contract` statements can semantically conflict.
+const fn conflictable_kind(kind: ContextKind) -> bool {
+    matches!(kind, ContextKind::Decision | ContextKind::Contract)
+}
+
+/// Mirrors the reducer's V1 rule: an omitted dimension is unrestricted, otherwise an exact match.
+fn applicability_overlaps(left: &Applicability, right: &Applicability) -> bool {
+    let dimension = |left: &[String], right: &[String]| {
+        left.is_empty() || right.is_empty() || left.iter().any(|value| right.contains(value))
+    };
+    dimension(&left.domains, &right.domains)
+        && dimension(&left.platforms, &right.platforms)
+        && dimension(&left.conditions, &right.conditions)
+}
+
+/// Whether an unresolved conflict already pairs `target_context_id` with this exact content.
+fn conflict_already_open(
+    snapshot: &DomainSnapshot,
+    target_context_id: ContextId,
+    final_content_hash: &str,
+) -> bool {
+    snapshot
+        .projection
+        .semantic_conflicts
+        .values()
+        .filter(|projection| matches!(projection.status, SemanticConflictStatus::Open { .. }))
+        .any(|projection| {
+            projection
+                .conflict
+                .participants
+                .iter()
+                .any(|participant| participant.context_id == target_context_id)
+                && projection.conflict.participants.iter().any(|participant| {
+                    accepted_content_hash(snapshot, participant.context_id).as_deref()
+                        == Some(final_content_hash)
+                })
+        })
+}
+
+/// Content hash of one Context's currently accepted revision, excluding generated identities.
+fn accepted_content_hash(snapshot: &DomainSnapshot, context_id: ContextId) -> Option<String> {
+    let (_, context) = find_context(snapshot, None, context_id).ok()?;
+    let ContextGovernanceStatus::Accepted { revision_id, .. } = context.governance else {
+        return None;
+    };
+    context.revisions.get(&revision_id).map(|projection| {
+        context_revision_content_hash(&context_revision_as_draft(&projection.revision))
+    })
+}
+
+fn validate_context_relation_targets(
+    snapshot: &DomainSnapshot,
+    relations: &[ContextRelation],
+) -> Result<()> {
+    let mut identities = BTreeSet::new();
+    for relation in relations {
+        relation.validate()?;
+        if !identities.insert((relation.target_context_id, relation.kind)) {
+            return Err(invalid("Context Relation target/kind pairs must be unique"));
+        }
+        find_context(snapshot, None, relation.target_context_id)
+            .map_err(|_| invalid("Context Relation target Context does not exist"))?;
     }
     Ok(())
 }
@@ -4818,6 +9701,101 @@ where
 mod tests {
     use super::*;
 
+    fn description_of(policy: &Policy, name: &str) -> String {
+        tools_list(policy)["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn candidate_description_and_ack_share_all_three_triage_tiers() {
+        let policy = Policy::compiled_default();
+        let description = description_of(&policy, "candidate_list");
+        let notice = task_checkpoint_ack_notice(&policy, &json!({"candidate_build": {}})).unwrap();
+        let description_policy = description
+            .split_once("Triage each Pending Review")
+            .unwrap()
+            .1
+            .split_once(" external_session_id:")
+            .unwrap()
+            .0;
+        let notice_policy = notice.split_once("Triage each Pending Review").unwrap().1;
+        assert_eq!(description_policy, notice_policy);
+        assert_eq!(
+            format!("Triage each Pending Review{notice_policy}"),
+            candidate_triage_text(&policy)
+        );
+        for criterion in [
+            "counter-intuitive finding",
+            "user correction to your proposal that later proved right",
+            "novel or supports",
+            "potential_contradiction",
+            "decision_source agent_policy",
+            "Space governance",
+        ] {
+            assert!(
+                description_policy.contains(criterion),
+                "missing {criterion}"
+            );
+        }
+        assert!(task_checkpoint_ack_notice(&policy, &json!({"status": "no_op"})).is_none());
+    }
+
+    /// The tier *mechanics* are protocol and must survive a `policy.md` that deletes `## triage`
+    /// entirely; only the team's grounds go away with it.
+    #[test]
+    fn an_empty_triage_section_still_delivers_every_protocol_tier() {
+        let empty = Policy::default();
+        let text = candidate_triage_text(&empty);
+        assert_eq!(text, CANDIDATE_TRIAGE_PROTOCOL);
+        for tier in [
+            "candidate_discard",
+            "candidate_confirm",
+            "decision_source agent_policy",
+            "auto_confirm_not_permitted",
+            "potential_contradiction",
+        ] {
+            assert!(text.contains(tier), "missing {tier}");
+        }
+        assert!(description_of(&empty, "candidate_list").contains(CANDIDATE_TRIAGE_PROTOCOL));
+    }
+
+    /// The regression guard for the split: with no `## checkpoint` section the tool description is
+    /// exactly the text that shipped before runtime policy existed, byte for byte.
+    #[test]
+    fn an_empty_checkpoint_section_reproduces_the_shipped_description() {
+        let empty = description_of(&Policy::default(), "task_checkpoint");
+        assert!(empty.starts_with(TASK_CHECKPOINT_PROTOCOL));
+        let default = description_of(&Policy::compiled_default(), "task_checkpoint");
+        assert_eq!(
+            default.len(),
+            empty.len() + 1 + Policy::compiled_default().checkpoint().len(),
+            "the default description is the protocol plus one space plus the policy section"
+        );
+        assert!(default.starts_with(TASK_CHECKPOINT_PROTOCOL));
+        assert!(default.contains(&Policy::inline(Policy::compiled_default().checkpoint())));
+    }
+
+    #[test]
+    fn language_hint_only_flags_statements_without_any_chinese() {
+        assert_eq!(
+            language_hint("The reviewed branch preserves runtime service resolution"),
+            Some(CHINESE_KNOWLEDGE_BASE_HINT.to_owned())
+        );
+        assert_eq!(
+            language_hint("PoiEntranceAssem.kt:202 的 null 保护发生得过晚"),
+            None,
+            "a Chinese statement keeps its Latin identifiers and needs no advisory"
+        );
+        assert_eq!(language_hint("仅中文"), None);
+    }
+
     #[test]
     fn intent_update_conflict_and_stale_errors_have_intent_specific_codes() {
         let conflict = ToolFailure::intent_update_failed(Error::new(
@@ -4830,5 +9808,92 @@ mod tests {
         ));
         assert_eq!(conflict.code, "intent_conflict");
         assert_eq!(stale.code, "intent_stale");
+    }
+
+    #[test]
+    fn full_review_rows_mark_every_recommended_space_as_provisional_or_not() {
+        let provisional_space = SpaceId::new();
+        let named_space = SpaceId::new();
+        let mut row = json!({
+            "space_recommendations": [
+                {"kind": "existing", "space_id": provisional_space.to_string()},
+                {"kind": "existing", "space_id": named_space.to_string()},
+                {"kind": "proposed_new_space_intent", "recommendation_id": "srx"},
+            ]
+        });
+        insert_space_recommendation_provisional(&mut row, &BTreeSet::from([provisional_space]));
+        let rows = row["space_recommendations"].as_array().unwrap();
+        assert_eq!(rows[0]["provisional"], Value::Bool(true));
+        assert_eq!(rows[1]["provisional"], Value::Bool(false));
+        // Confirming a proposed recommendation is what creates the Space, so it is always
+        // provisional and needs no lookup.
+        assert_eq!(rows[2]["provisional"], Value::Bool(true));
+    }
+
+    /// Builds one provisional Space by patching the serialized `space.created` event: only
+    /// Candidate Confirmation writes the flag, and this test is about how the flag is read.
+    fn provisional_space_event(title: &str) -> Event {
+        let human =
+            Event::space_created(provisional_test_intent(title), None).expect("valid Intent");
+        let mut json = serde_json::to_value(&human).expect("event serializes");
+        json["intent_revision"]["provisional"] = Value::Bool(true);
+        let bytes = serde_json::to_vec(&json).expect("event serializes");
+        sctx_event_schema::parse_event(&bytes)
+            .expect("patched event stays a valid V1 event")
+            .known()
+            .expect("patched event stays a known V1 event")
+            .clone()
+    }
+
+    fn provisional_test_intent(title: &str) -> sctx_domain::IntentSnapshot {
+        sctx_domain::IntentSnapshot {
+            title: title.to_owned(),
+            problem: "distinguish proposed and human-defined Space boundaries".to_owned(),
+            desired_outcome: "retain provisional markers for proposals".to_owned(),
+            in_scope: vec!["provisional Space markers".to_owned()],
+            out_of_scope: vec!["automatic merging".to_owned()],
+            acceptance_conditions: vec!["only proposals carry provisional markers".to_owned()],
+            domain_terms: vec!["space".to_owned()],
+        }
+    }
+
+    fn space_id_of(event: &Event) -> SpaceId {
+        match event.payload() {
+            EventPayload::SpaceCreated { space_id, .. } => *space_id,
+            _ => unreachable!("space.created"),
+        }
+    }
+
+    #[test]
+    fn provisional_space_ids_include_proposals_but_not_human_named_spaces() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let store =
+            GitStore::bootstrap_local(temporary.path().join("installation")).expect("bootstrap");
+        let index = ProjectionIndex::for_store(&store);
+
+        let grown = provisional_space_event("Grown provisional Space");
+        let grown_id = space_id_of(&grown);
+        store
+            .append_event(AppendRequest::event(grown))
+            .expect("append provisional Space");
+        let small = provisional_space_event("Small provisional Space");
+        let small_id = space_id_of(&small);
+        store
+            .append_event(AppendRequest::event(small))
+            .expect("append provisional Space");
+        let human = Event::space_created(provisional_test_intent("Human named Space"), None)
+            .expect("valid Intent");
+        store
+            .append_event(AppendRequest::event(human))
+            .expect("append human Space");
+
+        index.synchronize().expect("synchronize");
+        let snapshot = index.domain_snapshot().expect("snapshot");
+        assert_eq!(
+            provisional_space_ids(&snapshot),
+            BTreeSet::from([grown_id, small_id])
+        );
+
+        assert_eq!(snapshot.projection.spaces.len(), 3);
     }
 }

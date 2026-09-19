@@ -96,6 +96,8 @@ fn intent(title: &str) -> IntentSnapshot {
 
 fn context_draft() -> ContextRevisionDraft {
     ContextRevisionDraft {
+        problem_view: None,
+        hints: Vec::new(),
         kind: ContextKind::Decision,
         topic_key: Some("event-schema/compatibility".to_owned()),
         statement: "Unknown schemas are quarantined".to_owned(),
@@ -119,9 +121,9 @@ fn context_draft() -> ContextRevisionDraft {
 }
 
 #[test]
-fn all_eleven_v1_fixtures_round_trip_without_semantic_loss() {
+fn all_fourteen_v1_fixtures_round_trip_without_semantic_loss() {
     let paths = json_files(&fixture_root().join("events/v1/valid"));
-    assert_eq!(paths.len(), 11);
+    assert_eq!(paths.len(), 14);
 
     let mut event_types = Vec::new();
     for path in paths {
@@ -147,11 +149,14 @@ fn all_eleven_v1_fixtures_round_trip_without_semantic_loss() {
             "context.publication_changed",
             "context.reviewed",
             "context.revision_added",
+            "context.revision_added",
+            "context.revision_added",
             "context.space_association_changed",
             "context_candidate.created",
             "engineering_reference.recorded",
             "semantic_conflict.opened",
             "semantic_conflict.resolution_added",
+            "space.created",
             "space.created",
             "space.intent_revision_added",
         ]
@@ -348,6 +353,7 @@ fn generation_api_assigns_new_ids_and_all_generated_events_parse() {
                 context_revision_event_id: revision_added.event_id(),
                 space_association_event_id: association.event_id(),
                 publication_event_id: publication.event_id(),
+                engineering_reference_event_ids: Vec::new(),
             },
         },
         "bat_00000000-0000-4000-8000-000000000903",
@@ -572,6 +578,15 @@ fn bundled_schema_is_versioned_and_matches_the_exported_id() {
     assert_eq!(schema["$id"], V1_SCHEMA_ID);
     assert_eq!(schema["properties"]["schema_version"]["const"], "1");
     assert_eq!(schema["unevaluatedProperties"], false);
+    assert_eq!(
+        schema["$defs"]["repository_id"],
+        json!({
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+        })
+    );
 }
 
 #[test]

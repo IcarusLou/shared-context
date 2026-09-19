@@ -1,0 +1,106 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "'/Users/fixture/.shared-context/bin/current/sctx' hook --agent codex --agent-version '0.154.0'",
+            "statusMessage": "Shared Context",
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /somewhere/else/track.js --event PostToolUse",
+            "timeout": 45,
+            "async": true,
+            "additionalContextLimit": 9000
+          },
+          {
+            "type": "mcp_tool",
+            "server": "metrics",
+            "tool": "record"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "'/Users/fixture/.shared-context/bin/current/sctx' hook --agent codex --agent-version '0.154.0'",
+            "statusMessage": "Shared Context",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "'/Users/fixture/.shared-context/bin/current/sctx' hook --agent codex --agent-version '0.154.0'",
+            "statusMessage": "Shared Context",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "'/Users/fixture/.shared-context/bin/current/sctx' hook --agent codex --agent-version '0.154.0'",
+            "statusMessage": "Shared Context",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "'/Users/fixture/.shared-context/bin/current/sctx' hook --agent codex --agent-version '0.154.0'",
+            "statusMessage": "Shared Context",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "ignored-on-this-event",
+        "hooks": [
+          {
+            "command": "'/Users/fixture/.shared-context/bin/current/sctx' hook --agent codex --agent-version '0.154.0'",
+            "statusMessage": "Shared Context",
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "prompt"
+          },
+          {
+            "type": "command",
+            "command": "   "
+          },
+          {
+            "type": "command",
+            "command": "/bin/true",
+            "additionalContextLimit": 2500
+          }
+        ]
+      }
+    ]
+  }
+}

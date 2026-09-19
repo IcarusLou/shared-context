@@ -314,7 +314,7 @@ impl ArtifactKey {
     /// Returns [`ErrorKind::InvalidInput`] for an invalid locator.
     pub fn derive(repository_id: RepositoryId, locator: ArtifactLocator) -> Result<Self> {
         locator.validate()?;
-        let digest = artifact_digest(repository_id, &locator)?;
+        let digest = artifact_digest(&repository_id, &locator)?;
         Ok(Self {
             repository_id,
             locator,
@@ -323,8 +323,8 @@ impl ArtifactKey {
     }
 
     #[must_use]
-    pub const fn repository_id(&self) -> RepositoryId {
-        self.repository_id
+    pub fn repository_id(&self) -> RepositoryId {
+        self.repository_id.clone()
     }
 
     #[must_use]
@@ -360,7 +360,7 @@ impl ArtifactKey {
     /// Returns [`ErrorKind::InvalidInput`] for an invalid locator or mismatched digest.
     pub fn validate(&self) -> Result<()> {
         self.locator.validate()?;
-        if self.digest != artifact_digest(self.repository_id, &self.locator)? {
+        if self.digest != artifact_digest(&self.repository_id, &self.locator)? {
             return Err(invalid(
                 "artifact_key.digest must match repository and deterministic locator",
             ));
@@ -369,7 +369,7 @@ impl ArtifactKey {
     }
 }
 
-fn artifact_digest(repository_id: RepositoryId, locator: &ArtifactLocator) -> Result<String> {
+fn artifact_digest(repository_id: &RepositoryId, locator: &ArtifactLocator) -> Result<String> {
     let mut hasher = Sha256::new();
     for component in [
         repository_id.to_string(),
@@ -438,7 +438,7 @@ impl EngineeringReferenceDraft {
     pub fn validate(&self) -> Result<()> {
         EngineeringReference {
             reference_id: ReferenceId::new(),
-            repository_id: self.repository_id,
+            repository_id: self.repository_id.clone(),
             artifact_kind: self.artifact_kind,
             relation: self.relation,
             locator: self.locator.clone(),
@@ -693,6 +693,9 @@ pub enum ContextRelationKind {
     Implements,
     ValidatedBy,
     Contradicts,
+    /// This revision replaces the target Context. The target keeps its accepted Git facts; only
+    /// the local projection derives a `superseded_by` state from this edge.
+    Supersedes,
     RelatedTo,
 }
 
@@ -867,7 +870,7 @@ mod tests {
     fn path_move_and_symbol_rename_change_deterministic_identity() {
         let repository = repository("search-web");
         let file_key = ArtifactKey::derive(
-            repository.repository_id,
+            repository.repository_id.clone(),
             ArtifactLocator::File {
                 path: path("old/search.ts"),
             },
@@ -880,7 +883,7 @@ mod tests {
         };
         let after = EngineeringArtifact {
             artifact_key: ArtifactKey::derive(
-                repository.repository_id,
+                repository.repository_id.clone(),
                 ArtifactLocator::File {
                     path: path("new/search.ts"),
                 },
@@ -895,11 +898,11 @@ mod tests {
 
         let old_symbol = EngineeringArtifact {
             repository: repository.clone(),
-            artifact_key: symbol(repository.repository_id, "search", "oldSearch"),
+            artifact_key: symbol(repository.repository_id.clone(), "search", "oldSearch"),
             display_name: "oldSearch".to_owned(),
         };
         let renamed = EngineeringArtifact {
-            artifact_key: symbol(repository.repository_id, "search", "newSearch"),
+            artifact_key: symbol(repository.repository_id.clone(), "search", "newSearch"),
             display_name: "newSearch".to_owned(),
             ..old_symbol.clone()
         };
@@ -911,12 +914,12 @@ mod tests {
     #[test]
     fn locator_keys_distinguish_modules_and_normalize_contract_coordinates() {
         let repository = repository("cross-client");
-        let first = symbol(repository.repository_id, "feed", "Result");
-        let second = symbol(repository.repository_id, "search", "Result");
+        let first = symbol(repository.repository_id.clone(), "feed", "Result");
+        let second = symbol(repository.repository_id.clone(), "search", "Result");
         assert_ne!(first, second);
 
-        let api_from_swift = api(repository.repository_id, "/v2/search");
-        let api_from_typescript = api(repository.repository_id, "/v2/search");
+        let api_from_swift = api(repository.repository_id.clone(), "/v2/search");
+        let api_from_typescript = api(repository.repository_id.clone(), "/v2/search");
         assert_eq!(api_from_swift, api_from_typescript);
         assert!(
             api_from_swift
@@ -974,8 +977,8 @@ mod tests {
     #[test]
     fn resolution_models_ambiguity_unavailable_and_mixed_repository_rejection() {
         let repository = RepositoryId::new();
-        let first = symbol(repository, "module-a", "Result");
-        let second = symbol(repository, "module-b", "Result");
+        let first = symbol(repository.clone(), "module-a", "Result");
+        let second = symbol(repository.clone(), "module-b", "Result");
         let ambiguous = ArtifactResolution {
             reference_id: ReferenceId::new(),
             repository_id: repository,
@@ -1023,8 +1026,8 @@ mod tests {
     #[test]
     fn graph_edges_allow_cycles_but_reject_invalid_typed_combinations() {
         let repository = RepositoryId::new();
-        let a = module(repository, "src/a");
-        let b = module(repository, "src/b");
+        let a = module(repository.clone(), "src/a");
+        let b = module(repository.clone(), "src/b");
         let forward = EngineeringGraphEdge {
             source: a.clone(),
             target: b.clone(),
@@ -1041,7 +1044,7 @@ mod tests {
         assert!(backward.validate().is_ok());
 
         let invalid = EngineeringGraphEdge {
-            source: api(repository, "/a"),
+            source: api(repository.clone(), "/a"),
             target: ArtifactKey::derive(
                 repository,
                 ArtifactLocator::File {

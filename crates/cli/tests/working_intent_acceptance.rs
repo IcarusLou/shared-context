@@ -24,6 +24,9 @@ fn append(store: &GitStore, event: Event) {
     store.append_event(AppendRequest::event(event)).unwrap();
 }
 
+/// The file the oracle Context is recorded against, and the hint the Working Intent names it with.
+const RENDERER_FILE: &str = "src/search/searchresultrenderer.ts";
+
 fn seed_text_context(store: &GitStore) -> usize {
     let space = Event::space_created(
         IntentSnapshot {
@@ -46,6 +49,8 @@ fn seed_text_context(store: &GitStore) -> usize {
     let context = Event::context_revision_added(
         space_id,
         ContextRevisionDraft {
+            problem_view: None,
+            hints: Vec::new(),
             kind: ContextKind::Contract,
             topic_key: Some("search/v2".to_owned()),
             statement: "SearchResultRenderer consumes search-v2-endpoint".to_owned(),
@@ -90,6 +95,25 @@ fn seed_text_context(store: &GitStore) -> usize {
     append(store, review);
     append(
         store,
+        Event::engineering_reference_recorded(
+            context_id,
+            revision_id,
+            sctx_domain::EngineeringReferenceDraft {
+                repository_id: "Web".parse().unwrap(),
+                artifact_kind: sctx_domain::ArtifactKind::File,
+                relation: sctx_domain::ReferenceRelation::Implements,
+                locator: sctx_domain::ArtifactLocator::File {
+                    path: sctx_domain::RepoRelativePath::new(RENDERER_FILE).unwrap(),
+                },
+                supports: "the oracle Context is about the renderer file".to_owned(),
+                limitations: vec!["fixed local oracle".to_owned()],
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    append(
+        store,
         Event::publication_changed(
             space_id,
             context_id,
@@ -103,7 +127,8 @@ fn seed_text_context(store: &GitStore) -> usize {
         )
         .unwrap(),
     );
-    4
+    // Space, revision, review, Reference, publication.
+    5
 }
 
 fn input(
@@ -126,7 +151,7 @@ fn input(
 fn fixed_working_intent_cross_layer_oracle() {
     let temporary = TempDir::new().unwrap();
     let root = temporary.path().join("working-intent-oracle");
-    let store = GitStore::initialize(&root).unwrap();
+    let store = GitStore::bootstrap_local(&root).unwrap();
     let event_count = seed_text_context(&store);
     let goal_only: WorkingIntentSnapshot =
         serde_json::from_value(serde_json::json!({"goal": "Implement search"})).unwrap();
@@ -143,9 +168,13 @@ fn fixed_working_intent_cross_layer_oracle() {
     .unwrap();
     assert_eq!(initial.revision_status, IntentRevisionStatus::Created);
 
+    // The hint names a file rather than a symbol, because a hint is an anchor now: ADR-0007 reads
+    // the spellings that read as a path and joins them against the Engineering Reference rows. A
+    // bare `SearchResultRenderer` is still a legal hint and still recorded on the Intent; it simply
+    // names no file, so it anchors nothing.
     let hinted = WorkingIntentSnapshot {
         goal: "Implement search".to_owned(),
-        artifact_hints: vec!["SearchResultRenderer".to_owned()],
+        artifact_hints: vec![RENDERER_FILE.to_owned()],
         interface_hints: vec!["search-v2-endpoint".to_owned()],
         ..WorkingIntentSnapshot::new("Implement search").unwrap()
     };
@@ -164,29 +193,34 @@ fn fixed_working_intent_cross_layer_oracle() {
     assert!(
         changed
             .context
-            .retrieval_paths
+            .items
             .iter()
-            .flat_map(|item| &item.paths)
-            .any(|path| matches!(
-                path,
-                sctx_search::TaskRetrievalPath::WorkingIntentHintText { .. }
-            ))
-    );
-    assert!(
+            .flat_map(|item| &item.retrieval_paths)
+            .all(|path| matches!(path, sctx_search::TaskRetrievalPath::FileAnchor { .. })),
+        "a hint reaches knowledge by naming a file, and by nothing else: {:#?}",
         changed
             .context
-            .retrieval_paths
+            .items
             .iter()
-            .flat_map(|item| &item.paths)
-            .all(|path| !matches!(
-                path,
-                sctx_search::TaskRetrievalPath::EngineeringGraph { .. }
-            ))
+            .map(|item| &item.retrieval_paths)
+            .collect::<Vec<_>>()
     );
+    // Each explanation reaches the host once. The full shape used to carry a second, flattened
+    // copy of every item's paths at the top level -- byte-for-byte identical, 24.7% of one
+    // measured Pack's wire, charged by nothing and read by nobody.
+    let body = serde_json::to_string(&changed).unwrap();
+    for item in &changed.context.items {
+        let encoded = serde_json::to_string(&item.retrieval_paths).unwrap();
+        assert_eq!(
+            body.matches(encoded.as_str()).count(),
+            1,
+            "one explanation, one copy on the wire: {encoded}"
+        );
+    }
 
     let mut equivalent = hinted.clone();
     equivalent.goal = "  IMPLEMENT   search ".to_owned();
-    equivalent.artifact_hints[0] = "searchresultrenderer".to_owned();
+    equivalent.artifact_hints[0] = RENDERER_FILE.to_uppercase();
     let retry = task_intent_update_at_root(
         &root,
         &input(
@@ -286,7 +320,11 @@ fn fixed_working_intent_cross_layer_oracle() {
         .unwrap()
         .projection;
     assert!(projection.candidates.is_empty());
-    assert!(projection.engineering_references.is_empty());
+    // The corpus seeded exactly one Reference, on the Context. Working Intent activity adds none:
+    // a hint that names a file is read as a coordinate at retrieval time and never written down as
+    // one, which is what keeps the Intent a disposable local note rather than a source of
+    // engineering facts.
+    assert_eq!(projection.engineering_references.len(), 1);
     assert_eq!(
         outcomes
             .iter()
@@ -391,8 +429,11 @@ fn working_intent_document_language_is_current_and_bounded() {
         "**WorkingIntentSnapshot**:",
         "**TaskIntentRevision**:",
         "**TaskSignal**:",
+        "**DirectEvidenceDraft**:",
+        "**CheckpointOperation**:",
+        "**CandidateBuildOutbox**:",
         "**Evidence**:",
-        "it is not engineering Evidence",
+        "never engineering Evidence",
     ] {
         assert!(
             context.contains(required),
@@ -416,12 +457,12 @@ fn working_intent_document_language_is_current_and_bounded() {
             "Evidence 绑定 WorkObservation、CheckpointClaim、Candidate、ContextRevision 或 EngineeringReference"
         )
     );
-    assert!(development.contains("M4：Low-tax Capture"));
-    assert!(acceptance.contains("#136/#169"));
+    assert!(development.contains("M4：Direct Checkpoint / Candidate Review"));
+    assert!(acceptance.contains("Mew #226–#229"));
     assert!(
         development.contains("#164 固定 oracle")
             && technical.contains("#164 固定 oracle")
-            && acceptance.contains("final M4 Gate #164")
+            && acceptance.contains("direct_evidence_workflow")
     );
 
     let current_state = [context, development, technical, acceptance]

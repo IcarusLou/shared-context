@@ -10,6 +10,7 @@ use std::{
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
 };
 
 use fs2::FileExt;
@@ -32,7 +33,7 @@ pub use sctx_domain::{Error, ErrorKind, Result};
 pub use tokenizer::{normalize_search_text, search_tokens};
 
 /// Current physical `SQLite` schema version.
-pub const DB_SCHEMA_VERSION: &str = "11";
+pub const DB_SCHEMA_VERSION: &str = "15";
 /// Event parser implementation version recorded in every projection.
 pub const EVENT_PARSER_VERSION: &str = "1";
 /// Pure reducer implementation version recorded in every projection.
@@ -42,7 +43,12 @@ pub const CONFLICT_DETECTOR_VERSION: &str = "1";
 /// NFKC, full Unicode case-folding, identifier splitting, and CJK bigram implementation.
 pub const NORMALIZER_TOKENIZER_VERSION: &str = "1";
 /// Context and Space-Intent weighted-BM25, explanation, and stable-ID ranking implementation.
-pub const SEARCH_RANKING_VERSION: &str = "4";
+///
+/// It also versions what the ranked columns contain: version 5 folds each revision's `topic_key`
+/// into `hint_text` and its alias groups, and version 6 seeds an alias group from a non-ASCII
+/// term as well, so an index written by an earlier version must be rebuilt before a topic-keyed
+/// or Han-spelled term is reachable through the tokens it names.
+pub const SEARCH_RANKING_VERSION: &str = "6";
 
 pub(crate) const IMPLEMENTATION_VERSIONS: [(&str, &str); 6] = [
     ("db_schema_version", DB_SCHEMA_VERSION),
@@ -99,6 +105,61 @@ pub enum IncrementalFallback {
 pub struct OperationalWarning {
     pub code: &'static str,
     pub paths: Vec<String>,
+}
+
+/// Owned twin of [`OperationalWarning`], read back from `meta` (WP-V6 fix 4).
+///
+/// [`OperationalWarning::code`] is `&'static str` because every live warning is produced from a
+/// literal at its one call site; a warning read back from `SQLite` has no `'static` string to
+/// borrow, so this carries an owned `code` instead of reusing that type.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct PersistedOperationalWarning {
+    pub code: String,
+    pub paths: Vec<String>,
+}
+
+/// `meta` key the most recent rebuild's [`OperationalWarning`]s are persisted under (WP-V6 fix 4).
+///
+/// Additive to the existing generic `(key, value)` `meta` table, so no `DB_SCHEMA_VERSION` bump or
+/// migration is needed: an index built before this key existed simply has no row for it, which
+/// [`ProjectionIndex::last_rebuild_operational_warnings`] already treats as "nothing to report."
+pub(crate) const OPERATIONAL_WARNINGS_META_KEY: &str = "last_rebuild_operational_warnings";
+
+/// What one candidate [`UpdatePlan`] establishes about append-protocol integrity, and therefore
+/// what `meta`'s persisted [`OperationalWarning`]s should become (WP-V6 fix 4).
+///
+/// The two are different questions answered by the same comparison: [`RebuildOutcome`] reports
+/// what *this* `synchronize()` call found, which was already correct before this type existed and
+/// stays that way (only [`Self::Fresh`] ever contributes to it, same as before). This type is
+/// additionally about what `sctx doctor` should still be able to see afterward -- which requires
+/// knowing not just *whether* a violation was found, but whether the check that could have found
+/// one actually ran this time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OperationalWarningsUpdate {
+    /// A Tree diff against the previously indexed generation completed, so these warnings (empty
+    /// for a clean diff) are this generation's authoritative verdict and replace whatever was
+    /// persisted before.
+    Fresh(Vec<OperationalWarning>),
+    /// No comparable diff ran this synchronization -- a missing database, a forced rebuild, an
+    /// implementation-version change, or an old Tree unavailable for comparison all reach the
+    /// projection by some path other than comparing it against the last one. Whatever `meta`
+    /// already holds stands, unexamined and unchanged, exactly as an operator would expect
+    /// "unrelated to Git history integrity" to behave.
+    CarryForward,
+}
+
+/// Serializes warnings for [`OPERATIONAL_WARNINGS_META_KEY`], the one direction
+/// [`OperationalWarning::code`]'s `&'static str` never needs to round-trip back out of.
+fn encode_operational_warnings(warnings: &[OperationalWarning]) -> Result<String> {
+    let persisted = warnings
+        .iter()
+        .map(|warning| PersistedOperationalWarning {
+            code: warning.code.to_owned(),
+            paths: warning.paths.clone(),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&persisted)
+        .map_err(|error| invariant(format!("encode operational warnings for meta: {error}")))
 }
 
 /// Metadata that identifies one atomic projection generation.
@@ -180,7 +241,7 @@ enum UpdatePlan {
     Full {
         input: project::BuildInput,
         fallback: Option<IncrementalFallback>,
-        warnings: Vec<OperationalWarning>,
+        operational_warnings: OperationalWarningsUpdate,
     },
 }
 
@@ -201,11 +262,46 @@ pub struct DatabasePragmas {
 }
 
 /// Projection manager for one repository and its external state directory.
+///
+/// Clones share one [`IndexCaches`], so a long-lived server that hands clones to its Search
+/// Engine and its Runtime reduces one Git tree at most once.
 #[derive(Clone, Debug)]
 pub struct ProjectionIndex {
     repository: PathBuf,
     state: PathBuf,
     database: PathBuf,
+    caches: Arc<IndexCaches>,
+}
+
+/// Derived state that is a pure function of the indexed Git tree and may therefore be reused
+/// until that tree changes. Nothing here is authoritative: every entry can be recomputed.
+#[derive(Debug, Default)]
+struct IndexCaches {
+    snapshot: Mutex<Option<CachedDomainSnapshot>>,
+    event_commits: Mutex<EventCommitCache>,
+    head_trees: Mutex<BTreeMap<String, String>>,
+}
+
+/// Bound on remembered `HEAD commit -> Tree` pairs. Only the current commit is ever asked for.
+const MAX_REMEMBERED_HEAD_TREES: usize = 8;
+
+/// One reduced Domain Snapshot together with the exact projection identity it was reduced from.
+#[derive(Debug)]
+struct CachedDomainSnapshot {
+    metadata: IndexMetadata,
+    snapshot: Arc<DomainSnapshot>,
+}
+
+/// Memoized `event_path -> introducing commits`, warmed from the projection database once per
+/// process and refreshed by one history walk whenever an Event path is still unknown.
+#[derive(Debug, Default)]
+struct EventCommitCache {
+    entries: BTreeMap<String, Vec<git_tree::EventAddition>>,
+    warmed: bool,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl ProjectionIndex {
@@ -217,6 +313,7 @@ impl ProjectionIndex {
             repository: repository.into(),
             database: state.join("index.sqlite"),
             state,
+            caches: Arc::default(),
         }
     }
 
@@ -260,6 +357,32 @@ impl ProjectionIndex {
         require_quick_check(&connection)?;
         read_metadata(&connection)?.ok_or_else(|| {
             invariant("projection database does not contain complete version metadata")
+        })
+    }
+
+    /// Operational warnings the most recent rebuild that actually compared this generation
+    /// against the last one found, persisted in `meta` (WP-V6 fix 4) so `sctx doctor` can see
+    /// them without waiting for a live `sctx index sync`.
+    ///
+    /// Empty is the normal case, and is ambiguous by design between "the last rebuild found
+    /// nothing to warn about" and "this database predates the key": both mean there is nothing
+    /// for an operator to act on. Persists across every incremental sync after the rebuild that
+    /// wrote it -- see [`OperationalWarningsUpdate`] -- until the next rebuild that runs a real
+    /// Tree diff updates or clears it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is absent, corrupt, or the persisted value is not valid JSON.
+    pub fn last_rebuild_operational_warnings(&self) -> Result<Vec<PersistedOperationalWarning>> {
+        let connection = self.open_read_only()?;
+        require_quick_check(&connection)?;
+        let Some(raw) = schema::read_meta_value(&connection, OPERATIONAL_WARNINGS_META_KEY)? else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_str(&raw).map_err(|error| {
+            invariant(format!(
+                "parse persisted operational warnings from meta: {error}"
+            ))
         })
     }
 
@@ -330,11 +453,39 @@ impl ProjectionIndex {
     /// Returns an error when synchronization, Git object access, parsing, or
     /// deterministic reduction cannot complete.
     pub fn domain_snapshot(&self) -> Result<DomainSnapshot> {
+        let snapshot = self.shared_domain_snapshot()?;
+        Ok(DomainSnapshot::clone(&snapshot))
+    }
+
+    /// Shared, reference-counted form of [`Self::domain_snapshot`] for callers that only read.
+    ///
+    /// Reduction is a pure function of the indexed Git tree and the implementation versions, so
+    /// this index and every clone of it reuse the snapshot they already reduced until that exact
+    /// projection identity changes. A changed Tree, a new Generation, or a changed implementation
+    /// version all invalidate the reuse, which keeps `same Tree => same snapshot` intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization, Git object access, parsing, or deterministic
+    /// reduction cannot complete.
+    pub fn shared_domain_snapshot(&self) -> Result<Arc<DomainSnapshot>> {
         let outcome = self.synchronize()?;
+        if let Some(cached) = self.cached_domain_snapshot(&outcome.metadata) {
+            return Ok(cached);
+        }
         let tree = git_tree::read_tree(&self.repository, &outcome.metadata.indexed_tree_oid)?;
         let input = self.build_input(&tree.blobs)?;
-        Ok(DomainSnapshot {
-            metadata: outcome.metadata,
+        Ok(self.publish_domain_snapshot(&outcome.metadata, input))
+    }
+
+    /// Records one reduced projection as the snapshot for exactly `metadata`.
+    fn publish_domain_snapshot(
+        &self,
+        metadata: &IndexMetadata,
+        input: project::BuildInput,
+    ) -> Arc<DomainSnapshot> {
+        let snapshot = Arc::new(DomainSnapshot {
+            metadata: metadata.clone(),
             projection: input.projection,
             diagnostics: input
                 .diagnostics
@@ -348,7 +499,20 @@ impl ProjectionIndex {
                     message: diagnostic.message,
                 })
                 .collect(),
-        })
+        });
+        *lock(&self.caches.snapshot) = Some(CachedDomainSnapshot {
+            metadata: metadata.clone(),
+            snapshot: Arc::clone(&snapshot),
+        });
+        snapshot
+    }
+
+    fn cached_domain_snapshot(&self, metadata: &IndexMetadata) -> Option<Arc<DomainSnapshot>> {
+        let cached = lock(&self.caches.snapshot);
+        cached
+            .as_ref()
+            .filter(|entry| &entry.metadata == metadata)
+            .map(|entry| Arc::clone(&entry.snapshot))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -427,13 +591,50 @@ impl ProjectionIndex {
                     input: self
                         .build_input(&git_tree::read_tree(&self.repository, &head_oid)?.blobs)?,
                     fallback: None,
-                    warnings: Vec::new(),
+                    // No diff ran (a missing database, a forced rebuild, or an implementation
+                    // version change all skip `plan_tree_change` entirely), so this has nothing
+                    // fresh to say about append-protocol integrity either.
+                    operational_warnings: OperationalWarningsUpdate::CarryForward,
                 }
+            };
+            // Resolved from `&plan` before the shadow-rebuild transaction begins: `CarryForward`
+            // reads whatever `meta` currently holds so a synchronization that is not itself a
+            // rebuild re-examining Git history integrity does not silently erase a warning a past
+            // rebuild found. `replace_projection` and `replace_projection_incremental` only ever
+            // *write* this string; they never decide what it should be.
+            //
+            // `UpdatePlan::Incremental` always carries forward, never writes a fresh verdict, even
+            // though the diff that produced it did run and came back clean: an incremental update
+            // is not a rebuild (`IndexUpdateKind::Incremental`, not `FullRebuild`), and "the most
+            // recent rebuild's warning" -- what `sctx doctor` reports -- has to mean what it says.
+            // A past bypass stays visible through however many ordinary incremental syncs follow
+            // it, until the next real rebuild re-examines history and updates or clears it.
+            let operational_warnings_json = match &plan {
+                UpdatePlan::Incremental { .. }
+                | UpdatePlan::Full {
+                    operational_warnings: OperationalWarningsUpdate::CarryForward,
+                    ..
+                } => {
+                    // Also reached by the very first synchronization a database ever does
+                    // (`MissingDatabase`, before `meta` exists at all), so the read is guarded by
+                    // `schema::is_complete` -- already evaluated once above as part of
+                    // `versions_match` -- rather than assuming the table it names is there to read.
+                    if schema::is_complete(&connection)? {
+                        schema::read_meta_value(&connection, OPERATIONAL_WARNINGS_META_KEY)?
+                            .unwrap_or_else(|| "[]".to_owned())
+                    } else {
+                        "[]".to_owned()
+                    }
+                }
+                UpdatePlan::Full {
+                    operational_warnings: OperationalWarningsUpdate::Fresh(warnings),
+                    ..
+                } => encode_operational_warnings(warnings)?,
             };
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error("begin shadow rebuild transaction"))?;
-            match plan {
+            let projected = match plan {
                 UpdatePlan::Incremental {
                     input,
                     affected_spaces,
@@ -444,42 +645,58 @@ impl ProjectionIndex {
                         &head_oid,
                         generation,
                         &affected_spaces,
+                        &operational_warnings_json,
                     )?;
                     if update_kind == IndexUpdateKind::Current {
                         update_kind = IndexUpdateKind::Incremental;
                     }
+                    input
                 }
                 UpdatePlan::Full {
                     input,
                     fallback,
-                    warnings,
+                    operational_warnings: warnings_update,
                 } => {
-                    schema::replace_projection(&transaction, &input, &head_oid, generation)?;
+                    schema::replace_projection(
+                        &transaction,
+                        &input,
+                        &head_oid,
+                        generation,
+                        &operational_warnings_json,
+                    )?;
                     update_kind = IndexUpdateKind::FullRebuild;
                     if fallback.is_some() {
                         incremental_fallback = fallback;
                     }
-                    operational_warnings.extend(warnings);
+                    if let OperationalWarningsUpdate::Fresh(warnings) = warnings_update {
+                        operational_warnings.extend(warnings);
+                    }
+                    input
                 }
-            }
+            };
             transaction
                 .commit()
                 .map_err(sql_error("commit shadow rebuild transaction"))?;
             require_quick_check(&connection)?;
 
-            let observed_tree = git_tree::tree_oid(&self.repository)?;
+            let observed_tree = self.head_tree_oid()?;
             if observed_tree != head_oid {
                 force_next = false;
                 continue;
             }
-            break Ok(outcome_from_database(
+            let outcome = outcome_from_database(
                 &connection,
                 reason,
                 isolated_database,
                 update_kind,
                 incremental_fallback,
                 operational_warnings,
-            )?);
+            )?;
+            // Both plans project the complete new Tree, and `observed_tree` just proved that Tree
+            // is still `HEAD`. Reduction is a pure function of exactly that input, so the snapshot
+            // this rebuild already computed is the snapshot the next reader would recompute.
+            self.publish_domain_snapshot(&outcome.metadata, projected);
+            break Ok(outcome);
         };
 
         let unlock = FileExt::unlock(&lock).map_err(io_error("unlock index.lock"));
@@ -489,11 +706,34 @@ impl ProjectionIndex {
         }
     }
 
+    /// Reads `HEAD^{tree}`, reusing the answer while `HEAD` still names the same commit.
+    ///
+    /// Every read synchronizes, and every synchronization resolves this twice, so the steady state
+    /// used to spend two `git` processes per read. A commit's Tree cannot change, so resolving
+    /// `HEAD` from Git's own files is an exact substitute whenever it succeeds.
+    fn head_tree_oid(&self) -> Result<String> {
+        let head_commit = git_tree::head_commit_oid(&self.repository);
+        if let Some(commit) = head_commit.as_ref()
+            && let Some(tree) = lock(&self.caches.head_trees).get(commit).cloned()
+        {
+            return Ok(tree);
+        }
+        let tree = git_tree::tree_oid(&self.repository)?;
+        if let Some(commit) = head_commit {
+            let mut remembered = lock(&self.caches.head_trees);
+            if remembered.len() >= MAX_REMEMBERED_HEAD_TREES {
+                remembered.clear();
+            }
+            remembered.insert(commit, tree.clone());
+        }
+        Ok(tree)
+    }
+
     fn current_without_lock(&self) -> Result<Option<RebuildOutcome>> {
         if !self.database.exists() {
             return Ok(None);
         }
-        let before = git_tree::tree_oid(&self.repository)?;
+        let before = self.head_tree_oid()?;
         let Ok(connection) = self.open_read_only() else {
             return Ok(None);
         };
@@ -514,7 +754,7 @@ impl ProjectionIndex {
             None,
             Vec::new(),
         )?;
-        let after = git_tree::tree_oid(&self.repository)?;
+        let after = self.head_tree_oid()?;
         Ok((before == after).then_some(outcome))
     }
 
@@ -525,21 +765,32 @@ impl ProjectionIndex {
         new_tree_oid: &str,
         new_entries: &[git_tree::TreeEntry],
     ) -> Result<UpdatePlan> {
-        let full = |fallback, warnings| -> Result<UpdatePlan> {
+        let full = |fallback, operational_warnings| -> Result<UpdatePlan> {
             Ok(UpdatePlan::Full {
                 input: self
                     .build_input(&git_tree::read_tree(&self.repository, new_tree_oid)?.blobs)?,
                 fallback: Some(fallback),
-                warnings,
+                operational_warnings,
             })
         };
+        // Neither branch below ran a diff against the previously indexed generation, so neither
+        // has a fresh answer about append-protocol integrity -- whatever `meta` already says
+        // stands. Contrast the `AppendProtocolBypassed`, `CachedSourceMismatch`, and
+        // `ImpactClosureUnproven` branches further down, all reached only after `changes` was
+        // computed successfully.
         if !git_tree::tree_exists(&self.repository, &metadata.indexed_tree_oid) {
-            return full(IncrementalFallback::IndexedTreeUnavailable, Vec::new());
+            return full(
+                IncrementalFallback::IndexedTreeUnavailable,
+                OperationalWarningsUpdate::CarryForward,
+            );
         }
         let Ok(changes) =
             git_tree::diff_trees(&self.repository, &metadata.indexed_tree_oid, new_tree_oid)
         else {
-            return full(IncrementalFallback::IndexedTreeUnavailable, Vec::new());
+            return full(
+                IncrementalFallback::IndexedTreeUnavailable,
+                OperationalWarningsUpdate::CarryForward,
+            );
         };
         if changes.iter().any(|change| !change.is_addition()) {
             let paths = changes
@@ -554,10 +805,10 @@ impl ProjectionIndex {
                 .collect();
             return full(
                 IncrementalFallback::AppendProtocolBypassed,
-                vec![OperationalWarning {
+                OperationalWarningsUpdate::Fresh(vec![OperationalWarning {
                     code: "APPEND_PROTOCOL_BYPASSED",
                     paths,
-                }],
+                }]),
             );
         }
 
@@ -581,8 +832,14 @@ impl ProjectionIndex {
             .iter()
             .map(|blob| (blob.path.as_str(), blob.oid.as_str()))
             .collect();
+        // Reached only once `changes` was computed and confirmed to contain no non-addition
+        // change, so append-protocol integrity has a fresh, clean answer here even though the
+        // plan still degrades to a full rebuild for an unrelated reason.
         if expected != cached || expected.len() != new_blobs.len() {
-            return full(IncrementalFallback::CachedSourceMismatch, Vec::new());
+            return full(
+                IncrementalFallback::CachedSourceMismatch,
+                OperationalWarningsUpdate::Fresh(Vec::new()),
+            );
         }
 
         let old_input = self.build_input(&old_blobs)?;
@@ -594,7 +851,10 @@ impl ProjectionIndex {
         let affected_spaces = project::impact_closure(&old_input, &new_input, &changed_paths);
         let observed_changes = project::changed_projection_spaces(&old_input, &new_input);
         if !observed_changes.is_subset(&affected_spaces) {
-            return full(IncrementalFallback::ImpactClosureUnproven, Vec::new());
+            return full(
+                IncrementalFallback::ImpactClosureUnproven,
+                OperationalWarningsUpdate::Fresh(Vec::new()),
+            );
         }
         Ok(UpdatePlan::Incremental {
             input: new_input,
@@ -604,19 +864,93 @@ impl ProjectionIndex {
 
     fn build_input(&self, blobs: &[git_tree::TreeBlob]) -> Result<project::BuildInput> {
         let mut input = project::build(blobs);
+        let wanted = input
+            .candidate_events
+            .values()
+            .map(|metadata| metadata.event_path.clone())
+            .chain(
+                input
+                    .confirmation_events
+                    .values()
+                    .map(|metadata| metadata.event_path.clone()),
+            )
+            .chain(input.publication_event_paths.values().cloned())
+            .collect::<BTreeSet<_>>();
+        let additions = self.event_additions(&wanted)?;
         for metadata in input.candidate_events.values_mut() {
-            metadata.commit_oid = Some(git_tree::introducing_commit_oid(
-                &self.repository,
-                &metadata.event_path,
-            )?);
+            metadata.commit_oid = Some(introducing_commit_oid(&additions, &metadata.event_path)?);
         }
         for metadata in input.confirmation_events.values_mut() {
-            metadata.commit_oid = Some(git_tree::introducing_commit_oid(
-                &self.repository,
-                &metadata.event_path,
-            )?);
+            metadata.commit_oid = Some(introducing_commit_oid(&additions, &metadata.event_path)?);
         }
+        input.publication_times = input
+            .publication_event_paths
+            .iter()
+            .filter_map(|(publication_id, path)| {
+                additions
+                    .get(path)
+                    .and_then(|entries| entries.first())
+                    .map(|entry| (*publication_id, entry.commit_time))
+            })
+            .collect();
         Ok(input)
+    }
+
+    /// Answers `event_path -> introducing commits` for `wanted`, spending at most one Git process.
+    ///
+    /// Event paths are append-only, so an answer for a path never changes: this memo is warmed
+    /// from the projection database once per process, and only a path it has never seen forces
+    /// the single history walk that re-answers every path at once.
+    fn event_additions(
+        &self,
+        wanted: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Vec<git_tree::EventAddition>>> {
+        if wanted.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let mut cache = lock(&self.caches.event_commits);
+        if !cache.warmed {
+            cache.warmed = true;
+            if let Ok(connection) = self.open_read_only()
+                && let Ok(persisted) = schema::read_event_commits(&connection)
+            {
+                cache.entries.extend(persisted);
+            }
+        }
+        if wanted.iter().any(|path| !cache.entries.contains_key(path)) {
+            let scanned = git_tree::introducing_commits(&self.repository)?;
+            self.persist_event_commits(&scanned);
+            cache.entries.extend(scanned);
+        }
+        Ok(wanted
+            .iter()
+            .filter_map(|path| {
+                cache
+                    .entries
+                    .get(path)
+                    .map(|entries| (path.clone(), entries.clone()))
+            })
+            .collect())
+    }
+
+    /// Best-effort write of the Event introduction memo; a failure only costs the next walk.
+    fn persist_event_commits(&self, additions: &BTreeMap<String, Vec<git_tree::EventAddition>>) {
+        if !self.database.exists() {
+            return;
+        }
+        let Ok(mut connection) = Connection::open_with_flags(
+            &self.database,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return;
+        };
+        if connection
+            .busy_timeout(std::time::Duration::from_secs(3))
+            .is_err()
+        {
+            return;
+        }
+        let _ = schema::write_event_commits(&mut connection, additions);
     }
 
     fn open_healthy_or_replace(&self) -> Result<(Connection, Option<PathBuf>)> {
@@ -639,6 +973,43 @@ impl ProjectionIndex {
             .map_err(sql_error("create replacement projection database"))?;
         configure(&connection)?;
         Ok((connection, Some(quarantined)))
+    }
+
+    /// Records the local-only `context_item.stale_reason` derivation for a set of Contexts.
+    ///
+    /// `stale_reason` is *not* a Git fact: it is the outcome of evaluating a Context's structured
+    /// `recheck_when` entries against the current local checkouts. It therefore lives only in this
+    /// machine's projection and is cleared whenever the projection is rebuilt or a Space closure
+    /// is replaced; re-run the evaluator (`sctx doctor --recheck`) after new Events land.
+    ///
+    /// Contexts absent from `reasons` keep whatever they already carry; pass `None` to clear one.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when synchronization or the write transaction fails.
+    pub fn record_stale_reasons(&self, reasons: &[(String, Option<String>)]) -> Result<usize> {
+        self.synchronize()?;
+        let mut connection = Connection::open(&self.database)
+            .map_err(sql_error("open projection for stale write"))?;
+        configure(&connection)?;
+        let transaction = connection
+            .transaction()
+            .map_err(sql_error("begin stale-reason transaction"))?;
+        let mut updated = 0;
+        {
+            let mut statement = transaction
+                .prepare("UPDATE context_item SET stale_reason = ?2 WHERE context_id = ?1")
+                .map_err(sql_error("prepare stale-reason update"))?;
+            for (context_id, reason) in reasons {
+                updated += statement
+                    .execute(rusqlite::params![context_id, reason])
+                    .map_err(sql_error("write stale-reason derivation"))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(sql_error("commit stale-reason transaction"))?;
+        Ok(updated)
     }
 
     fn open_read_only(&self) -> Result<Connection> {
@@ -1046,6 +1417,27 @@ fn read_metadata(connection: &Connection) -> Result<Option<IndexMetadata>> {
         normalizer_tokenizer_version,
         search_ranking_version,
     }))
+}
+
+/// Resolves the one commit that introduced an append-only Event path.
+///
+/// The zero and many cases stay hard errors: a Candidate or Confirmation Event whose introduction
+/// is not unique has no defensible publication identity.
+fn introducing_commit_oid(
+    additions: &BTreeMap<String, Vec<git_tree::EventAddition>>,
+    path: &str,
+) -> Result<String> {
+    match additions.get(path).map(Vec::as_slice) {
+        Some([entry]) => Ok(entry.commit_oid.clone()),
+        None | Some([]) => Err(Error::new(
+            ErrorKind::External,
+            format!("Candidate event has no introducing commit: {path}"),
+        )),
+        Some(_) => Err(Error::new(
+            ErrorKind::External,
+            format!("Candidate event has multiple introducing commits: {path}"),
+        )),
+    }
 }
 
 fn versions_are_current(metadata: &IndexMetadata) -> bool {
